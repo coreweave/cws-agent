@@ -1,46 +1,38 @@
 # Cursor CLI
 
-Run Cursor's terminal agent inside a CoreWeave sandbox. This is the native CLI,
-not the Cursor desktop editor or a Cursor Cloud Agent worker.
+Run Cursor's terminal agent in a sandbox:
 
 ```sh
-cws-agent launch --name cursor1 --agent cursor --local-dir .
-cws-agent login cursor1
-cws-agent connect cursor1
+cws-agent launch cursor1 --agent cursor
 ```
 
-Login prints a browser sign-in link; open it on your local machine. For automation,
-set `CURSOR_API_KEY` before launch instead. The key is passed as an environment
-variable, never a CLI argument. See [Cursor authentication](https://cursor.com/docs/cli/reference/authentication).
-
-Headless runs and Telegram check sign-in before creating a chat. If logged out,
-they ask you to run `cws-agent login NAME` instead of waiting on an unauthenticated
-request. A configured key still needs a valid Cursor account and model access.
+Use `cws-agent login cursor1` and open its browser link locally, or export
+`CURSOR_API_KEY` before launch. You need Cursor account and model access.
+[Authentication](https://cursor.com/docs/cli/reference/authentication).
 
 ## Commands
 
 ```sh
 cws-agent run cursor1 "Review the README"
-cws-agent connect cursor1 --cmd 'cursor-agent ls'
+cws-agent session history cursor1 --agent cursor
 cws-agent session resume cursor1 CHAT_ID --agent cursor
-cws-agent snapshot cursor1
-cws-agent restore cursor1 --connect  # after the original sandbox stops
+cws-agent down cursor1
+cws-agent restore cursor1 --connect
 ```
 
-`connect` opens Cursor in the running sandbox; `session resume` continues a native
-conversation. Cursor's `ls` opens its own conversation picker. Local/remote
-conversation upload and download are not supported: Cursor does not document a
-portable CLI session export/import format. Snapshots preserve the sandbox's own
-Cursor state. See [Cursor's command reference](https://cursor.com/docs/cli/reference/parameters).
+History opens Cursor's conversation picker. Snapshots preserve saved logins,
+settings, and chats; re-export environment-only keys before restoring.
+Conversation upload/download is unsupported. This runs the CLI, not the desktop
+editor or a Cursor Cloud Agent worker.
+[Command reference](https://cursor.com/docs/cli/reference/parameters).
 
 ## Telegram
 
 ```sh
-cws-agent launch --name cursor-bot --agent cursor --telegram --dangerously-skip-permissions
+cws-agent launch cursor-bot --agent cursor --telegram
 ```
 
-The bridge retains a native Cursor chat ID for follow-up messages. Use the existing
-[Telegram setup](messaging.md) for your bot or manager bot.
+Follow-up messages share a Cursor chat. See [Telegram setup](messaging.md).
 
 ## Permissions and configuration
 
