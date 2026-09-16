@@ -1,214 +1,122 @@
 # cws-agent
 
-Run Claude Code, Codex, Devin CLI, OpenCode, or Cursor CLI in a CoreWeave sandbox.
-Also run [OpenAI Agents API tools on CoreWeave](docs/openai-agents.md), with
-OpenAI managing the agent and conversation.
+Run coding agents in persistent cloud sandboxes. Bring your code, skills, and tools;
+run agents in parallel, save your workspace, and pick up where you left off.
 
-## Install once
-
-Already have `cws-agent --help` working? Skip to [Launch](#launch).
-
-Requires Git, [uv](https://docs.astral.sh/uv/getting-started/installation/),
-and macOS, Linux, or WSL.
+## Install
 
 ```bash
-git clone https://github.com/coreweave/cws-agent.git
-cd cws-agent
-mkdir -p "$HOME/.local/bin"
-ln -s "$PWD/cws-agent" "$HOME/.local/bin/cws-agent"
-export PATH="$HOME/.local/bin:$PATH"
-cws-agent --help
+curl -fsSL https://raw.githubusercontent.com/coreweave/cws-agent/main/install.sh | sh
 ```
 
-Add the `export PATH=...` line above to `~/.zshrc` (or `~/.bashrc`) for future
-terminals. Keep the checkout: the installed command links to it.
-If the link already exists, inspect `command -v cws-agent` before changing it;
-these instructions do not overwrite an existing installation.
+Works on macOS, Linux, and WSL. Installs `uv` and configures zsh and bash
+for future sessions. Open a new terminal afterward. [Install options](docs/install.md).
 
-All examples use **`cws-agent`**, which works from any project directory.
-A `./` prefix looks for a file in your current directory instead.
+## Get started
 
-## Launch
+For sandbox access and setup, see [Get started with Serverless Sandboxes](https://docs.wandb.ai/sandboxes#basic-usage).
 
-Set your W&B credential:
+Set your [W&B API key](https://wandb.ai/authorize):
 
 ```bash
 export WANDB_API_KEY='YOUR_WANDB_KEY'
+cws-agent launch my-claude
 ```
 
-Choose one agent:
+`my-claude` names your sandbox. Claude Code opens; type `/login` to sign in.
+CLI choices for `--agent`: `claude` (default), `codex`, `devin`, `opencode`, `cursor`.
+To use an open-source model hosted by W&B instead of the default proprietary models,
+choose OpenCode with `--agent opencode --wandb` ([setup](docs/opencode.md)).
+Agents use [YOLO mode](docs/permissions.md) by default; `--permission-mode native`
+uses the agent's own approval settings. [Other credentials](docs/usage.md#authentication).
+
+## Bring your skills and tools
+
+Launch offers to import local skills and MCP tools. Review or update them later:
 
 ```bash
-cws-agent launch my-claude              # Claude Code (default)
-cws-agent launch cdx1 --agent codex    # Codex
-cws-agent launch dvn1 --agent devin    # Devin CLI
-cws-agent launch open1 --agent opencode # OpenCode
-cws-agent launch cursor1 --agent cursor # Cursor CLI
+cws-agent config preview my-claude
+cws-agent config sync my-claude
 ```
 
-Launch opens the remote agent. Follow its sign-in flow; if needed, exit the
-agent to return to your local shell and run:
+You choose what gets copied. [Supported configuration](docs/config-import.md).
+
+## Move your workspace to the cloud
 
 ```bash
-cws-agent login my-claude
+cws-agent launch project1 --local-dir .
 ```
 
-For Claude, type `/login` inside the agent. For the others, use their sandbox name.
-Already have an agent token or API key? See [authentication](docs/usage.md#authentication).
-Setup and differences: [OpenCode](docs/opencode.md) · [Cursor CLI](docs/cursor.md).
+Uploads the current directory to `/workspace/project` and saves a snapshot when
+complete. Keep this terminal open until the upload finishes; use `cws-agent sync
+project1 .` for later changes. [Upload options and recovery](docs/usage.md#upload-your-project).
 
-OpenCode with an open-weight coding model on **W&B Serverless Inference**:
+## Continue a session
 
-```bash
-export WANDB_API_KEY='YOUR_WANDB_KEY'
-cws-agent launch open-wandb --agent opencode --wandb
-```
-
-Keep your sandbox credential set. Get the W&B key from
-[User Settings](https://wandb.ai/settings) → Create new API key; inference access
-and credits are required. The preset selects DeepSeek V4 Pro 0813, with no fallback
-to GPT or another provider. [Key setup, model choice, and alternatives](docs/opencode.md#wb-serverless-inference).
-
-Add `--local-dir PATH` to upload a project to `/workspace/project`. Local sync shows packaging/upload
-sizes and progress (`.` means the entire current directory).
-Launch automatically sizes the disk to fit local files with headroom; `--disk` overrides it.
-Project uploads are resumable: on failure, run the printed `cws-agent sync NAME
---resume-upload ID` command. Completed chunks are reused without repackaging.
-The sandbox stays billable until stopped or expired. See [upload recovery](docs/usage.md#resume-an-upload).
-With `--telegram`, skills/MCP setup and sign-in come first; workspace upload runs
-in the background while you chat. Completion automatically saves a snapshot.
-Later: `cws-agent restore telegram2 --telegram --dangerously-skip-permissions` restores
-the saved workspace and reconnects the bot without another upload.
-CLI agents start in YOLO mode by default, bypassing tool approval prompts.
-Use `--permission-mode accept-edits` or `--permission-mode native` to override it. Review the skills/MCP import prompt,
-or press Enter to skip. Exiting the agent **does not stop the sandbox**.
-
-## Daily commands
-
-```bash
-cws-agent list
-cws-agent connect my-claude                   # open the agent in a running sandbox
-cws-agent sync my-claude .                   # upload local changes
-cws-agent run my-claude "summarize this repo" # one-shot prompt
-cws-agent snapshot my-claude                 # save workspace without stopping
-cws-agent down my-claude                     # snapshot and stop compute
-cws-agent restore my-claude --connect          # restore and open the agent
-```
-
-Re-export environment-only credentials before `restore`. Snapshots retain
-files and saved logins, not running processes. To continue a specific
-conversation, use `session resume` below.
-
-Snapshot preparation temporarily changes live permissions and link representations;
-read the [snapshot caveat](docs/usage.md#snapshots) before storing sensitive data.
-
-## Continue a conversation
+Find a saved conversation inside the `my-claude` sandbox, then resume it by ID:
 
 ```bash
 cws-agent session history my-claude
 cws-agent session resume my-claude SESSION_ID
 ```
 
-History listing supports Claude/Codex and OpenCode workspace projects; Cursor
-uses its native picker (`session history NAME --agent cursor`). For upload/download and multiple
-agents in one sandbox, see [sessions](docs/sessions.md).
+To open a fresh agent terminal in that sandbox, use `cws-agent connect my-claude`.
 
-## Claude Managed Agents: a separate mode
-
-Use `--agent claude` for the Claude Code terminal.
-Use `--claude-env` to run **Managed Agents tool workers**:
+## Save your work and stop compute
 
 ```bash
-export ANTHROPIC_ENVIRONMENT_KEY='YOUR_ENVIRONMENT_KEY'
+cws-agent down my-claude
+cws-agent restore my-claude --connect
+```
+
+`down` snapshots your workspace and stops the sandbox; `restore` brings the files
+back. Exiting the agent alone leaves compute running. [Snapshot details](docs/usage.md#snapshots).
+
+## Self-hosted sandboxes
+
+Keep the agent and conversation in Devin Cloud, Claude Managed Agents, or the
+OpenAI Agents API while tools execute in your sandbox. After setting up the
+[provider credentials](docs/self-hosted.md), choose one:
+
+```bash
+cws-agent launch devinbox --outpost my-outpost
 cws-agent launch claudebox --claude-env env_REPLACE_ME
+cws-agent launch api1 --agent openai
 ```
 
-This starts workers and returns to your shell. It does not create a conversation.
-Managed Agents supports interactive conversations through its API, but
-**cws-agent has no Managed Agents chat command**. Neither `login` nor
-attaching to worker logs opens a chat.
+Send work through Devin Cloud or the Claude Managed Agents API; for OpenAI, use
+`cws-agent run api1 "your task"` ([API setup](docs/openai-agents.md)).
 
-See [self-hosted setup](docs/self-hosted.md) for connecting an agent/session,
-checking worker connectivity, and Devin Outposts. Environment keys are not
-Claude Code login tokens.
+## Run agents in parallel
 
-## More features
-
-Create a Claude sandbox and connect Telegram in one command:
+Sign in to `project1` with `/login`, then exit Claude. Give each task its own
+Git worktree and branch inside that sandbox:
 
 ```bash
-cws-agent launch telegram2 --local-dir . --telegram --dangerously-skip-permissions
+cws-agent session start project1 fix-auth --prompt "Fix the login bug"
+cws-agent session start project1 add-tests --prompt "Add parser tests"
+cws-agent session attach project1 fix-auth
+cws-agent session diff project1 add-tests
 ```
 
-Follow sign-in and QR pairing; leave the command running. The permission flag
-bypasses tool approvals. [Configure a management bot once](docs/messaging.md#create-bots-without-copying-their-tokens)
-to create bots without copying each token; otherwise setup asks for a BotFather token.
+Branches are named `agent/fix-auth` and `agent/add-tests`. Detach with **Ctrl-b, d**;
+the agent keeps working. [Sessions guide](docs/sessions.md).
 
-| Task | How |
-| --- | --- |
-| Parallel agents, restart, history transfer | [Sessions guide](docs/sessions.md) |
-| Bypass permissions explicitly | `cws-agent connect my-claude --yolo` — [permissions](docs/permissions.md) |
-| Review skills and MCP imports | `cws-agent config sync my-claude` — [configuration](docs/config-import.md) |
-| Paste a local image into remote Claude | **Ctrl+V** — [terminal guide](docs/terminal.md) |
-| Copy remote text to your clipboard | Ask the agent to run `cws-copy` — [terminal guide](docs/terminal.md) |
-| Telegram chat with QR pairing and progress updates | `cws-agent bridge telegram my-claude` — [messaging guide](docs/messaging.md) |
-| Get changes back, snapshots, remote control | [Usage guide](docs/usage.md) |
+## Chat with your agent on Telegram
 
-## Troubleshooting
-
-- **Command not found:** complete [Install once](#install-once), then check `command -v cws-agent`.
-- **Unknown option:** check which checkout `command -v cws-agent` links to, then `git pull` in it. This guide targets `main`.
-- **Managed Agents starts but shows no prompt:** follow [self-hosted setup](docs/self-hosted.md); worker logs are not chat.
-- **Ghostty redraw or clipboard issues:** see [terminal troubleshooting](docs/terminal.md#troubleshooting).
-- **Need an option?** Run `cws-agent --help` or `cws-agent launch --help`.
-
-## Development
-
-From the repository checkout, run offline checks:
+Use [Telegram](docs/messaging.md) to chat with your agent while your project uploads
+in the background:
 
 ```bash
-uv run --no-project --with 'cwsandbox[wandb]>=1.10,<2' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' --with 'openai>=3.14,<4' python -m unittest discover -s tests
+cws-agent launch telegram1 --local-dir . --telegram
 ```
 
-These do not prove live provider authentication or terminal rendering.
-The optional `./smoke.sh` creates billable sandboxes and deletes its test snapshots.
+The upload survives closing its terminal.
+Keep your laptop awake and online; the Telegram bridge needs a running terminal.
 
-Probe an existing OpenCode/Cursor sandbox: `uv run smoke_harnesses.py NAME`.
-Add `--model-turns` for two potentially billable prompts that verify conversation
-resume. Authentication is required; the sandbox is not stopped.
+## More
 
-## Contributing
+[CLI guide](docs/usage.md) · [Terminal and clipboard](docs/terminal.md) ·
+[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Commits need a `Signed-off-by` trailer
-to accept the [CoreWeave CLA](CLA.md). Report vulnerabilities per [SECURITY.md](SECURITY.md).
-
-## License
-
-Copyright 2026 CoreWeave, Inc. Licensed under Apache 2.0. See [LICENSE](LICENSE).
-
-## Third-party software, services, and accounts
-
-cws-agent is an open-source CoreWeave tool that runs compatible agent software
-and services in CoreWeave Sandboxes. Third-party offerings are governed by their
-providers' licenses, terms, privacy notices, pricing, usage limits, and support
-policies. You are responsible for any required accounts, credentials,
-permissions, and compliance with the terms applicable to the third-party
-offerings you use. The Apache License 2.0 governs cws-agent; applicable
-CoreWeave terms govern your use of CoreWeave Sandboxes and related CoreWeave
-services.
-
-Except for offerings from CoreWeave or its affiliates, third-party offerings are
-independently provided and are not controlled by CoreWeave. CoreWeave makes no
-warranties regarding third-party offerings or their availability, security,
-accuracy, outputs, or conduct. Listing or supporting a compatible product does
-not, by itself, constitute sponsorship or endorsement of that product by
-CoreWeave. Product names and trademarks belong to their respective owners.
-
-Agents can generate inaccurate, insecure, harmful, or potentially infringing
-material and may execute commands, modify or delete files, or invoke external
-services. Review agent actions and outputs, maintain appropriate backups and
-access controls, and test thoroughly before production or other consequential
-use.
-
-This notice supplements and does not modify the Apache License 2.0 or any
-applicable agreement with CoreWeave.
+Copyright 2026 CoreWeave, Inc. [Apache 2.0](LICENSE) · [Third-party notices](docs/third-party.md).
