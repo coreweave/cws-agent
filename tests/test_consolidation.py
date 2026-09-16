@@ -42,7 +42,7 @@ class ConsolidationTests(unittest.TestCase):
         top = subcommands(cli_parser())  # argparse rejects duplicate registrations
         self.assertEqual(set(top), {"launch", "connect", "attach", "run", "login", "exec", "sync", "uploads",
                                     "snapshot", "checkpoint", "down", "restore", "resume", "list", "status", "snapshots",
-                                    "prune", "rc", "session", "bridge", "config"})
+                                    "prune", "rc", "session", "bridge", "discord", "config"})
         self.assertEqual(set(subcommands(top["session"])),
                          {"start", "attach", "ls", "history", "transfer", "resume", "restart", "diff", "stop"})
         self.assertEqual(set(subcommands(top["bridge"])), {"telegram"})

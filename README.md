@@ -114,6 +114,34 @@ cws-agent launch telegram1 --local-dir . --telegram
 The upload survives closing its terminal.
 Keep your laptop awake and online; the Telegram bridge needs a running terminal.
 
+## Chat with your agent in Discord
+
+Chat with Claude Code, OpenCode, or Cursor CLI from Discord. Start with a running,
+signed-in sandbox, such as `my-claude` above, and exit the agent to your local shell.
+
+[Create a Discord bot and install it in your server](docs/discord.md#2-create-and-install-your-bot).
+The guide walks through the Developer Portal, bot permissions, token, and server ID.
+Then enter the bot token privately and start listening:
+
+```bash
+export DISCORD_BOT_TOKEN="$(uv run --no-project python -c 'import getpass; print(getpass.getpass("Discord bot token: "))')"
+cws-agent discord --server 234567890123456789 --sandbox my-claude
+```
+
+Replace the example server ID with the first number after `/channels/` in a Discord
+channel URL: `https://discord.com/channels/SERVER_ID/CHANNEL_ID`.
+On mobile, tap your profile avatar → settings gear → **Advanced** and enable
+**Developer Mode**. Open the server, tap its name, scroll down, and tap **Copy Server ID**.
+
+In a public channel, select your bot
+from the `@` mention picker and send a message. It replies in a thread; mention it
+there for follow-ups. You get a receipt, typing indicator, and formatted replies.
+The first message starts an agent conversation in the selected sandbox.
+
+Keep this terminal running and its host awake and online.
+See [Discord setup](docs/discord.md) for DMs, shared thread history, and continuing
+the conversation in your terminal.
+
 ## More
 
 [CLI guide](docs/usage.md) · [Terminal and clipboard](docs/terminal.md) ·
