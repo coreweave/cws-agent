@@ -26,8 +26,8 @@ cleanup() {
   local code=$?
   trap - EXIT INT TERM
   if [ "$SMOKE_OWNS_SANDBOX" -eq 1 ]; then
-    "$DIR/cws-agent" down "$NAME" --no-snapshot >&2 || true
-    "$DIR/cws-agent" prune "$NAME" --keep 0 >&2 || true
+    "$DIR/cws-agent.py" down "$NAME" --no-snapshot >&2 || true
+    "$DIR/cws-agent.py" prune "$NAME" --keep 0 >&2 || true
   fi
   exit "$code"
 }
@@ -37,7 +37,7 @@ trap 'exit 143' TERM
 
 # An explicit reused name may still own old snapshots even without a running
 # sandbox. Refuse it rather than deleting those snapshots in our cleanup.
-EXISTING_SNAPSHOTS="$("$DIR/cws-agent" snapshots "$NAME")"
+EXISTING_SNAPSHOTS="$("$DIR/cws-agent.py" snapshots "$NAME")"
 if [ -n "$EXISTING_SNAPSHOTS" ]; then
   echo "smoke name '$NAME' already has snapshots; choose a fresh name" >&2
   exit 1
@@ -46,26 +46,26 @@ fi
 MARKER="persisted-$(date +%s)"
 
 step "launch --detach (creates sandbox, installs Claude Code into /opt/agent)"
-"$DIR/cws-agent" launch --name "$NAME" --lifetime 30m --detach
+"$DIR/cws-agent.py" launch --name "$NAME" --lifetime 30m --detach
 SMOKE_OWNS_SANDBOX=1
 
 step "seed a marker into /workspace/project (proves persistence across restore)"
-"$DIR/cws-agent" exec "$NAME" "echo $MARKER > /workspace/project/marker.txt && cat /workspace/project/marker.txt"
+"$DIR/cws-agent.py" exec "$NAME" "echo $MARKER > /workspace/project/marker.txt && cat /workspace/project/marker.txt"
 
 step "list"
-"$DIR/cws-agent" list
+"$DIR/cws-agent.py" list
 
 step "snapshot (while RUNNING)"
-"$DIR/cws-agent" snapshot "$NAME"
+"$DIR/cws-agent.py" snapshot "$NAME"
 
 step "down (snapshot + stop)"
-"$DIR/cws-agent" down "$NAME"
+"$DIR/cws-agent.py" down "$NAME"
 
 step "restore (restore latest snapshot into a fresh sandbox)"
-"$DIR/cws-agent" restore "$NAME" --lifetime 30m
+"$DIR/cws-agent.py" restore "$NAME" --lifetime 30m
 
 step "verify marker survived the stop/restore round-trip"
-GOT="$("$DIR/cws-agent" exec "$NAME" "cat /workspace/project/marker.txt" | tr -d '[:space:]')"
+GOT="$("$DIR/cws-agent.py" exec "$NAME" "cat /workspace/project/marker.txt" | tr -d '[:space:]')"
 if [ "$GOT" = "$MARKER" ]; then
   echo "  OK: marker '$GOT' survived snapshot round-trip"
 else
@@ -74,11 +74,11 @@ else
 fi
 
 step "status after restore"
-"$DIR/cws-agent" status "$NAME"
+"$DIR/cws-agent.py" status "$NAME"
 
 step "cleanup: down --no-snapshot + prune --keep 0"
-"$DIR/cws-agent" down "$NAME" --no-snapshot
-"$DIR/cws-agent" prune "$NAME" --keep 0
+"$DIR/cws-agent.py" down "$NAME" --no-snapshot
+"$DIR/cws-agent.py" prune "$NAME" --keep 0
 SMOKE_OWNS_SANDBOX=0
 
 step "PASS"

@@ -22,7 +22,7 @@ import time
 
 def load_cli():
     loader = importlib.machinery.SourceFileLoader(
-        "cws_agent_upload_smoke", str(Path(__file__).resolve().with_name("cws-agent")))
+        "cws_agent_upload_smoke", str(Path(__file__).resolve().with_name("cws-agent.py")))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[loader.name] = module

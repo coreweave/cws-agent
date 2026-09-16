@@ -30,7 +30,7 @@ def load_documented_cli():
     sdk.Sandbox = type("OfflineSandbox", (), {})
     sdk.FileSystemSnapshotOptions = sdk.ResourceOptions = object
     loader = importlib.machinery.SourceFileLoader(
-        "documented_sessions_cli", str(Path(__file__).resolve().parents[1] / "cws-agent"))
+        "documented_sessions_cli", str(Path(__file__).resolve().parents[1] / "cws-agent.py"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -470,7 +470,7 @@ class DocumentedSmokeCleanup(unittest.TestCase):
         self.log = self.root / "calls.jsonl"
         self.script = self.root / "smoke.sh"
         self.script.write_text((Path(__file__).resolve().parents[1] / "smoke.sh").read_text())
-        fake = self.root / "cws-agent"
+        fake = self.root / "cws-agent.py"
         fake.write_text("#!" + sys.executable + "\n" + '''
 import json, os, pathlib, sys
 args = sys.argv[1:]

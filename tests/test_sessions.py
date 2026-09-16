@@ -15,7 +15,7 @@ def load_cli():
     sdk.AuthStrategy = types.SimpleNamespace(WANDB="wandb", COREWEAVE_API_KEY="coreweave_api_key")
     sdk.CWSandboxAuthenticationError = type("CWSandboxAuthenticationError", (Exception,), {})
     sdk.FileSystemSnapshotOptions = sdk.ResourceOptions = sdk.Sandbox = object
-    loader = importlib.machinery.SourceFileLoader("cws_agent_sessions", str(Path(__file__).resolve().parents[1] / "cws-agent"))
+    loader = importlib.machinery.SourceFileLoader("cws_agent_sessions", str(Path(__file__).resolve().parents[1] / "cws-agent.py"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[loader.name] = module

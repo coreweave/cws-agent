@@ -16,8 +16,19 @@ cleanup-repro.py
 
 # Python / uv
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
+
+# Build outputs and compiled binaries
+/build/
+/dist/
+*.egg-info/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
 
 # OS
 .DS_Store

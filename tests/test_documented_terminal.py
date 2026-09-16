@@ -25,12 +25,17 @@ from cwsandbox._types import OperationRef, StreamReader, StreamWriter, TerminalS
 
 ROOT = Path(__file__).resolve().parents[1]
 if os.environ.get("CWS_TEST_REF"):
-    source = subprocess.check_output(["git", "show", os.environ["CWS_TEST_REF"] + ":cws-agent"], cwd=ROOT).decode()
+    ref = os.environ["CWS_TEST_REF"]
+    path = "cws-agent.py"
+    if subprocess.run(["git", "cat-file", "-e", ref + ":" + path], cwd=ROOT,
+                      stderr=subprocess.DEVNULL).returncode:
+        path = "cws-agent"  # Revisions before the source rename.
+    source = subprocess.check_output(["git", "show", ref + ":" + path], cwd=ROOT).decode()
 else:
-    source = (ROOT / "cws-agent").read_text()
+    source = (ROOT / "cws-agent.py").read_text()
 agent = types.ModuleType("documented_terminal_agent")
 sys.modules[agent.__name__] = agent
-exec(compile(source, str(ROOT / "cws-agent"), "exec"), agent.__dict__)
+exec(compile(source, str(ROOT / "cws-agent.py"), "exec"), agent.__dict__)
 
 
 def completed(value=None):

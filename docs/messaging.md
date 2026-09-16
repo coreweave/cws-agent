@@ -2,6 +2,8 @@
 
 [Back to README](../README.md).
 
+For Discord DMs and server threads, see [Discord setup](discord.md).
+
 Chat with Claude Code, Codex, Devin CLI, OpenCode, or Cursor CLI through Telegram.
 The bridge runs on your laptop or an always-on host; no inbound port is needed.
 Managed Agents and Outposts are not supported.

@@ -17,7 +17,7 @@ def load_cli():
     sdk.CWSandboxAuthenticationError = type("CWSandboxAuthenticationError", (Exception,), {})
     for name in ("Sandbox", "ResourceOptions", "FileSystemSnapshotOptions"):
         setattr(sdk, name, type(name, (), {}))
-    loader = importlib.machinery.SourceFileLoader("permissions_cli", str(Path(__file__).parents[1] / "cws-agent"))
+    loader = importlib.machinery.SourceFileLoader("permissions_cli", str(Path(__file__).parents[1] / "cws-agent.py"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[loader.name] = module
