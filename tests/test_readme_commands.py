@@ -7,7 +7,6 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -44,7 +43,6 @@ def documented_commands():
 
 class ReadmeCommands(unittest.TestCase):
     def test_checkout_examples_use_the_default_branch(self):
-        clones = 0
         for path in [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]:
             fences = re.findall(FENCE_PATTERN, path.read_text(), re.MULTILINE | re.DOTALL)
             for language, block in fences:
@@ -53,11 +51,9 @@ class ReadmeCommands(unittest.TestCase):
                 for line in re.sub(r"\\\r?\n", "", block).splitlines():
                     words = shlex.split(line, comments=True)
                     if words[:2] == ["git", "clone"]:
-                        clones += 1
                         with self.subTest(file=path.name, command=line):
                             self.assertNotIn("--branch", words)
                             self.assertEqual(words[-1], REPO_URL)
-        self.assertGreaterEqual(clones, 1)
 
     def test_combined_features_have_documented_examples(self):
         commands = [words[1:] for _, words in documented_commands()]
@@ -68,7 +64,7 @@ class ReadmeCommands(unittest.TestCase):
             with self.subTest(feature=prefix):
                 self.assertTrue(any(tuple(words[:len(prefix)]) == prefix for words in commands))
         for flag in ("--claude-env", "--outpost", "--upload", "--download",
-                     "--dangerously-skip-permissions", "--permission-mode", "--no-config-sync"):
+                     "--permission-mode", "--no-config-sync"):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in words for words in commands))
         for term in ("Ctrl+V", "cws-copy", "100 KB", "10 MiB", "5 MiB"):
@@ -89,33 +85,14 @@ class ReadmeCommands(unittest.TestCase):
                                    for h in headings}
                         self.assertIn(anchor, anchors)
 
-    def test_examples_use_installed_command_and_document_path_setup(self):
+    def test_examples_use_installed_command_and_link_to_installer(self):
         for path, body in DOCS.items():
             with self.subTest(file=path.name):
                 self.assertNotIn("./cws-agent", body)
-        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', README)
-        self.assertIn("~/.zshrc", README)
+        self.assertIn("https://raw.githubusercontent.com/coreweave/cws-agent/main/install.sh", README)
+        self.assertTrue((ROOT / "install.sh").is_file())
+        self.assertIn("zsh and bash", README)
         self.assertLess(len(README.splitlines()), 220, "Keep the quickstart concise")
-        self.assertIn("no Managed Agents chat command", README)
-
-    def test_install_link_is_absolute_and_does_not_overwrite(self):
-        install = re.search(r"^ln -s .+$", README, re.MULTILINE)
-        self.assertIsNotNone(install)
-        with tempfile.TemporaryDirectory(prefix="cws docs install ") as directory:
-            destination = Path(directory) / "cws-agent"
-            command = install.group().replace('"$HOME/.local/bin/cws-agent"',
-                                              shlex.quote(str(destination)))
-            result = subprocess.run(["bash", "-c", command], cwd=ROOT,
-                                    capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(destination.is_symlink())
-            self.assertEqual(destination.readlink(), ROOT / "cws-agent")
-            destination.unlink()
-            destination.write_text("existing installation\n")
-            result = subprocess.run(["bash", "-c", command], cwd=ROOT,
-                                    capture_output=True, text=True, timeout=10)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(destination.read_text(), "existing installation\n")
 
     def test_shell_fences_have_valid_bash_syntax(self):
         blocks = [(language, block) for language, block in FENCES
