@@ -44,24 +44,15 @@ The bridge retains a native Cursor chat ID for follow-up messages. Use the exist
 
 ## Permissions and configuration
 
-Cursor has no `accept-edits` CLI flag. The default keeps Cursor's native permission
-configuration and prints a notice; `--permission-mode native` suppresses the
-notice. `--dangerously-skip-permissions` maps to `--force`, which still honors
-explicit deny rules. It does **not** auto-approve every MCP server. Headless runs
-trust the sandbox workspace but do not silently bypass tool permissions.
-See [Cursor permissions](https://cursor.com/docs/cli/reference/permissions).
+YOLO uses `--force` by default, honoring explicit deny rules without automatically
+approving every MCP server. `--permission-mode native` keeps Cursor's policy.
+Cursor has no `accept-edits` flag; that mode also uses its native policy.
+[Permissions](https://cursor.com/docs/cli/reference/permissions).
 
-Reviewed imports install skills in `~/.cursor/skills` and MCP configuration in
-`~/.cursor/mcp.json` inside the sandbox. MCP authentication and missing server
-executables still need setup there. For example:
+[Config sync](config-import.md) imports skills and MCP definitions. Install
+missing server executables and authenticate MCP servers in the sandbox:
 
 ```sh
 cws-agent connect cursor1 --cmd 'cursor-agent mcp list'
 cws-agent connect cursor1 --cmd 'cursor-agent mcp login SERVER_NAME'
 ```
-
-Cursor binaries install under `/opt/agent`; auth, settings, and chat state use
-`HOME=/workspace/home` and are included in snapshots. Restoring reinstalls the
-native CLI without replacing saved state. Background CLI auto-updates are disabled
-to keep downloaded binaries out of snapshots. The integration installs verified
-Cursor CLI release `2026.09.02-c22c1a3` from Cursor's official download service.

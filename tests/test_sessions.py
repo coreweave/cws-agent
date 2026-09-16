@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 def load_cli():
     sdk = types.ModuleType("cwsandbox")
+    sdk.AuthStrategy = types.SimpleNamespace(WANDB="wandb", COREWEAVE_API_KEY="coreweave_api_key")
+    sdk.CWSandboxAuthenticationError = type("CWSandboxAuthenticationError", (Exception,), {})
     sdk.FileSystemSnapshotOptions = sdk.ResourceOptions = sdk.Sandbox = object
     loader = importlib.machinery.SourceFileLoader("cws_agent_sessions", str(Path(__file__).resolve().parents[1] / "cws-agent"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -76,14 +78,14 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(cli.cmd_session_restart(args), 0)
             cmd = run.call_args_list[-1].args[1]
             self.assertIn("/workspace/sessions/fix", cmd)
-            self.assertTrue(cmd[-1].endswith("exec codex resume abc --sandbox workspace-write --ask-for-approval on-request"))
+            self.assertTrue(cmd[-1].endswith("exec codex resume abc --dangerously-bypass-approvals-and-sandbox"))
             self.assertNotIn("worktree add", repr(run.call_args_list))
 
     def test_resume_uses_recorded_directory(self):
         args = types.SimpleNamespace(name="dev", agent=None, session_id="abc", cwd=None)
         with patch.object(cli, "require_active", return_value=object()), patch.object(cli, "remote_native_history", return_value=[{"agent": "claude", "id": "abc", "cwd": "/workspace/sessions/my work"}]), patch.object(cli, "pty_attach", return_value=0) as attach:
             cli.cmd_session_resume(args)
-        self.assertEqual(attach.call_args.args[1], "cd '/workspace/sessions/my work' && exec claude --resume abc --permission-mode acceptEdits")
+        self.assertEqual(attach.call_args.args[1], "cd '/workspace/sessions/my work' && exec claude --resume abc --dangerously-skip-permissions")
 
     def test_resume_parser_routes_without_cloud(self):
         with patch.object(cli, "cmd_session_resume", return_value=0) as command:

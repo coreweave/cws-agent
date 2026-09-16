@@ -23,7 +23,9 @@ sensitive backups. [OpenCode CLI reference](https://opencode.ai/docs/cli/)
 
 ## W&B Serverless Inference
 
-Keep your existing `CWSANDBOX_API_KEY` for sandbox access. In
+With `--wandb`, `WANDB_API_KEY` is forwarded for inference and gives the agent
+its sandbox-access permissions too. Without `--wandb`, it stays local unless
+you explicitly pass it through. In
 [W&B User Settings](https://wandb.ai/settings), select **Create new API key**,
 give it a name, then copy the **full key** immediately (it is shown only once).
 Your W&B account needs Serverless Inference access and available credits.
@@ -39,11 +41,8 @@ That's it: no provider chooser or hand-written JSON. The preset uses
 including background/title requests. Other providers are disabled for this preset.
 Code and prompts sent to the model use W&B Inference; execution stays in the sandbox.
 
-If you already have a **W&B** key for sandbox access, reuse that same full key
-as `WANDB_API_KEY`. A CoreWeave-only key is not automatically a W&B inference
-key. This CLI's sandbox connection still uses `CWSANDBOX_API_KEY`; `--wandb`
-only selects inference. HTTP 401/403 requires checking the W&B key, account
-access, and credits—not choosing another model provider.
+An explicit `CWSANDBOX_API_KEY` takes precedence for sandbox access.
+`WANDB_API_KEY` still supplies inference credentials; `--wandb` selects the preset.
 
 ### Why this model?
 
@@ -72,7 +71,7 @@ cws-agent session history open-wandb --agent opencode
 cws-agent session resume open-wandb ses_EXAMPLE --agent opencode
 cws-agent snapshot open-wandb
 cws-agent down open-wandb --no-snapshot
-cws-agent restore open-wandb --connect
+cws-agent restore open-wandb --wandb --connect
 ```
 
 Re-export `WANDB_API_KEY` before restoring. The preset and conversation data
@@ -83,27 +82,17 @@ reference, not the key. To stop using it, remove that preset file in the sandbox
 
 ## Permissions
 
-With no configured policy, the default accepts file edits and reads, but asks
-before shell commands, external-directory access, and other tools. Existing
-OpenCode permission policies are kept unchanged, including rule order and
-explicit denials; cws-agent only supplies defaults when no policy is configured.
-OpenCode rejects unanswered approval
-requests in headless runs; it does not silently approve them.
+YOLO is the default: OpenCode's `--auto` accepts approval requests while keeping
+explicit deny rules. `accept-edits` supplies defaults only when no policy is
+configured: file edits are allowed, other tools ask. Unanswered approvals fail
+in headless runs. `native` keeps OpenCode's own policy.
 
 ```sh
+cws-agent connect open1 --permission-mode accept-edits
 cws-agent connect open1 --permission-mode native
-cws-agent connect open1 --dangerously-skip-permissions
 ```
 
-`native` keeps OpenCode's configured policy. The dangerous option enables
-OpenCode's `--auto`: approval requests are accepted, but explicit deny rules
-remain enforced. These are agent policies, not an additional OS sandbox.
-Per-agent OpenCode configuration can override global permission defaults.
-[Permissions](https://opencode.ai/docs/permissions/)
-
-Internally, `/opt/agent/bin/opencode` translates private `--cws-permission=...`
-arguments to OpenCode's permission environment or `--auto`; user config files
-are not rewritten. Ordinary native commands still work through `cws-agent exec`.
+See [OpenCode permissions](https://opencode.ai/docs/permissions/).
 
 ## Skills, tools, and images
 

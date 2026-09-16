@@ -18,7 +18,7 @@ cws-agent launch --name telegram2 --agent claude --local-dir . --telegram --dang
 
 This opens sign-in when needed: type `/login` in Claude, complete it, then
 press Ctrl-D. The same command continues into Telegram setup and stays running.
-The permission flag allows tools without approval; omit it for default edit permissions.
+YOLO is the default. Use `--permission-mode accept-edits` or `--permission-mode native` to override it.
 
 Skills/MCP review and agent sign-in happen first. A separate process packages and
 uploads the workspace while Telegram setup proceeds; you do not wait for the files
@@ -115,8 +115,8 @@ Ctrl-C stops the bridge, not the sandbox.
   Everyone shares the sandbox/project.
 - Claude, OpenCode, and Cursor keep a conversation per chat/user pair; `/new` starts another and
   `/help` shows help. Codex and Devin use independent one-shot prompts.
-- Default [edit permissions](permissions.md) apply. Headless runs cannot answer
-  approval prompts; `--yolo` explicitly bypasses them.
+- [YOLO mode](permissions.md) bypasses approval prompts by default. Headless runs
+  cannot answer prompts when an explicit policy requires approval.
 - Groups, bots, edits, and attachments are ignored. Existing-bot pairing discards
   messages from before the pairing challenge; automatic pairing keeps prompts
   sent after the successful Start event. Fresh managed creation preserves the owner's
@@ -139,8 +139,8 @@ cws-agent bridge telegram dev1 --dangerously-skip-permissions
 
 This is equivalent to `--yolo`. It allows agent tools to run without approval;
 only allowlist people you trust with the sandbox and its credentials.
-Repeat the flag each time you start the bridge. Launch flags and saved pairing
-settings do not persist this permission choice.
+YOLO is the default. Explicit permission overrides apply only to the current
+invocation; saved pairing settings do not persist them.
 
 The one-command launch above passes the permission choice to its bridge too.
 For a fresh sandbox, use a separate bot; unset `TELEGRAM_BOT_TOKEN` if it points

@@ -33,7 +33,7 @@ class WandbPresetTests(unittest.TestCase):
         provider = config["provider"]["cws-wandb"]
         self.assertEqual(provider["options"]["apiKey"], "{env:WANDB_API_KEY}")
         self.assertEqual(provider["models"][agent.WANDB_OPENCODE_MODEL]["interleaved"], {"field": "reasoning"})
-        self.assertIn("WANDB_API_KEY", agent.HARNESSES["opencode"].env_passthrough)
+        self.assertNotIn("WANDB_API_KEY", agent.HARNESSES["opencode"].env_passthrough)
 
     def test_invalid_selection_or_credentials_fail_before_provision(self):
         parser = cli_parser()

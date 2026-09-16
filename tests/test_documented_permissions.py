@@ -1,4 +1,4 @@
-"""Permission bypass is explicitly requested and works in root containers."""
+"""Explicit permission policies work in root containers."""
 import io
 import shlex
 import types

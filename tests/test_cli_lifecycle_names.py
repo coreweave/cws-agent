@@ -9,6 +9,30 @@ from test_terminal import agent
 
 
 class LifecycleNameTests(unittest.TestCase):
+    def test_launch_accepts_positional_name_and_compatibility_flag(self):
+        for argv in (["dev1"], ["--name", "dev1"],
+                     ["dev1", "--agent", "codex"], ["--agent", "codex", "dev1"]):
+            with self.subTest(argv=argv), patch.object(agent, "cmd_launch", return_value=0) as launch:
+                self.assertEqual(agent.main(["launch", *argv]), 0)
+                self.assertEqual(launch.call_args.args[0].name, "dev1")
+
+    def test_launch_requires_exactly_one_name(self):
+        for argv in ([], ["--agent", "codex"], ["dev1", "dev2"],
+                     ["dev1", "--name", "dev2"], ["--name", "dev1", "dev2"]):
+            with self.subTest(argv=argv), patch.object(agent, "cmd_launch") as launch, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                agent.main(["launch", *argv])
+            self.assertEqual(error.exception.code, 2)
+            launch.assert_not_called()
+
+    def test_launch_validates_both_name_forms_before_remote_access(self):
+        for name in ("Invalid", "-bad", "a" * 41, ""):
+            for argv in ([f"--name={name}"], ["--", name]):
+                with self.subTest(argv=argv), patch.object(agent, "find_active") as active, \
+                        self.assertRaisesRegex(SystemExit, "session name must match"):
+                    agent.main(["launch", *argv])
+                active.assert_not_called()
+
     def test_connect_and_attach_share_parser_and_options(self):
         parser = cli_parser()
         commands = subcommands(parser)

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["cwsandbox>=1.1", "python-dotenv>=1,<2"]
+# dependencies = ["cwsandbox[wandb]>=1.10,<2", "python-dotenv>=1,<2"]
 # ///
 """Probe an installed OpenCode/Cursor CLI in an explicitly named running sandbox.
 

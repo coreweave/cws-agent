@@ -57,7 +57,7 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertEqual(env["XDG_CACHE_HOME"], "/opt/cache")
         self.assertEqual(env["OPENCODE_DISABLE_AUTOUPDATE"], "1")
 
-    def test_default_accepts_edits_but_not_shell_or_external_tools(self):
+    def test_accept_edits_does_not_enable_shell_or_external_tools(self):
         harness = agent.HARNESSES["opencode"]
         args = types.SimpleNamespace(yolo=False, permission_mode="accept-edits")
         flags = agent.permission_flags(harness, args)

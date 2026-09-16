@@ -72,7 +72,7 @@ class ConsolidationTests(unittest.TestCase):
         args = parser.parse_args(["launch", "--name", "dev1", "--dangerously-skip-permissions", "--no-config-sync"])
         self.assertTrue(args.yolo)
         self.assertTrue(args.no_config_sync)
-        self.assertEqual(parser.parse_args(["attach", "dev1"]).permission_mode, "accept-edits")
+        self.assertIsNone(parser.parse_args(["attach", "dev1"]).permission_mode)
 
     def test_managed_worker_default_attach_skips_local_config_discovery(self):
         sandbox = Mock(spec=Sandbox)

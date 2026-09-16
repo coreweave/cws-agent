@@ -14,6 +14,8 @@ import unittest
 from unittest.mock import patch
 
 sdk = types.ModuleType("cwsandbox")
+sdk.AuthStrategy = types.SimpleNamespace(WANDB="wandb", COREWEAVE_API_KEY="coreweave_api_key")
+sdk.CWSandboxAuthenticationError = type("CWSandboxAuthenticationError", (Exception,), {})
 sdk.FileSystemSnapshotOptions = sdk.ResourceOptions = sdk.Sandbox = object
 sys.modules.setdefault("cwsandbox", sdk)
 loader = importlib.machinery.SourceFileLoader("cws_native_imports", str(Path(__file__).parents[1] / "cws-agent"))

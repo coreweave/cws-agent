@@ -5,7 +5,7 @@ cws-agent is a single `uv run --script` file (`cws-agent`) plus offline tests in
 offline suite from the checkout:
 
 ```bash
-uv run --no-project --with 'cwsandbox>=1.1' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' python -m unittest discover -s tests
+uv run --no-project --with 'cwsandbox[wandb]>=1.10,<2' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' --with 'openai>=3.14,<4' python -m unittest discover -s tests
 ```
 
 ## Checklist

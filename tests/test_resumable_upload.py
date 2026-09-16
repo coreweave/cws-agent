@@ -261,6 +261,19 @@ class ResumableUploadTests(unittest.TestCase):
             self.assertEqual(stop.called, should_stop)
         self.assertIn("cws-agent connect test --dangerously-skip-permissions", self.errors.getvalue())
 
+    def test_paused_launch_reconnect_preserves_explicit_permission_mode(self):
+        for options in ([], ["--permission-mode", "accept-edits"], ["--permission-mode", "native"]):
+            with self.subTest(options=options), \
+                    patch.object(cli, "find_active", return_value=None), \
+                    patch.object(cli, "build_env", return_value={}), \
+                    patch.object(cli, "provision_session", return_value=self.sb), \
+                    patch.object(cli, "sync_local_dir", side_effect=cli.UploadPaused("resume me")), \
+                    contextlib.redirect_stderr(io.StringIO()) as output, \
+                    self.assertRaises(cli.UploadPaused):
+                cli.main(["launch", "test", "--local-dir", str(self.source), *options])
+            expected = "Then: cws-agent connect test" + (" " + " ".join(options) if options else "")
+            self.assertIn(expected + "\n", output.getvalue())
+
     def test_bad_cache_permissions_and_malformed_manifest_fail_cleanly(self):
         folder = self.pause()
         manifest = folder / "manifest.json"
