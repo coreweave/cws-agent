@@ -17,7 +17,7 @@ sdk.AuthStrategy = types.SimpleNamespace(WANDB="wandb", COREWEAVE_API_KEY="corew
 sdk.CWSandboxAuthenticationError = type("CWSandboxAuthenticationError", (Exception,), {})
 sdk.FileSystemSnapshotOptions = sdk.ResourceOptions = sdk.Sandbox = object
 sys.modules.setdefault("cwsandbox", sdk)
-loader = importlib.machinery.SourceFileLoader("cws_imports", str(Path(__file__).parents[1] / "cws-agent"))
+loader = importlib.machinery.SourceFileLoader("cws_imports", str(Path(__file__).parents[1] / "cws-agent.py"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 app = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = app

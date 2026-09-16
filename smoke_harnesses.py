@@ -31,8 +31,8 @@ def load_cli():
     # Source-generated remote helpers use inspect.getsource. Freeze the file so
     # concurrent local development cannot change its line offsets mid-smoke.
     frozen = tempfile.TemporaryDirectory(prefix="cws-harness-smoke-cli-")
-    source = Path(frozen.name) / "cws-agent"
-    shutil.copy2(Path(__file__).resolve().with_name("cws-agent"), source)
+    source = Path(frozen.name) / "cws-agent.py"
+    shutil.copy2(Path(__file__).resolve().with_name("cws-agent.py"), source)
     loader = importlib.machinery.SourceFileLoader(
         "cws_agent_harness_smoke", str(source))
     spec = importlib.util.spec_from_loader(loader.name, loader)

@@ -5,7 +5,7 @@ main() {
     set -eu
 
     if [ "$#" -gt 1 ]; then
-        echo "Usage: sh install.sh [path/to/cws-agent]" >&2
+        echo "Usage: sh install.sh [path/to/cws-agent.py]" >&2
         exit 1
     fi
 
@@ -22,7 +22,7 @@ main() {
     if [ "$#" -eq 1 ]; then
         cp "$1" "$staging/cws-agent"
     else
-        curl -fsSL https://raw.githubusercontent.com/coreweave/cws-agent/main/cws-agent \
+        curl -fsSL https://raw.githubusercontent.com/coreweave/cws-agent/main/cws-agent.py \
             -o "$staging/cws-agent"
     fi
     chmod 755 "$staging/cws-agent"

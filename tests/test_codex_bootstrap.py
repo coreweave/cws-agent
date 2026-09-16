@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 
-tree = ast.parse((Path(__file__).resolve().parents[1] / "cws-agent").read_text())
+tree = ast.parse((Path(__file__).resolve().parents[1] / "cws-agent.py").read_text())
 BOOTSTRAP = next(ast.literal_eval(node.value) for node in tree.body
                  if isinstance(node, ast.Assign)
                  and any(isinstance(target, ast.Name) and target.id == "CODEX_BOOTSTRAP"

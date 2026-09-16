@@ -32,7 +32,7 @@ class Installer(unittest.TestCase):
     def install(self, local=True):
         command = ["/bin/sh", str(ROOT / "install.sh")]
         if local:
-            command.append(str(ROOT / "cws-agent"))
+            command.append(str(ROOT / "cws-agent.py"))
         return subprocess.run(command, env=self.env, capture_output=True, text=True)
 
     def test_local_install_is_independent_and_repeatable(self):
@@ -41,7 +41,7 @@ class Installer(unittest.TestCase):
         for _ in range(2):
             result = self.install()
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.installed.read_bytes(), (ROOT / "cws-agent").read_bytes())
+        self.assertEqual(self.installed.read_bytes(), (ROOT / "cws-agent.py").read_bytes())
         self.assertFalse(self.installed.is_symlink())
         self.assertTrue(os.access(self.installed, os.X_OK))
         self.assertTrue(rc.read_text().startswith("# existing settings"))
@@ -89,7 +89,7 @@ set -eu
 test "$1" = -fsSL
 test "$3" = -o
 case "$2" in
-  https://raw.githubusercontent.com/coreweave/cws-agent/main/cws-agent)
+  https://raw.githubusercontent.com/coreweave/cws-agent/main/cws-agent.py)
     printf '#!/bin/sh\\necho command works\\n' > "$4"
     ;;
   https://astral.sh/uv/install.sh)

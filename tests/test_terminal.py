@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 
-loader = importlib.machinery.SourceFileLoader("cws_agent_terminal", str(Path(__file__).resolve().parents[1] / "cws-agent"))
+loader = importlib.machinery.SourceFileLoader("cws_agent_terminal", str(Path(__file__).resolve().parents[1] / "cws-agent.py"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 agent = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = agent

@@ -1,8 +1,8 @@
 # Contributing to cws-agent
 
-cws-agent is a single `uv run --script` file (`cws-agent`) plus offline tests in
-`tests/` and optional live smoke scripts. Clone the repository, then run the
-offline suite from the checkout:
+cws-agent is a single Python source file (`cws-agent.py`) run by `uv`, with offline
+tests in `tests/` and optional live smoke scripts. Clone the repository, then run
+the offline suite from the checkout:
 
 ```bash
 uv run --no-project --with 'cwsandbox[wandb]>=1.10,<2' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' --with 'openai>=3.14,<4' --with 'discord.py>=2.6,<3' python -m unittest discover -s tests
