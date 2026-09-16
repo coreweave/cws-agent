@@ -30,27 +30,27 @@ A `./` prefix looks for a file in your current directory instead.
 
 ## Launch
 
-Set your CoreWeave credential, then change to the project you want to upload:
+Set your W&B credential:
 
 ```bash
-export CWSANDBOX_API_KEY='YOUR_COREWEAVE_KEY'
+export WANDB_API_KEY='YOUR_WANDB_KEY'
 ```
 
 Choose one agent:
 
 ```bash
-cws-agent launch --name claude1 --local-dir .              # Claude Code (default)
-cws-agent launch --name cdx1 --agent codex --local-dir .    # Codex
-cws-agent launch --name dvn1 --agent devin --local-dir .    # Devin CLI
-cws-agent launch --name open1 --agent opencode --local-dir . # OpenCode
-cws-agent launch --name cursor1 --agent cursor --local-dir . # Cursor CLI
+cws-agent launch my-claude              # Claude Code (default)
+cws-agent launch cdx1 --agent codex    # Codex
+cws-agent launch dvn1 --agent devin    # Devin CLI
+cws-agent launch open1 --agent opencode # OpenCode
+cws-agent launch cursor1 --agent cursor # Cursor CLI
 ```
 
 Launch opens the remote agent. Follow its sign-in flow; if needed, exit the
 agent to return to your local shell and run:
 
 ```bash
-cws-agent login claude1
+cws-agent login my-claude
 ```
 
 For Claude, type `/login` inside the agent. For the others, use their sandbox name.
@@ -61,7 +61,7 @@ OpenCode with an open-weight coding model on **W&B Serverless Inference**:
 
 ```bash
 export WANDB_API_KEY='YOUR_WANDB_KEY'
-cws-agent launch --name open-wandb --agent opencode --wandb --local-dir .
+cws-agent launch open-wandb --agent opencode --wandb
 ```
 
 Keep your sandbox credential set. Get the W&B key from
@@ -69,7 +69,7 @@ Keep your sandbox credential set. Get the W&B key from
 and credits are required. The preset selects DeepSeek V4 Pro 0813, with no fallback
 to GPT or another provider. [Key setup, model choice, and alternatives](docs/opencode.md#wb-serverless-inference).
 
-Your project lands at `/workspace/project`. Local sync shows packaging/upload
+Add `--local-dir PATH` to upload a project to `/workspace/project`. Local sync shows packaging/upload
 sizes and progress (`.` means the entire current directory).
 Launch automatically sizes the disk to fit local files with headroom; `--disk` overrides it.
 Project uploads are resumable: on failure, run the printed `cws-agent sync NAME
@@ -79,20 +79,20 @@ With `--telegram`, skills/MCP setup and sign-in come first; workspace upload run
 in the background while you chat. Completion automatically saves a snapshot.
 Later: `cws-agent restore telegram2 --telegram --dangerously-skip-permissions` restores
 the saved workspace and reconnects the bot without another upload.
-Edits are accepted by default where supported; Cursor retains its native permissions.
-Other actions can still need approval. Review the skills/MCP import prompt,
+CLI agents start in YOLO mode by default, bypassing tool approval prompts.
+Use `--permission-mode accept-edits` or `--permission-mode native` to override it. Review the skills/MCP import prompt,
 or press Enter to skip. Exiting the agent **does not stop the sandbox**.
 
 ## Daily commands
 
 ```bash
 cws-agent list
-cws-agent connect claude1                   # open the agent in a running sandbox
-cws-agent sync claude1 .                   # upload local changes
-cws-agent run claude1 "summarize this repo" # one-shot prompt
-cws-agent snapshot claude1                 # save workspace without stopping
-cws-agent down claude1                     # snapshot and stop compute
-cws-agent restore claude1 --connect          # restore and open the agent
+cws-agent connect my-claude                   # open the agent in a running sandbox
+cws-agent sync my-claude .                   # upload local changes
+cws-agent run my-claude "summarize this repo" # one-shot prompt
+cws-agent snapshot my-claude                 # save workspace without stopping
+cws-agent down my-claude                     # snapshot and stop compute
+cws-agent restore my-claude --connect          # restore and open the agent
 ```
 
 Re-export environment-only credentials before `restore`. Snapshots retain
@@ -105,8 +105,8 @@ read the [snapshot caveat](docs/usage.md#snapshots) before storing sensitive dat
 ## Continue a conversation
 
 ```bash
-cws-agent session history claude1
-cws-agent session resume claude1 SESSION_ID
+cws-agent session history my-claude
+cws-agent session resume my-claude SESSION_ID
 ```
 
 History listing supports Claude/Codex and OpenCode workspace projects; Cursor
@@ -120,7 +120,7 @@ Use `--claude-env` to run **Managed Agents tool workers**:
 
 ```bash
 export ANTHROPIC_ENVIRONMENT_KEY='YOUR_ENVIRONMENT_KEY'
-cws-agent launch --name claudebox --claude-env env_REPLACE_ME
+cws-agent launch claudebox --claude-env env_REPLACE_ME
 ```
 
 This starts workers and returns to your shell. It does not create a conversation.
@@ -137,7 +137,7 @@ Claude Code login tokens.
 Create a Claude sandbox and connect Telegram in one command:
 
 ```bash
-cws-agent launch --name telegram2 --local-dir . --telegram --dangerously-skip-permissions
+cws-agent launch telegram2 --local-dir . --telegram --dangerously-skip-permissions
 ```
 
 Follow sign-in and QR pairing; leave the command running. The permission flag
@@ -147,11 +147,11 @@ to create bots without copying each token; otherwise setup asks for a BotFather 
 | Task | How |
 | --- | --- |
 | Parallel agents, restart, history transfer | [Sessions guide](docs/sessions.md) |
-| Bypass permissions explicitly | `cws-agent connect claude1 --yolo` — [permissions](docs/permissions.md) |
-| Review skills and MCP imports | `cws-agent config sync claude1` — [configuration](docs/config-import.md) |
+| Bypass permissions explicitly | `cws-agent connect my-claude --yolo` — [permissions](docs/permissions.md) |
+| Review skills and MCP imports | `cws-agent config sync my-claude` — [configuration](docs/config-import.md) |
 | Paste a local image into remote Claude | **Ctrl+V** — [terminal guide](docs/terminal.md) |
 | Copy remote text to your clipboard | Ask the agent to run `cws-copy` — [terminal guide](docs/terminal.md) |
-| Telegram chat with QR pairing and progress updates | `cws-agent bridge telegram claude1` — [messaging guide](docs/messaging.md) |
+| Telegram chat with QR pairing and progress updates | `cws-agent bridge telegram my-claude` — [messaging guide](docs/messaging.md) |
 | Get changes back, snapshots, remote control | [Usage guide](docs/usage.md) |
 
 ## Troubleshooting
@@ -167,7 +167,7 @@ to create bots without copying each token; otherwise setup asks for a BotFather 
 From the repository checkout, run offline checks:
 
 ```bash
-uv run --no-project --with 'cwsandbox>=1.1' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' --with 'openai>=3.14,<4' python -m unittest discover -s tests
+uv run --no-project --with 'cwsandbox[wandb]>=1.10,<2' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' --with 'openai>=3.14,<4' python -m unittest discover -s tests
 ```
 
 These do not prove live provider authentication or terminal rendering.

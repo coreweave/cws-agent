@@ -158,7 +158,8 @@ exit "${CWS_CURSOR_TEST_CURL_STATUS:-0}"
     def test_accept_edits_does_not_enable_shell_or_mcp_bypass(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            flags = agent.permission_flags(self.harness, types.SimpleNamespace(yolo=False))
+            flags = agent.permission_flags(self.harness,
+                types.SimpleNamespace(yolo=False, permission_mode="accept-edits"))
         self.assertEqual(flags, "")
         self.assertIn("configured permissions", stderr.getvalue())
 

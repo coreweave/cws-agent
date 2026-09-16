@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 def load_cli():
     sdk = types.ModuleType("cwsandbox")
+    sdk.AuthStrategy = types.SimpleNamespace(WANDB="wandb", COREWEAVE_API_KEY="coreweave_api_key")
+    sdk.CWSandboxAuthenticationError = type("CWSandboxAuthenticationError", (Exception,), {})
     for name in ("Sandbox", "ResourceOptions", "FileSystemSnapshotOptions"):
         setattr(sdk, name, type(name, (), {}))
     loader = importlib.machinery.SourceFileLoader("permissions_cli", str(Path(__file__).parents[1] / "cws-agent"))
@@ -38,11 +40,14 @@ class PermissionTests(unittest.TestCase):
             "claude": ["--permission-mode", "acceptEdits"],
             "devin": ["--permission-mode", "accept-edits"],
             "codex": ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
+            "opencode": ["--cws-permission=accept-edits"],
+            "cursor": [],
         }
         for name, flags in expected.items():
             harness = cli.HARNESSES[name]
             for option in ([], ["--yolo"], ["--dangerously-skip-permissions"],
                            ["--dangerously-bypass-approvals-and-sandbox"],
+                           ["--permission-mode", "accept-edits"],
                            ["--permission-mode", "native"]):
                 with self.subTest(name=name, option=option), \
                      patch.object(cli, "require_active"), \
@@ -51,15 +56,15 @@ class PermissionTests(unittest.TestCase):
                     self.assertEqual(cli.main(["attach", "dev1", *option]), 0)
                     result = shlex.split(attach.call_args.args[1])
                     chosen = ([] if "native" in option else
-                              shlex.split(harness.yolo_flag) if option else flags)
-                    self.assertEqual(result, ["exec", name, *chosen])
+                              flags if "accept-edits" in option else shlex.split(harness.yolo_flag))
+                    self.assertEqual(result, [*shlex.split(harness.interactive_cmd), *chosen])
 
     def test_headless_codex_policy_uses_supported_config_argument(self):
         result = types.SimpleNamespace(stdout="", stderr="", returncode=0)
         with patch.object(cli, "require_active"), \
              patch.object(cli, "active_harness", return_value=cli.HARNESSES["codex"]), \
              patch.object(cli, "exec_retry", return_value=result) as execute:
-            cli.main(["run", "dev1", "fix $(touch /tmp/unwanted) 'quote'"])
+            cli.main(["run", "dev1", "fix $(touch /tmp/unwanted) 'quote'", "--permission-mode", "accept-edits"])
         script = execute.call_args.args[1][2]
         self.assertIn("--sandbox workspace-write -c 'approval_policy=\"on-request\"'", script)
         self.assertNotIn("--ask-for-approval", script)
@@ -69,15 +74,17 @@ class PermissionTests(unittest.TestCase):
 
     def test_headless_run_closes_stdin_for_every_agent(self):
         result = types.SimpleNamespace(stdout="", stderr="", returncode=0)
-        for name in ("claude", "codex", "devin"):
+        for name in ("claude", "codex", "devin", "opencode", "cursor"):
             harness = cli.HARNESSES[name]
             with self.subTest(name=name), \
                  patch.object(cli, "require_active"), \
                  patch.object(cli, "active_harness", return_value=harness), \
+                 patch.object(cli, "cursor_auth_status", return_value=True), \
                  patch.object(cli, "exec_retry", return_value=result) as execute:
                 cli.main(["run", "dev1", "task"])
                 script = execute.call_args.args[1][2]
                 self.assertIn("IS_SANDBOX=1", script)
+                self.assertIn(harness.yolo_flag, script)
                 self.assertTrue(script.endswith(" </dev/null"), script)
 
     def test_flags_reach_all_agent_entrypoints(self):
@@ -91,9 +98,23 @@ class PermissionTests(unittest.TestCase):
                  (["bridge", "telegram", "dev1", "--allow-chat", "1", "--allow-user", "1"], "cmd_bridge_telegram"),
                  (["rc", "dev1"], "cmd_rc")]
         for argv, handler in cases:
-            with self.subTest(argv=argv), patch.object(cli, handler, return_value=0) as command:
-                cli.main([*argv, "--yolo"])
-                self.assertTrue(command.call_args.args[0].yolo)
+            for options in ([], ["--yolo"], ["--permission-mode", "accept-edits"],
+                            ["--permission-mode", "native"]):
+                with self.subTest(argv=argv, options=options), patch.object(cli, handler, return_value=0) as command:
+                    cli.main([*argv, *options])
+                    args = command.call_args.args[0]
+                    flags = cli.permission_flags(cli.HARNESSES["claude"], args)
+                    expected = (" --permission-mode acceptEdits" if "accept-edits" in options else
+                                "" if "native" in options else " --dangerously-skip-permissions")
+                    self.assertEqual(flags, expected)
+
+    def test_worker_attach_keeps_its_shell_by_default(self):
+        for name in ("ant", "openai"):
+            with self.subTest(name=name), patch.object(cli, "require_active"), \
+                    patch.object(cli, "active_harness", return_value=cli.HARNESSES[name]), \
+                    patch.object(cli, "pty_attach", return_value=0) as attach:
+                cli.main(["connect", "worker"])
+                self.assertEqual(attach.call_args.args[1], "exec bash")
 
     def test_conflicting_policy_flags_fail_before_remote_access(self):
         with patch.object(cli, "require_active") as active, contextlib.redirect_stderr(io.StringIO()):

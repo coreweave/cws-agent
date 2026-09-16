@@ -1,246 +1,188 @@
 # Everyday usage
 
-[Back to README](../README.md). Run `cws-agent` from your local project directory.
+[Back to README](../README.md). Run these commands from your local shell.
 
 ## Authentication
 
-This CLI uses `CWSANDBOX_API_KEY` for sandbox access. OpenCode's `--wandb`
-preset additionally uses `WANDB_API_KEY` for inference; it does not switch the
-sandbox SDK's authentication strategy. [W&B setup](opencode.md#wb-serverless-inference).
-Set `CWSANDBOX_BASE_URL` only for a non-default endpoint.
+### W&B accounts
 
-| Agent | Sign in after launch | Optional credential before launch |
-| --- | --- | --- |
-| Claude Code | `cws-agent login dev1`, then `/login` | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` |
-| Codex | `cws-agent login cdx1` | `OPENAI_API_KEY` |
-| Devin CLI | `cws-agent login dvn1`, then paste its login token | Use the login flow; forwarded keys may not be accepted by your account |
-| OpenCode | `cws-agent login open1`, then choose a provider | `OPENCODE_API_KEY` or your supported provider key; [details](opencode.md) |
-| Cursor CLI | `cws-agent login cursor1`, then open its browser link | `CURSOR_API_KEY`; [details](cursor.md) |
-
-For a Claude token, run `claude setup-token` locally and export only the printed
-token as `CLAUDE_CODE_OAUTH_TOKEN`. Do not capture the interactive command with
-shell substitution. It requires a local Claude installation.
-API-key usage is billed through the API; it is not subscription authentication.
-
-Saved login files survive snapshots. Environment-only credentials do not:
-re-export them before restoring a sandbox. Forward additional variables by name:
+Use your [W&B API key](https://wandb.ai/authorize):
 
 ```bash
-cws-agent launch --name dev1 --local-dir . --env-passthrough MY_SERVICE_TOKEN
+export WANDB_API_KEY='YOUR_WANDB_KEY'
+cws-agent launch my-claude
 ```
 
-Never commit credentials or paste real keys into issues or chat.
+A saved `wandb login` also works. `--agent opencode --wandb` forwards the key
+for inference, giving the agent its sandbox-access permissions too. For access and setup, see
+[Serverless Sandboxes](https://docs.wandb.ai/sandboxes).
+
+### CoreWeave accounts
+
+Use a **CoreWeave API access token**. In [Cloud Console → Tokens](https://console.coreweave.com/tokens),
+choose **Create Token** and copy the **Token Secret**:
+
+```bash
+export CWSANDBOX_API_KEY='YOUR_COREWEAVE_TOKEN_SECRET'
+cws-agent launch my-claude
+```
+
+This token takes precedence over W&B credentials for sandbox access.
+See [token setup](https://docs.coreweave.com/security/authn-authz/manage-api-access-tokens)
+and [CoreWeave Sandbox setup](https://docs.coreweave.com/products/sandboxes/get-started).
+Your organization must have sandbox access enabled.
+
+### Agent sign-in
+
+Sandbox credentials create compute; sign in to your agent separately.
+
+| Agent | Sign in | Optional environment variable |
+| --- | --- | --- |
+| Claude Code | `/login` inside Claude | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` |
+| Codex | `cws-agent login my-codex` | `OPENAI_API_KEY` |
+| Devin CLI | `cws-agent login my-devin` | Use its login flow |
+| OpenCode | `cws-agent login my-opencode` | [Provider key or W&B inference](opencode.md) |
+| Cursor CLI | `cws-agent login my-cursor` | `CURSOR_API_KEY` |
+
+For a Claude subscription token, run `claude setup-token` locally and copy only
+the printed token into `CLAUDE_CODE_OAUTH_TOKEN`. API keys use API billing.
+Saved logins survive snapshots; re-export environment-only credentials before restore.
+To pass another variable, add `--env-passthrough VARIABLE_NAME` to launch or restore.
 
 ## Upload your project
 
 ```bash
-cws-agent launch --name dev1 --local-dir . --exclude data --exclude .cache
-cws-agent sync dev1 .
+cws-agent launch project1 --local-dir . --exclude .env --exclude data
+cws-agent sync project1 . --exclude .env --exclude data
 ```
 
-Files go to `/workspace/project`, including `.git` and project agent settings.
-Common dependency/build directories are excluded. Use `--no-git` to omit Git history.
-Successful project uploads automatically save a workspace snapshot, including
-already-imported skills/MCP configuration and stored agent state. `--no-snapshot`
-on `launch` or `sync` opts out. Snapshot failure leaves uploaded data intact and
-prints a snapshot retry command; only a reported READY snapshot is restorable.
-Launch sizes the disk automatically from the filtered, uncompressed local files:
-allow 4 KiB per entry for filesystem overhead, budget another copy for the staged
-archive, add 50% headroom plus 5 GiB, and
-round up to a 5 GiB increment (minimum 10 GiB). The chosen size is printed before
-provisioning. For example, 20.4 GiB across roughly 546,000 entries selects 65 GiB.
-An explicit `--disk` overrides this choice. Without `--local-dir`, the default
-remains 10 GiB. This sizes new sandboxes; `sync` does not resize an existing disk.
-The estimate cannot anticipate unlimited file growth or future dependency installs.
-Review what you upload: project sync is a file copy, not the filtered
-[skills/MCP import](config-import.md).
+Files go to `/workspace/project`. `.git` is included; common dependency and build
+directories are excluded. **`.gitignore` is not applied.** Exclude secrets explicitly;
+`--no-git` skips Git history. Private Git clones need credentials inside the sandbox.
 
-`--local-dir .` selects your **whole current directory**, including nested projects.
-`.gitignore` is not applied; exclude secrets such as `.env` explicitly.
-Scanning reports discovered bytes, packaging shows the selected source-byte total,
-and upload shows the exact compressed total and remotely verified bytes.
-Terminals show a progress bar when wide enough; redirected logs get periodic plain
-status lines on stderr. Remote extraction is reported separately before success.
+CLI launches and `sync` save a snapshot after upload unless you pass `--no-snapshot`.
+If snapshot creation fails, the files remain uploaded; retry with `cws-agent snapshot project1`.
+Worker launch modes do not take this automatic snapshot.
 
-Upload/extraction gets a size-based deadline instead of the SDK's five-minute
-default: allow one second per compressed MiB and per 100 files, plus ten minutes
-(minimum fifteen minutes). Override with `--transfer-timeout 4h` on `launch` or
-`sync` if needed. This does not extend the sandbox's `--lifetime`.
-Each 32 MiB chunk is checksum-verified and committed before progress advances.
-Chunks have a five-minute deadline and one-minute input-stall limit; failed chunks
-get up to two retries, checking for a saved receipt first. `Upload verified` means
-all compressed bytes are saved; extraction is a separate step and can be retried
-without uploading again.
+Launch sizes the disk to fit your files with headroom; `--disk` overrides it.
+Without local files, the default is 10 GiB. `sync` cannot resize an existing disk.
+Large transfers get a size-based timeout; use `--transfer-timeout 4h` to override it.
+This does not extend the sandbox's lifetime.
+
+Uploads normally block. With `launch --telegram`, upload runs in a separate local
+process after sign-in; keep the laptop awake and online. Background uploads preserve
+existing remote files so they do not overwrite the agent's edits.
+
+Sync merges files and overwrites matching paths. `--clean` deletes the remote
+project before extraction. Avoid concurrent edits: packaging and extraction are
+not atomic, and files changed during packaging may be skipped with a warning.
 
 ### Resume an upload
 
-```bash
-cws-agent uploads                         # find retained upload IDs
-cws-agent sync telegram2 --resume-upload ID
-cws-agent uploads --discard ID            # delete only this local cache
-```
-
-The error prints the exact recovery command. Resume uses the **original cached
-archive**, not your current local files; no scanning or packaging is repeated.
-Missing or damaged remote chunks are resent. A failed extraction keeps all chunks;
-a saved completion marker prevents reapplying an already successful extraction.
-To send newer edits afterward, run a normal `sync NAME .`.
-
-Failed uploads keep the sandbox running and billable until its **original lifetime
-expires** or you stop it. Resume before expiration. If it has expired, explicitly
-target a replacement sandbox with the same cached ID; chunks not available there
-must be uploaded again. This cannot recover uploads made by older CLI versions.
-For Telegram launches, imports and sign-in happen before the background upload;
-the agent remains usable if that upload pauses. Follow its private log or the
-bot's status message for the resume ID. Non-Telegram failed launches print the
-remaining config/login/connect commands.
-
-Cached archives live in `~/.local/state/cws-agent/uploads` (owner-only permissions,
-not encrypted) and need compressed-archive-sized local disk space. Remote staging
-uses `/workspace/.cws-uploads`. Success deletes the local archive and remote chunks,
-keeping a small remote completion receipt. Discard removes only the local cache;
-remote staging remains until successful extraction or sandbox deletion. Cache
-directories are excluded from project scans.
-
-Extraction merges into the project and is **not atomic**: a failure can leave
-partial files. Telegram background uploads preserve existing remote files rather
-than overwrite agent edits (`sync --preserve-existing` selects the same behavior).
-That choice is retained in the resumable archive. Other syncs overwrite as before.
-Avoid external writers during extraction/recovery.
-`sync --clean` deletes project contents only after every chunk is verified;
-resuming such an upload requires `--clean` again. Extraction is never automatically
-replayed after a failure.
-
-To check the upload fix without a large project, run these from the repository:
+Run the recovery command printed after a failure:
 
 ```bash
-# Offline interruption/resume tests using real local tar and checksum operations.
-uv run --no-project --python 3.12 python -m unittest discover -s tests -p 'test_resumable_upload.py'
-# Live interruption/resume check in isolated temporary directories.
-uv run smoke_upload.py telegram2
+cws-agent uploads
+cws-agent sync project1 --resume-upload ID
+cws-agent uploads --discard ID
 ```
 
-The live check uses an **existing** sandbox, 8 MiB of random test data, and a
-temporary directory that is removed after verification. It does not touch your
-project or start/stop agents. Expect tens of seconds on a healthy connection;
-individual transfers have short deadlines. It prints the SDK version being
-tested. This checks the failure handling, not sustained multi-gigabyte throughput.
+Resume reuses the original cached archive and verified chunks. Send newer changes
+with a separate `sync`. An extraction failure may leave partial files; resume it
+before using the project. A clean upload requires `--clean` again on resume.
 
-Project packaging tolerates a working directory that changes: new files after
-the scan wait for the next sync; removed paths are skipped. Edited files are
-captured individually, retried once if they change while being read, then skipped
-with a warning if still unstable. This is a best-effort copy, not an atomic
-snapshot. Packaging totals adjust for changed sizes and retries; the compressed
-upload total is exact. One file at a time is buffered (large files use temporary
-disk space). Once packaging finishes, later edits cannot affect that upload.
-History transfers retain their stricter consistency checks.
+A paused upload leaves compute running until you stop it or its lifetime expires.
+Resume before expiration, or target a replacement sandbox and resend missing chunks.
 
-`sync --clean` **deletes the remote project before extraction**. Use it only when
-you intend to replace remote changes. Private repositories need remote Git authentication.
+Archives live in `~/.local/state/cws-agent/uploads`; they need local disk space and
+are not encrypted. Successful upload removes the archive and remote chunks.
+`--discard` removes only the local archive.
 
 ## Get changes back
 
-There is no `pull` command. Export a patch, or push a branch after configuring
-Git credentials inside the sandbox:
+Export a patch, or push a branch using Git credentials configured in the sandbox:
 
 ```bash
-cws-agent exec dev1 "git diff" > dev1.patch
-cws-agent session diff work fix-auth > fix-auth.patch
+cws-agent exec project1 "git diff" > project.patch
+cws-agent session diff project1 fix-auth > fix-auth.patch
+cws-agent exec project1 "git push origin HEAD:agent/fix-auth"
 ```
 
-Review a patch before applying it with `git apply`. Diffs omit untracked files;
-use `git add -N` for new files before exporting, or commit them before pushing.
+Review patches before `git apply`. Diffs omit untracked files; use `git add -N`
+before exporting new files, or commit before pushing. There is no `pull` command.
 
-```bash
-cws-agent exec dev1 "git push origin HEAD:agent/fix-auth"
-```
-
-Git authentication is not copied from your laptop. `GH_TOKEN` alone does not
-authenticate plain Git. For HTTPS GitHub remotes, install `gh`, supply its
-credential, and configure [gh auth setup-git](https://cli.github.com/manual/gh_auth_setup-git).
-SSH remotes need their own SSH setup.
+Git credentials are not copied from your laptop. For GitHub HTTPS remotes,
+[configure `gh auth setup-git`](https://cli.github.com/manual/gh_auth_setup-git)
+inside the sandbox; `GH_TOKEN` alone does not authenticate plain Git.
+SSH remotes need SSH credentials there.
 
 ## Snapshots
 
 ```bash
-cws-agent snapshot dev1         # snapshot without stopping
-cws-agent down dev1             # snapshot, then stop compute
-cws-agent restore dev1 --connect  # restore into a new sandbox
-cws-agent snapshots dev1
-cws-agent prune dev1 --keep 3   # delete older READY snapshots
+cws-agent snapshot my-claude          # save without stopping
+cws-agent down my-claude              # save and stop compute
+cws-agent restore my-claude --connect  # restore and open the agent
+cws-agent snapshots my-claude          # list saved snapshots
+cws-agent prune my-claude --keep 3     # delete older READY snapshots
 ```
 
-`snapshot` creates a backup; `snapshots` lists backups. `checkpoint` remains a
-compatibility alias for `snapshot`.
+Snapshots preserve `/workspace`: project files, worktrees, and saved logins.
+They do not preserve running processes. Use [session restart](sessions.md) for
+saved worktrees, and take another snapshot after later edits.
+Only READY snapshots can be restored.
 
-Only `/workspace` persists: project files, worktrees, and saved agent state
-under `/workspace/home`. Processes do not persist; agent binaries outside the
-volume are reinstalled. Use [session restart](sessions.md) for retained worktrees.
+**During capture, file read permissions are temporarily broadened, including on
+saved credentials, and symlinks become placeholders.** The CLI restores their
+original permissions and targets afterward. Use trusted processes in the sandbox
+and pause unrelated writers during capture; only this host's Telegram requests
+coordinate automatically.
 
-**Snapshot caveat:** the snapshot service needs readable files and cannot archive
-symlinks directly. Preparation temporarily broadens read permissions (including
-stored credentials) and substitutes link placeholders. A restore manifest preserves
-the original targets and modes; the CLI restores live attributes afterward, even
-on snapshot failure, and rehydrates them when resuming a snapshot. Use only trusted
-processes/users in the sandbox. This host's Telegram requests coordinate with
-capture; unrelated processes or clients on other hosts are not paused.
-
-New snapshots record the configured disk size, reused by `restore` unless `--disk`
-overrides it. Legacy snapshots without disk metadata still default to 10 GiB;
-specify a sufficient disk explicitly for those. Snapshots are not continuous
-backups: later edits require another snapshot or `down` without `--no-snapshot`.
-
-`down --no-snapshot` stops without saving current changes. Snapshots accumulate
-until pruned; quotas and maximum sandbox lifetime depend on your account.
+Restore reuses the saved disk size; override it with `--disk`. Older snapshots
+without disk metadata default to 10 GiB. `down --no-snapshot` stops compute without
+saving current changes; snapshots remain until pruned.
 
 ## Reconnect from another machine
 
-Install the CLI there and use a CoreWeave credential with access to the sandbox:
+Install `cws-agent` and use credentials with access to the same sandbox:
 
 ```bash
 cws-agent list
-cws-agent status dev1
-cws-agent connect dev1
+cws-agent status my-claude
+cws-agent connect my-claude
 ```
 
-`list` shows start dates and times in your local timezone, with a timezone label.
-
-Use `restore dev1 --connect` instead if it was stopped and has a snapshot.
-`connect` opens the CLI; [session resume](sessions.md) selects a saved conversation.
-Dropped connections are not automatically reattached.
-
-Compatibility: `attach` aliases `connect`; top-level `resume` aliases `restore`;
-`restore --attach` aliases `restore --connect`. `session resume` still continues
-an existing conversation, and `session attach` still joins a running tmux process.
+If stopped, use `restore my-claude --connect`. To continue a saved conversation,
+use [session resume](sessions.md). Connections do not reconnect automatically.
 
 ## Claude Remote Control
 
-For an eligible Claude subscription login:
+Use a Claude subscription login, then open the URL printed by `rc`:
 
 ```bash
-cws-agent login dev1
-cws-agent rc dev1
+cws-agent login my-claude
+cws-agent rc my-claude
 ```
 
-Complete `/login`, exit to your local shell, then run `rc` and open the URL in
-its logs. API keys and setup-token-only authentication are not sufficient for
-this workflow. This is Claude Code Remote Control, not Managed Agents.
-See [provider requirements](https://code.claude.com/docs/en/remote-control).
+Complete `/login` and exit Claude before running `rc`. API keys and setup tokens
+alone do not support this workflow. [Provider requirements](https://code.claude.com/docs/en/remote-control).
 
 ## Options
 
-Run `cws-agent --help` for commands or `cws-agent launch --help` for all launch flags.
+Run `cws-agent --help` or `cws-agent launch --help` for all commands and flags.
 
-| Scope | Options |
+| Task | Options |
 | --- | --- |
-| Launch and restore sizing | `--cpu 4 --memory 8Gi --disk 20Gi --lifetime 7d` (defaults: 2, 4Gi, auto for local-directory launch or 10Gi otherwise, 8h) |
-| Launch and restore environment | `--image IMAGE`, `--mode serverless\|cks`, `--env KEY=VALUE`, `--env-passthrough KEY` |
-| Launch only | `--local-dir PATH`, `--repo-url URL`, `--exclude NAME`, `--no-git`, `--detach` |
-| Restore and connect | `restore NAME --connect` |
-| Worker backends | [Environment/outpost target and worker count](self-hosted.md) |
-| Agent policy | [Accept edits, bypass, or native](permissions.md) |
+| Set resources | `--cpu 4 --memory 8Gi --disk 20Gi --lifetime 7d` |
+| Choose an image or placement | `--image IMAGE`, `--mode serverless\|cks` |
+| Pass environment variables | `--env KEY=VALUE`, `--env-passthrough KEY` |
+| Clone or upload a project | `--repo-url URL`, `--local-dir PATH` |
+| Create without opening an agent | `launch NAME --detach` |
+| Run a shell command | `exec NAME "command"` |
+| Send a one-shot agent task | `run NAME "prompt"` |
 
-`launch --detach` prepares a CLI sandbox without starting its interactive agent.
-Use `login`, `connect`, or `session start` afterward. `exec NAME "command"` runs a
-shell command without invoking an agent; `run NAME "prompt"` invokes the agent
-headlessly. Headless approval prompts cannot be answered.
+Defaults: 2 CPUs, 4 GiB memory, 8-hour lifetime. Disk is automatic for local uploads,
+otherwise 10 GiB. `--detach` prepares the sandbox; use `login`, `connect`, or
+`session start` afterward.
+
+Compatibility aliases: `attach` → `connect`, `resume` → `restore`,
+`checkpoint` → `snapshot`, and `restore --attach` → `restore --connect`.

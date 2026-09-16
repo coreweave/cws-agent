@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["cwsandbox>=1.1", "openai>=3.14,<4", "python-dotenv>=1,<2"]
+# dependencies = ["cwsandbox[wandb]>=1.10,<2", "openai>=3.14,<4", "python-dotenv>=1,<2"]
 # ///
 """Billable end-to-end Agents API test; creates and cleans up its own resources."""
 import argparse
@@ -24,7 +24,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="gpt-6-astra")
     args = parser.parse_args(argv)
-    missing = [key for key in ("CWSANDBOX_API_KEY", "OPENAI_API_KEY", "OPENAI_EXECUTOR_API_KEY")
+    missing = [key for key in ("OPENAI_API_KEY", "OPENAI_EXECUTOR_API_KEY")
                if not os.environ.get(key)]
     if missing:
         raise SystemExit("Missing credentials: " + ", ".join(missing))
@@ -72,13 +72,13 @@ def main(argv=None):
     finally:
         cleanup_errors = []
         try:
-            for sb in cli.Sandbox.list(tags=[cli.SESSION_TAG, cli.name_tag(name)]).result(timeout=30):
+            for sb in cli.Sandbox.list(tags=[cli.SESSION_TAG, cli.name_tag(name)], auth=cli.sandbox_auth()).result(timeout=30):
                 sb.stop(missing_ok=True).result(timeout=60)
         except Exception as error:
             cleanup_errors.append("sandbox: " + type(error).__name__)
         try:
             for snap in cli.session_snapshots(name):
-                cli.Sandbox.delete_snapshot(snap.file_system_snapshot_id, missing_ok=True).result(timeout=60)
+                cli.Sandbox.delete_snapshot(snap.file_system_snapshot_id, missing_ok=True, auth=cli.sandbox_auth()).result(timeout=60)
         except Exception as error:
             cleanup_errors.append("snapshot: " + type(error).__name__)
         if session_id:

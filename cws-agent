@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "cwsandbox>=1.1",
+#     "cwsandbox[wandb]>=1.10,<2",
 #     "segno>=1.6,<2",
 #     "truststore>=0.10,<1",
 #     "markdown-it-py>=3,<5",
@@ -24,8 +24,8 @@ instead of hosting a CLI you drive: `launch --outpost NAME` runs Devin outpost
 workers that claim sessions from Devin Cloud.
 
 Usage:
-    cws-agent launch  --name dev1 [--agent claude|codex|devin|opencode|cursor] [--local-dir .]
-    cws-agent launch  --name box1 --outpost my-outpost --workers 2
+    cws-agent launch  dev1 [--agent claude|codex|devin|opencode|cursor] [--local-dir .]
+    cws-agent launch  box1 --outpost my-outpost --workers 2
     cws-agent connect  dev1 [--cmd bash]
     cws-agent run     dev1 "fix the failing test" [--yolo]
     cws-agent snapshot dev1
@@ -35,8 +35,9 @@ Usage:
     cws-agent session start|attach|ls|diff|stop   # parallel agents, one worktree each
     cws-agent rc      dev1          # start `claude remote-control` (after /login)
 
-Auth: the CoreWeave side uses CWSANDBOX_API_KEY, plus CWSANDBOX_BASE_URL if
-needed. WANDB_API_KEY selects inference credentials with --wandb. Agent env
+Auth: sandbox access uses WANDB_API_KEY or a saved W&B login. An explicit
+CWSANDBOX_API_KEY selects CoreWeave authentication instead. CWSANDBOX_BASE_URL
+overrides the endpoint. --wandb also uses W&B for OpenCode inference. Agent env
 passthrough: CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY are
 copied into the sandbox if set locally. The Devin CLI needs one interactive
 login, which persists across restores because $HOME lives on the snapshotted
@@ -57,6 +58,8 @@ import time
 from dataclasses import dataclass
 
 from cwsandbox import (
+    AuthStrategy,
+    CWSandboxAuthenticationError,
     FileSystemSnapshotOptions,
     ResourceOptions,
     Sandbox,
@@ -469,7 +472,7 @@ HARNESSES: dict[str, Harness] = {
         yolo_flag=" --cws-permission=bypass",
         env_passthrough=("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY",
                          "GOOGLE_GENERATIVE_AI_API_KEY", "OPENROUTER_API_KEY",
-                         "GROQ_API_KEY", "OPENCODE_VERSION", "WANDB_API_KEY"),
+                         "GROQ_API_KEY", "OPENCODE_VERSION"),
         login_cmd="exec opencode auth login",
         agent_bin="opencode",
     ),
@@ -542,24 +545,23 @@ HARNESSES: dict[str, Harness] = {
 
 
 def permission_flags(harness: Harness, args, *, headless: bool = False) -> str:
-    """Map the shared CLI policy to each harness without escalating by default."""
+    """Default CLI agents to bypass; preserve explicit policies and worker behavior."""
+    mode = getattr(args, "permission_mode", None)
     if harness.name == "openai" and (getattr(args, "yolo", False) or
-                                     getattr(args, "permission_mode", "accept-edits") != "accept-edits"):
+                                     mode not in (None, "accept-edits")):
         raise SystemExit("error: CLI permission flags do not apply to the OpenAI executor")
     if harness.name in ("ant", "openai"):
         return ""  # worker-backed environments attach a shell, not a chat CLI
+    if getattr(args, "yolo", False) or mode is None:
+        return harness.yolo_flag
     if harness.name == "cursor":
-        if getattr(args, "yolo", False):
-            return harness.yolo_flag
-        if getattr(args, "permission_mode", "accept-edits") != "native":
+        if mode != "native":
             # No edits-only CLI mode: don't grant shell/MCP access with --force
             # or overwrite the user's restored permission configuration.
             print("Cursor has no accept-edits flag; using its configured permissions "
                   "(--permission-mode native hides this notice).", file=sys.stderr)
         return ""
-    if getattr(args, "yolo", False):
-        return harness.yolo_flag
-    if getattr(args, "permission_mode", "accept-edits") == "native":
+    if mode == "native":
         return ""
     if harness.name == "claude":
         return " --permission-mode acceptEdits"
@@ -795,8 +797,15 @@ def automatic_snapshot(sb, name, harness_name):
 # ---------------------------------------------------------------------------
 
 
+def sandbox_auth() -> AuthStrategy:
+    """Prefer W&B unless the caller explicitly configures a CoreWeave key."""
+    if os.environ.get("CWSANDBOX_API_KEY", "").strip():
+        return AuthStrategy.COREWEAVE_API_KEY
+    return AuthStrategy.WANDB
+
+
 def find_active(name: str) -> Sandbox | None:
-    boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(name)]).result()
+    boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(name)], auth=sandbox_auth()).result()
     if not boxes:
         return None
     if len(boxes) > 1:
@@ -817,7 +826,7 @@ def require_active(name: str) -> Sandbox:
 
 
 def all_session_sandbox_ids(name: str) -> set[str]:
-    boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(name)], show_terminated=True).result()
+    boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(name)], show_terminated=True, auth=sandbox_auth()).result()
     return {b.sandbox_id for b in boxes}
 
 
@@ -825,7 +834,7 @@ def session_snapshots(name: str):
     ids = all_session_sandbox_ids(name)
     if not ids:
         return []
-    snaps = [s for s in Sandbox.list_snapshots().result() if s.source_sandbox_id in ids]
+    snaps = [s for s in Sandbox.list_snapshots(auth=sandbox_auth()).result() if s.source_sandbox_id in ids]
     snaps.sort(key=lambda s: (s.created_at is not None, s.created_at), reverse=True)
     return snaps
 
@@ -865,11 +874,15 @@ def _validate_token(key: str, val: str) -> str:
     return stripped
 
 
-def build_env(harness: Harness, extra_env: list[str], passthrough: list[str]) -> dict[str, str]:
+def build_env(harness: Harness, extra_env: list[str], passthrough: list[str],
+              *, wandb: bool = False) -> dict[str, str]:
     # HOME is set per-exec by SH_WRAP (state on the snapshot volume), not as a
     # container env, so the install step can target AGENT_HOME instead.
     env: dict[str, str] = {}
-    for key in list(harness.env_passthrough) + passthrough:
+    keys = list(harness.env_passthrough) + passthrough
+    if wandb and harness.name == "opencode":
+        keys.append("WANDB_API_KEY")
+    for key in keys:
         val = os.environ.get(key)
         if val:
             env[key] = _validate_token(key, val) if key in _TOKEN_KEYS else val
@@ -976,7 +989,7 @@ def create_session_sandbox(
     )
     if mode:
         kwargs["placement_mode"] = mode
-    return Sandbox.run("sh", "-c", "sleep infinity", **kwargs)
+    return Sandbox.run("sh", "-c", "sleep infinity", auth=sandbox_auth(), **kwargs)
 
 
 def _is_start_transient(e: Exception) -> bool:
@@ -1137,7 +1150,7 @@ def start_openai_executor(sb, session_id):
 def run_openai_prompt(sb, args):
     if args.timeout <= 0:
         raise SystemExit("error: --timeout must be positive")
-    if args.yolo or args.permission_mode != "accept-edits":
+    if args.yolo or args.permission_mode not in (None, "accept-edits"):
         raise SystemExit("error: configure permissions through the Agents API; CLI permission flags do not apply")
     state = read_backend_config(sb)
     if not state or state["kind"] != "openai":
@@ -3237,10 +3250,10 @@ def launch_session(args) -> int:
         raise SystemExit("error: --telegram requires a CLI agent and cannot be combined with --detach or worker backends")
     if telegram and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise SystemExit("error: launch --telegram requires an interactive terminal for setup and agent sign-in")
-    if (args.outpost or args.claude_env or args.agent == "openai") and (args.yolo or args.permission_mode != "accept-edits"):
+    if (args.outpost or args.claude_env or args.agent == "openai") and (args.yolo or args.permission_mode not in (None, "accept-edits")):
         raise SystemExit("error: permission flags apply to agent CLIs, not worker backends")
     if not NAME_RE.match(args.name):
-        raise SystemExit("error: --name must match [a-z0-9][a-z0-9-]{0,39}")
+        raise SystemExit("error: session name must match [a-z0-9][a-z0-9-]{0,39}")
     if args.workers < 1:
         raise SystemExit("error: --workers must be positive")
     if args.agent == "openai" and (args.outpost or args.claude_env):
@@ -3272,7 +3285,7 @@ def launch_session(args) -> int:
         agent = "ant"
     harness = HARNESSES[agent]
     image = args.image or harness.image
-    env = build_env(harness, args.env, args.env_passthrough)
+    env = build_env(harness, args.env, args.env_passthrough, wandb=getattr(args, "wandb", False))
     wandb_config = wandb_opencode_config(args, harness, env)
     if harness.name == "openai":
         if not env.get("CODEX_API_KEY"):
@@ -3372,7 +3385,7 @@ def launch_session(args) -> int:
             followup = (f"cws-agent bridge telegram {args.name}" if telegram else f"cws-agent connect {args.name}")
             if args.yolo:
                 followup += " --dangerously-skip-permissions"
-            elif args.permission_mode != "accept-edits":
+            elif args.permission_mode is not None:
                 followup += " --permission-mode " + shlex.quote(args.permission_mode)
             print("Then: " + followup, file=sys.stderr)
             raise
@@ -3450,7 +3463,7 @@ def launch_session(args) -> int:
 
 
 def cmd_attach(args) -> int:
-    if args.cmd and (args.yolo or args.permission_mode != "accept-edits"):
+    if args.cmd and (args.yolo or args.permission_mode not in (None, "accept-edits")):
         raise SystemExit("error: permission flags cannot be combined with --cmd")
     sb = require_active(args.name)
     harness = active_harness(sb, args.agent)
@@ -3855,7 +3868,7 @@ def start_launched_telegram(sb, harness, args, env):
         return cmd_bridge_telegram(bridge_args)
     finally:
         permission = " --dangerously-skip-permissions" if args.yolo else (
-            " --permission-mode native" if args.permission_mode == "native" else "")
+            " --permission-mode " + shlex.quote(args.permission_mode) if args.permission_mode is not None else "")
         print(f"Sandbox {args.name!r} was not stopped by the bridge. Reconnect: cws-agent bridge telegram {args.name}{permission}")
         print(f"To snapshot and stop compute: cws-agent down {args.name}")
 
@@ -4522,7 +4535,7 @@ def cmd_snapshot(args) -> int:
         print("  Sandbox was not stopped. If live restoration did not complete, inspect /workspace/.cws-snapshot-restore.json before retrying.", file=sys.stderr)
         print("  For repeated failures, inspect the snapshot error returned by the service. Re-uploading or changing --transfer-timeout will not fix snapshot creation.", file=sys.stderr)
         return 1
-    snap = Sandbox.get_snapshot(snap_id).result()
+    snap = Sandbox.get_snapshot(snap_id, auth=sandbox_auth()).result()
     mib = (snap.size_bytes or 0) / (1 << 20)
     print(f"  snapshot {snap_id} READY ({mib:.1f} MiB, {time.monotonic() - t0:.1f}s)")
     return 0
@@ -4563,12 +4576,12 @@ def cmd_resume(args) -> int:
     harness_name = harness_from_request_id(getattr(snap, "request_id", None))
     harness = HARNESSES[harness_name or args.agent or "claude"]
     if harness.name == "openai" and (args.claude_env or args.outpost or args.workers not in (None, 1)
-                                    or args.yolo or args.permission_mode != "accept-edits"):
+                                    or args.yolo or args.permission_mode not in (None, "accept-edits")):
         raise SystemExit("error: OpenAI restore uses its saved API session and one executor; worker overrides and CLI permissions do not apply")
     if getattr(args, "telegram", False) and (harness.name in ("ant", "openai") or args.claude_env or args.outpost):
         raise SystemExit("error: Telegram requires a CLI-agent snapshot, not worker backends")
     image = args.image or harness.image
-    env = build_env(harness, args.env, args.env_passthrough)
+    env = build_env(harness, args.env, args.env_passthrough, wandb=getattr(args, "wandb", False))
     wandb_config = wandb_opencode_config(args, harness, env)
     if harness.name == "openai":
         if not env.get("CODEX_API_KEY"):
@@ -4648,7 +4661,7 @@ def format_started_at(started) -> str:
 
 
 def cmd_list(args) -> int:
-    boxes = Sandbox.list(tags=[SESSION_TAG]).result()
+    boxes = Sandbox.list(tags=[SESSION_TAG], auth=sandbox_auth()).result()
     if not boxes:
         print("no active agent sessions.")
         return 0
@@ -4711,7 +4724,7 @@ def cmd_prune(args) -> int:
         print(f"nothing to prune ({len(snaps)} READY snapshot(s), keeping {args.keep})")
         return 0
     for s in doomed:
-        Sandbox.delete_snapshot(s.file_system_snapshot_id, missing_ok=True).result()
+        Sandbox.delete_snapshot(s.file_system_snapshot_id, missing_ok=True, auth=sandbox_auth()).result()
         print(f"deleted {s.file_system_snapshot_id}")
     return 0
 
@@ -5790,11 +5803,11 @@ def cmd_session_stop(args) -> int:
 def add_permission_flags(p: argparse.ArgumentParser) -> None:
     group = p.add_mutually_exclusive_group()
     group.add_argument("--permission-mode", choices=["accept-edits", "native"],
-                       default="accept-edits",
-                       help="accept edits by default; native leaves the agent's own policy unchanged")
+                       default=None,
+                       help="override the default YOLO mode: accept-edits requests edit permissions; native uses the agent's own policy")
     group.add_argument("--yolo", "--dangerously-skip-permissions",
                        "--dangerously-bypass-approvals-and-sandbox", dest="yolo",
-                       action="store_true", help="bypass agent permission prompts for this invocation")
+                       action="store_true", help="bypass agent permission prompts (default for CLI agents)")
 
 
 def add_verbose_flag(p: argparse.ArgumentParser) -> None:
@@ -5830,7 +5843,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("launch", help="create a session sandbox and attach")
-    p.add_argument("--name", required=True, help="session name ([a-z0-9-], <=40 chars)")
+    name = p.add_mutually_exclusive_group(required=True)
+    name.add_argument("name", nargs="?", default=argparse.SUPPRESS,
+                      help="session name ([a-z0-9-], <=40 chars)")
+    name.add_argument("--name", dest="name", default=argparse.SUPPRESS,
+                      help="compatibility alias for the positional session name")
     add_create_flags(p)
     p.add_argument("--repo-url", help="git URL to clone into /workspace/project")
     p.add_argument("--local-dir", metavar="PATH",
@@ -6047,6 +6064,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except CWSandboxAuthenticationError:
+        print("error: sandbox authentication failed. Set WANDB_API_KEY or run `wandb login`; "
+              "CoreWeave accounts can set CWSANDBOX_API_KEY.", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return 130
 

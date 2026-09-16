@@ -44,6 +44,22 @@ class TelegramLaunchTests(unittest.TestCase):
                                             {credential: "test"})
             login.assert_not_called()
 
+    def test_bridge_and_reconnect_command_preserve_permission_mode(self):
+        for options in ([], ["--yolo"], ["--permission-mode", "accept-edits"],
+                        ["--permission-mode", "native"]):
+            with self.subTest(options=options), \
+                    patch.object(app, "cmd_bridge_telegram", return_value=0) as bridge, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                args = self.args(*options)
+                app.start_launched_telegram(object(), app.HARNESSES["claude"], args,
+                                            {"ANTHROPIC_API_KEY": "test"})
+                expected = app.permission_flags(app.HARNESSES["claude"], args)
+                self.assertEqual(app.permission_flags(app.HARNESSES["claude"], bridge.call_args.args[0]), expected)
+                reconnect = output.getvalue().split("Reconnect: ")[1].splitlines()[0]
+                with patch.object(app, "cmd_bridge_telegram", side_effect=lambda args: args):
+                    parsed = app.main(reconnect.split()[1:])
+                self.assertEqual(app.permission_flags(app.HARNESSES["claude"], parsed), expected)
+
     def test_login_cancellation_does_not_start_bridge_or_destroy_sandbox(self):
         with patch.object(app, "pty_attach", return_value=130), \
                 patch.object(app, "cmd_bridge_telegram") as bridge, \

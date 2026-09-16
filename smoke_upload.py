@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["cwsandbox>=1.1"]
+# dependencies = ["cwsandbox[wandb]>=1.10,<2"]
 # ///
 """Live resumable upload check: uv run smoke_upload.py EXISTING_SANDBOX_NAME.
 

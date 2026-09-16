@@ -25,6 +25,8 @@ from unittest.mock import Mock, patch
 
 def load_documented_cli():
     sdk = types.ModuleType("cwsandbox")
+    sdk.AuthStrategy = types.SimpleNamespace(WANDB="wandb", COREWEAVE_API_KEY="coreweave_api_key")
+    sdk.CWSandboxAuthenticationError = type("CWSandboxAuthenticationError", (Exception,), {})
     sdk.Sandbox = type("OfflineSandbox", (), {})
     sdk.FileSystemSnapshotOptions = sdk.ResourceOptions = object
     loader = importlib.machinery.SourceFileLoader(
@@ -230,9 +232,9 @@ class DocumentedSessionCommands(unittest.TestCase):
 
     def test_restart_uses_native_continuation_for_each_cli_harness(self):
         for agent, native in (
-                ("claude", "claude --continue --permission-mode acceptEdits"),
-                ("codex", "codex resume --last --sandbox workspace-write --ask-for-approval on-request"),
-                ("devin", "devin --continue --permission-mode accept-edits")):
+                ("claude", "claude --continue --dangerously-skip-permissions"),
+                ("codex", "codex resume --last --dangerously-bypass-approvals-and-sandbox"),
+                ("devin", "devin --continue --permission-mode bypass")):
             with self.subTest(agent=agent), patch.object(app, "require_active", return_value=object()), \
                     patch.object(app, "read_session_sessions", return_value=[{"name": "fix", "alive": False}]), \
                     patch.object(app, "active_harness", return_value=app.HARNESSES[agent]), \
@@ -418,7 +420,7 @@ class DocumentedSnapshotCommands(unittest.TestCase):
         with patch.object(app, "session_snapshots", return_value=snapshots), \
                 patch.object(app.Sandbox, "delete_snapshot", return_value=operation(None), create=True) as delete:
             self.assertEqual(self.call(["prune", "dev1", "--keep", "1"]), 0)
-        delete.assert_called_once_with("old", missing_ok=True)
+        delete.assert_called_once_with("old", missing_ok=True, auth=app.sandbox_auth())
 
     def test_prune_rejects_negative_keep_without_deleting(self):
         with patch.object(app, "session_snapshots", return_value=[snapshot("new"), snapshot("old")]), \

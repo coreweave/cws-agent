@@ -19,7 +19,7 @@ You need three credentials:
 
 | Variable on your machine | Purpose | Sent to the sandbox |
 | --- | --- | --- |
-| `CWSANDBOX_API_KEY` | Create and manage CoreWeave compute | No |
+| `WANDB_API_KEY` (or `CWSANDBOX_API_KEY` for CoreWeave accounts) | Sandbox access | No |
 | `OPENAI_API_KEY` | Create API sessions, submit prompts, inspect results | No |
 | `OPENAI_EXECUTOR_API_KEY` | Register the sandbox executor with OpenAI | Yes, as `CODEX_API_KEY` |
 

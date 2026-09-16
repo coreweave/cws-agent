@@ -22,10 +22,9 @@ cws-agent session stop work add-tests      # kill agent and worktree, keep the b
 ```
 
 Each session forks from the project's `HEAD` onto `agent/<session>`. Override
-with `--base` and `--branch`. Agents accept edits by default; shell commands
-can still require approval. `--yolo` bypasses permission prompts for unattended
-runs. See [permission modes](permissions.md) for mappings, aliases, and
-`--permission-mode native`. On
+with `--base` and `--branch`. Agents bypass permission prompts by default (YOLO).
+Use `--permission-mode accept-edits` or `--permission-mode native` to override it.
+See [permission modes](permissions.md) for mappings and aliases. On
 `restore`, worktrees and branches come back, but their tmux processes do not.
 Use `cws-agent session restart work fix-auth` to restart the agent in its
 existing worktree, then attach. `session start` creates a new worktree and
