@@ -9,11 +9,71 @@ directory recovers that operation instead of creating a different checkpoint.
 It uses filesystem snapshots; processes, memory, sockets, and in-flight model
 requests are not restored.
 
-This mode requires an external **writer gate**. The CLI does not yet enforce that
-gate across `connect`, `exec`, uploads, parallel sessions, messaging bridges,
-background services, or direct SDK calls. Only use checkpoint mode when your
-application routes all of these writers through the gate. A no-op hook cannot
-make a live workspace consistent.
+Launch with `--managed-headless` to use the built-in writer gate for CLI commands
+and uploads. Other sessions require an external **writer gate** supplied by your
+application. A no-op hook cannot make a live workspace consistent.
+
+## Managed headless sessions
+
+Use a digest-pinned Linux image with Python 3.9+ and its `sqlite3` module already
+installed. The sandbox must support `/proc`, child subreapers, and `syncfs`.
+The CLI installs the selected agent during bootstrap; an agent image is not
+required. Export the agent's credentials before launch, since interactive login
+is unavailable in this mode.
+
+```bash
+cws-agent launch project1 --managed-headless \
+  --image REGISTRY/IMAGE@sha256:DIGEST --local-dir .
+cws-agent run project1 'Fix the failing test and run the test suite'
+cws-agent sync project1 .
+cws-agent down project1 --checkpoint-dir ./project1-checkpoint
+cws-agent restore project1 --checkpoint-dir ./project1-checkpoint --no-config-sync
+```
+
+`--managed-headless` implies `--detach` on launch. It supervises bootstrap,
+headless `run`, `exec`, uploads, and config imports. Automatic upload snapshots
+are skipped; save and stop with `down --checkpoint-dir`. Restore from its
+manifest automatically preserves managed mode and initializes fresh admission
+state on the new sandbox, including when it runs on another host.
+
+Admission state lives outside `/workspace` in the source sandbox. Separate CLI
+processes and machines using this version share it. Checkpointing closes
+admission first, waits for admitted commands and all their descendants to exit,
+then flushes the workspace filesystem. A detached child keeps its command
+pending even after the parent exits. Commands are allowed to finish normally;
+checkpointing does not interrupt an agent turn or capture its RAM.
+
+If a command supervisor disappears, its durable receipt remains unconfirmed and
+checkpointing is refused. Timeouts keep admission closed. Inspect the gate with
+`cws-agent status project1`, retry the same checkpoint directory, or explicitly
+abandon an uncommitted checkpoint:
+
+```bash
+cws-agent down project1 --checkpoint-dir ./project1-checkpoint --abort-checkpoint
+```
+
+Aborting reopens admission but does not erase unconfirmed commands. There is no
+force-clear option: inspect or discard such a source with `down --no-snapshot`.
+The gate retains at most 4096 command receipts and 4096 checkpoint-operation
+receipts per source, then refuses new admissions. Checkpoint and restore into a
+fresh sandbox before reaching that limit. Managed commands are not automatically
+replayed after transport errors; inspect their output and workspace before retrying.
+
+`connect`, `login`, tmux worktree sessions, interactive native resume, Remote
+Control, messaging bridges, worker backends, and ordinary snapshots are refused.
+Use a native headless command to continue a saved conversation:
+
+```bash
+cws-agent session history project1
+cws-agent exec project1 'claude -p --resume NATIVE_SESSION_ID "Continue the task and run tests"'
+```
+
+This gate is cooperative, not a security boundary. Use it only when all workload
+commands go through this CLI version. Older clients, direct SDK/API execs, tools
+that launch work through another service, and processes modifying the gate can
+bypass it. The image must not start independent workspace writers. It does not
+provide isolation between simultaneous admitted commands or automatically resume
+an interrupted model request.
 
 ## Before starting
 
@@ -32,6 +92,11 @@ make a live workspace consistent.
   coordinators against copies of the same directory or rely on network locks.
 
 ## Hook contract
+
+For ordinary sessions, route every writer through your application's gate,
+including terminals, uploads, bridges, background services, and SDK calls. The
+CLI does not add coordination to those sessions. Managed headless sessions use
+their built-in gate and reject an external hook override.
 
 Supply an executable file, without shell arguments. The CLI invokes it as:
 
@@ -55,7 +120,7 @@ checkpoint. A timeout is not permission for the hook to reopen admission.
 The hook receives no input and its output is suppressed, since it may contain
 credentials. Keep diagnostic logs in your application's private storage.
 Use the same executable path when retrying an operation. The hook is application
-code that you supply; this repository does not ship a universal writer gate.
+code that you supply; the built-in gate is limited to managed headless sessions.
 
 ## Suspend and recover
 
@@ -100,7 +165,6 @@ service access checks, not stored in the local journal.
 ```bash
 cws-agent restore project1 --checkpoint-dir ./project1-checkpoint
 cws-agent session history project1
-cws-agent session resume project1 NATIVE_SESSION_ID --agent claude
 ```
 
 Restore requires a completed suspend and uses exactly the committed READY
@@ -118,6 +182,10 @@ downloads and dependencies are not automatically pinned by this feature; use
 your deployment's version controls for reproducible toolchains. Resume a saved
 conversation using its native ID; this does not resume the old process or retry
 unfinished tool calls automatically.
+
+Use headless native resume through `exec` for managed sessions, as shown above.
+For sessions coordinated by an external hook, interactive native resume remains
+available through `cws-agent session resume project1 NATIVE_SESSION_ID --agent claude`.
 
 Restore allocation uses the existing restore command's behavior. It is not a
 durable or idempotent allocation transaction. If it is interrupted, inspect

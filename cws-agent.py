@@ -80,6 +80,9 @@ PROJECT_DIR = f"{MOUNT_PATH}/project"  # snapshotted: the repo / working files
 AGENT_HOME = "/opt/agent"              # ephemeral: agent BINARY (NEVER snapshotted)
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+MANAGED_HEADLESS_ENV = "CWS_AGENT_MANAGED_HEADLESS"
+BUILTIN_WRITER_GATE = "builtin:headless-v1"
+MANAGED_GATE_PATH = "/opt/cws-agent-headless-v1.py"
 
 # Older snapshot helpers reject symlinks, so ordinary snapshots use a metadata
 # workaround. Checkpoint mode requires native permission/symlink support.
@@ -602,6 +605,8 @@ def session_tags(name: str, harness: str) -> list[str]:
 def exec_retry(sb: Sandbox, command, *, timeout_seconds=None, attempts=4):
     """Run sb.exec, retrying transient runner errors (a runner being replaced
     surfaces as 'Runner shard is retiring' or a channel reset mid-call)."""
+    if isinstance(sb, ManagedHeadlessSandbox):
+        attempts = 1  # A transport error is not permission to replay admitted work.
     last: Exception | None = None
     for i in range(attempts):
         try:
@@ -621,6 +626,9 @@ def exec_retry(sb: Sandbox, command, *, timeout_seconds=None, attempts=4):
 def probe_session_meta(sb: Sandbox) -> tuple[str, str]:
     """Read (name, harness) from the session env. Tags filter server-side but
     aren't readable on adopted Sandbox objects, so we stamp env at create."""
+    env = managed_headless_environment(sb)
+    if env:
+        return env.get("CWS_AGENT_NAME", "?"), env.get("CWS_AGENT_HARNESS", "?")
     try:
         r = exec_retry(
             sb,
@@ -656,6 +664,7 @@ def harness_from_request_id(request_id: str | None) -> str | None:
 
 def take_snapshot(sb: Sandbox, name: str, harness_name: str) -> str:
     """Make FSS-compatible placeholders, then restore live links and permissions."""
+    reject_managed_headless(sb, "ordinary snapshots; use down --checkpoint-dir")
     with workspace_access(name):
         try:
             print("  Preparing workspace links and permissions ...", flush=True)
@@ -781,6 +790,9 @@ def workspace_access(name):
 
 
 def automatic_snapshot(sb, name, harness_name):
+    if managed_headless_environment(sb):
+        print(f"Workspace uploaded. Checkpoint this managed session with: cws-agent down {name} --checkpoint-dir PATH")
+        return None
     print("Saving workspace, skills, MCP configuration, and stored agent state to a snapshot ...", flush=True)
     try:
         sid = take_snapshot(sb, name, harness_name)
@@ -811,7 +823,7 @@ def find_active(name: str) -> Sandbox | None:
         ids = ", ".join(b.sandbox_id for b in boxes)
         print(f"warn: {len(boxes)} active sandboxes for {name!r} ({ids}); using the first",
               file=sys.stderr)
-    return boxes[0]
+    return managed_headless_sandbox(boxes[0])
 
 
 def require_active(name: str) -> Sandbox:
@@ -853,6 +865,266 @@ def is_managed_checkpoint(snapshot) -> bool:
 
 class CheckpointError(Exception):
     """A checkpoint could not advance safely; the journal remains recoverable."""
+
+
+MANAGED_GATE_HELPER = r'''
+import argparse, contextlib, ctypes, json, os, sqlite3, stat, subprocess, sys, time, uuid
+from pathlib import Path
+
+class GateError(Exception):
+    pass
+
+def identity(pid):
+    try:
+        fields = Path('/proc/' + str(pid) + '/stat').read_text().rsplit(')', 1)[1].split()
+        return fields[19] if fields[0] != 'Z' else None
+    except FileNotFoundError:
+        return None
+
+def subreaper():
+    # Adopt and wait for orphaned descendants, including double-forked children.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if not hasattr(libc, 'prctl') or libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise GateError('managed headless mode requires Linux child-subreaper support')
+
+def flush_workspace():
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = os.open('/workspace', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        if not hasattr(libc, 'syncfs') or libc.syncfs(fd) != 0:
+            raise GateError('workspace flush failed; admission remains closed')
+    finally:
+        os.close(fd)
+
+class Gate:
+    LIMIT = 4096
+
+    def __init__(self, directory, source, initialize=False):
+        self.root = Path(directory)
+        self.source = str(uuid.UUID(source))
+        if initialize:
+            self.root.mkdir(mode=0o700, exist_ok=True)
+        info = self.root.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise GateError('unsafe or missing managed gate directory')
+        path = self.root / 'state.sqlite3'
+        if path.exists() or path.is_symlink():
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_nlink != 1):
+                raise GateError('unsafe managed gate database')
+        elif not initialize:
+            raise GateError('managed gate is not initialized; refusing to reopen admission')
+        self.db = sqlite3.connect(path.as_uri() + ('?mode=rwc' if initialize else '?mode=rw'),
+                                  uri=True, isolation_level=None, timeout=5)
+        self.db.execute('PRAGMA synchronous=FULL')
+        if initialize:
+            subreaper()
+            with self.transaction():
+                self.db.execute('CREATE TABLE IF NOT EXISTS gate (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER, source TEXT, owner TEXT)')
+                self.db.execute('CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, released INTEGER NOT NULL)')
+                self.db.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, pid INTEGER, start TEXT, complete INTEGER NOT NULL, code INTEGER)')
+                self.db.execute('CREATE INDEX IF NOT EXISTS pending_jobs ON jobs(complete)')
+                self.db.execute('INSERT OR IGNORE INTO gate VALUES (1, 1, ?, NULL)', (self.source,))
+            for folder in (self.root, self.root.parent):
+                fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        row = self.db.execute('SELECT version, source FROM gate WHERE id=1').fetchone()
+        if row != (1, self.source):
+            raise GateError('managed gate version or source identity mismatch')
+
+    @contextlib.contextmanager
+    def transaction(self):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            yield
+            self.db.execute('COMMIT')
+        except BaseException:
+            if self.db.in_transaction:
+                self.db.execute('ROLLBACK')
+            raise
+
+    def owner(self):
+        return self.db.execute('SELECT owner FROM gate WHERE id=1').fetchone()[0]
+
+    def check_capacity(self, table):
+        # The table name is internal, never supplied by a command or caller.
+        if self.db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] >= self.LIMIT:
+            raise GateError('managed gate receipt limit reached; checkpoint and restore into a new sandbox')
+
+    def run(self, job, command, umask):
+        job = str(uuid.UUID(job))
+        if not command:
+            raise GateError('missing managed command')
+        subreaper()
+        started = identity(os.getpid())
+        if started is None:
+            raise GateError('cannot establish command supervisor identity')
+        with self.transaction():
+            if self.owner() is not None:
+                raise GateError('checkpoint owns admission; retry after explicit abort or restore')
+            if self.db.execute('SELECT 1 FROM jobs WHERE id=?', (job,)).fetchone():
+                raise GateError('command already admitted; it will not be replayed')
+            self.check_capacity('jobs')
+            self.db.execute('INSERT INTO jobs VALUES (?, ?, ?, 0, NULL)', (job, os.getpid(), started))
+        # Nothing may start before its durable receipt. An interrupted supervisor
+        # leaves a pending receipt: quiesce never guesses whether its children died.
+        child = subprocess.Popen(command, umask=umask)
+        code = child.wait()
+        while True:
+            try:
+                os.waitpid(-1, 0)
+            except ChildProcessError:
+                break
+        with self.transaction():
+            self.db.execute('UPDATE jobs SET complete=1, code=? WHERE id=?', (code, job))
+        return code if code >= 0 else 128 - code
+
+    def quiesce(self, operation, timeout):
+        operation = str(uuid.UUID(operation))
+        deadline = time.monotonic() + timeout
+        with self.transaction():
+            row = self.db.execute('SELECT released FROM operations WHERE id=?', (operation,)).fetchone()
+            if row == (1,):
+                raise GateError('checkpoint was released; a delayed quiesce cannot reclaim admission')
+            if self.owner() not in (None, operation):
+                raise GateError('another checkpoint owns admission')
+            if row is None:
+                self.check_capacity('operations')
+                self.db.execute('INSERT INTO operations VALUES (?, 0)', (operation,))
+            self.db.execute('UPDATE gate SET owner=? WHERE id=1', (operation,))
+        while True:
+            with self.transaction():
+                if self.owner() != operation:
+                    raise GateError('checkpoint ownership was released while draining commands')
+                pending = self.db.execute('SELECT pid, start FROM jobs WHERE complete=0').fetchall()
+                if any(identity(pid) != started for pid, started in pending):
+                    raise GateError('an admitted command lost its supervisor; source retained, checkpoint refused')
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise GateError('active commands or descendants have not drained; admission remains closed')
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        # All application processes have exited normally. Flush filesystem writes
+        # before the coordinator requests its snapshot; application RAM is gone.
+        flush_workspace()
+        with self.transaction():
+            if self.owner() != operation:
+                raise GateError('checkpoint ownership was released before quiesce completed')
+
+    def release(self, operation):
+        operation = str(uuid.UUID(operation))
+        with self.transaction():
+            if not self.db.execute('SELECT 1 FROM operations WHERE id=?', (operation,)).fetchone():
+                self.check_capacity('operations')
+            # Tombstone first, even if the corresponding quiesce has not arrived.
+            self.db.execute('INSERT OR REPLACE INTO operations VALUES (?, 1)', (operation,))
+            self.db.execute('UPDATE gate SET owner=NULL WHERE id=1 AND owner=?', (operation,))
+
+    def status(self):
+        with self.transaction():
+            rows = self.db.execute('SELECT id, pid, start FROM jobs WHERE complete=0').fetchall()
+            return {'owner': self.owner(), 'pending': len(rows),
+                    'unconfirmed': [job for job, pid, started in rows if identity(pid) != started]}
+
+def main():
+    original_umask = os.umask(0o077)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--directory', default='/opt/cws-agent-headless-v1')
+    parser.add_argument('action', choices=('init', 'run', 'quiesce', 'release', 'status'))
+    parser.add_argument('source')
+    parser.add_argument('arguments', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    gate = Gate(args.directory, args.source, initialize=args.action == 'init')
+    try:
+        if args.action == 'run' and len(args.arguments) >= 2:
+            return gate.run(args.arguments[0], args.arguments[1:], original_umask)
+        if args.action == 'quiesce' and len(args.arguments) == 2:
+            timeout = float(args.arguments[1])
+            if not 0 < timeout <= 600:
+                raise GateError('invalid quiesce timeout')
+            gate.quiesce(args.arguments[0], timeout)
+        elif args.action == 'release' and len(args.arguments) == 1:
+            gate.release(args.arguments[0])
+        elif args.action == 'status' and not args.arguments:
+            print(json.dumps(gate.status()))
+        elif args.action != 'init' or args.arguments:
+            raise GateError('invalid gate command')
+        return 0
+    finally:
+        gate.db.close()
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except GateError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(75)
+    except Exception as error:
+        print('managed gate failed (' + type(error).__name__ + '); admission was not reset', file=sys.stderr)
+        raise SystemExit(75)
+'''
+
+
+def managed_headless_environment(sb):
+    containers = getattr(sb, "containers", ())
+    if isinstance(containers, (list, tuple)) and len(containers) == 1:
+        env = getattr(containers[0], "environment_variables", None) or {}
+        if env.get(MANAGED_HEADLESS_ENV) == "1":
+            return env
+    return {}
+
+
+def reject_managed_headless(sb, action):
+    if managed_headless_environment(sb):
+        raise CheckpointError(f"managed headless sessions do not support {action}")
+
+
+class ManagedHeadlessSandbox:
+    """Route CLI execs through source-local admission, including streaming uploads."""
+
+    def __init__(self, sandbox):
+        self.sandbox = sandbox
+
+    def __getattr__(self, name):
+        return getattr(self.sandbox, name)
+
+    def exec(self, command, **kwargs):
+        import uuid
+        return self.sandbox.exec(["python3", MANAGED_GATE_PATH, "run", self.sandbox_id,
+                                  str(uuid.uuid4()), *command], **kwargs)
+
+    def write_file(self, *args, **kwargs):
+        raise CheckpointError("managed headless writes must use supervised exec or sync")
+
+    def snapshot(self, *args, **kwargs):
+        raise CheckpointError("managed headless snapshots require down --checkpoint-dir")
+
+
+def managed_headless_sandbox(sb):
+    if isinstance(sb, ManagedHeadlessSandbox) or not managed_headless_environment(sb):
+        return sb
+    return ManagedHeadlessSandbox(sb)
+
+
+def initialize_managed_headless(sb):
+    sb.write_file(MANAGED_GATE_PATH, MANAGED_GATE_HELPER.encode()).result(timeout=30)
+    result = sb.exec(["python3", MANAGED_GATE_PATH, "init", sb.sandbox_id], timeout_seconds=30).result(timeout=35)
+    if result.returncode not in (0, None):
+        raise CheckpointError("could not initialize the managed writer gate; the image needs Python 3 with sqlite3 and Linux subreaper support")
+    return managed_headless_sandbox(sb)
+
+
+def validate_managed_headless(args, harness, image):
+    if (getattr(args, "telegram", False) or getattr(args, "attach", False)
+            or getattr(args, "claude_env", None) or getattr(args, "outpost", None)
+            or harness.name in ("ant", "openai")):
+        raise CheckpointError("managed headless mode does not support interactive sessions, bridges, or worker backends")
+    if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
+        raise CheckpointError("managed headless mode requires --image pinned by @sha256")
 
 
 class CheckpointJournal:
@@ -955,6 +1227,9 @@ def checkpoint_plan(sb, name, gate):
         raise CheckpointError("checkpoint mode requires a single-container CLI session")
     container = containers[0]
     env = container.environment_variables or {}
+    managed = bool(managed_headless_environment(sb))
+    if (gate == BUILTIN_WRITER_GATE) != managed:
+        raise CheckpointError("managed headless sessions use the built-in gate; other sessions require --writer-gate")
     harness = env.get("CWS_AGENT_HARNESS")
     if env.get("CWS_AGENT_NAME") != name or harness not in HARNESSES or harness in ("ant", "openai"):
         raise CheckpointError("source must be a named CLI-agent session")
@@ -1014,6 +1289,25 @@ class CheckpointCoordinator:
                                           timeout_seconds=min(30, self.remaining())))
 
     def gate(self, plan, action):
+        if plan["gate"] == BUILTIN_WRITER_GATE:
+            from cwsandbox import SandboxNotFoundError
+            try:
+                source = self.source(plan)
+            except SandboxNotFoundError:
+                if action == "release":
+                    return
+                raise
+            if action == "release" and checkpoint_status(source.status) in {"terminated", "completed", "failed"}:
+                return
+            if not managed_headless_environment(source):
+                raise CheckpointError("source no longer identifies as a managed headless session")
+            command = ["python3", MANAGED_GATE_PATH, action, plan["source_id"], plan["operation"]]
+            if action == "quiesce":
+                command.append(str(min(600, self.remaining())))
+            result = self.result(source.exec(command, timeout_seconds=self.remaining()))
+            if result.returncode not in (0, None):
+                raise CheckpointError(f"managed writer gate {action} failed; source retained, inspect status before retrying")
+            return
         import subprocess
         # Hooks must persist ownership before acknowledging quiesce. Killing this
         # local child on timeout is not permission to release remote admission.
@@ -1114,13 +1408,15 @@ class CheckpointCoordinator:
 def checkpoint_down(args):
     from pathlib import Path
     timeout = 180 if args.checkpoint_timeout is None else args.checkpoint_timeout
-    if (not args.checkpoint_dir or not args.writer_gate or args.no_snapshot
+    if (not args.checkpoint_dir or args.no_snapshot
             or not 0 < timeout <= 600 or not NAME_RE.fullmatch(args.name)):
-        raise SystemExit("error: checkpoint mode requires --checkpoint-dir and --writer-gate, "
+        raise SystemExit("error: checkpoint mode requires --checkpoint-dir, "
                          "a valid name, a timeout of 1–600 seconds, and no --no-snapshot")
-    gate = str(Path(args.writer_gate).expanduser().resolve(strict=True))
-    if not os.path.isfile(gate) or not os.access(gate, os.X_OK):
-        raise SystemExit("error: --writer-gate must be an executable file")
+    gate = BUILTIN_WRITER_GATE
+    if args.writer_gate:
+        gate = str(Path(args.writer_gate).expanduser().resolve(strict=True))
+        if not os.path.isfile(gate) or not os.access(gate, os.X_OK):
+            raise SystemExit("error: --writer-gate must be an executable file")
     with CheckpointJournal(args.checkpoint_dir) as journal:
         coordinator = CheckpointCoordinator(journal, timeout)
         state = journal.read("journal.json")
@@ -1212,6 +1508,8 @@ def build_env(harness: Harness, extra_env: list[str], passthrough: list[str],
         key = env.pop("OPENAI_EXECUTOR_API_KEY", None)
         if key:
             env["CODEX_API_KEY"] = _validate_token("OPENAI_EXECUTOR_API_KEY", key)
+    if MANAGED_HEADLESS_ENV in env:
+        raise CheckpointError("use --managed-headless instead of setting its reserved environment marker")
     return env
 
 
@@ -1314,17 +1612,21 @@ def _is_start_transient(e: Exception) -> bool:
 
 
 def provision_session(*, name: str, harness: Harness, repo_url: str | None,
-                      attempts: int = 5, **create_kwargs) -> Sandbox:
+                      attempts: int = 5, managed_headless: bool = False, **create_kwargs) -> Sandbox:
     """Create the sandbox AND run bootstrap as one retryable unit. A sandbox that
     fails to start (surfaced on the first exec) on a runner that is being
     replaced is dead — tear it down and provision a fresh one rather than
     retrying exec against the corpse. A runner replacement can fail several
     starts in a row, so retry a handful of times before giving up."""
+    if managed_headless:
+        create_kwargs["env"] = {**create_kwargs["env"], MANAGED_HEADLESS_ENV: "1"}
     last: Exception | None = None
     for i in range(attempts):
         sb = create_session_sandbox(name=name, harness=harness, **create_kwargs)
         print(f"  sandbox: {sb.sandbox_id}")
         try:
+            if managed_headless:
+                sb = initialize_managed_headless(sb)
             if create_kwargs.get("restore_snapshot_id"):
                 snapshot_metadata(sb, "restore-snapshot")
             run_bootstrap(sb, harness, repo_url)
@@ -1398,6 +1700,7 @@ def read_backend_config(sb: Sandbox) -> dict | None:
 
 
 def start_backend(sb: Sandbox, state: dict, name: str, env: dict) -> None:
+    reject_managed_headless(sb, "worker backends")
     # Persist only our documented fields, never extra input or credentials.
     state = backend_config(state["kind"], state["target"], state["workers"])
     key = {"claude": "ANTHROPIC_ENVIRONMENT_KEY", "outpost": "DEVIN_OUTPOSTS_TOKEN",
@@ -2648,6 +2951,7 @@ def command_uses_claude(remote_cmd: str) -> bool:
 
 
 def pty_attach(sb: Sandbox, remote_cmd: str, *, image_paste: bool | None = None) -> int:
+    reject_managed_headless(sb, "interactive terminals")
     if os.name == "nt":
         raise SystemExit("error: interactive terminal connections are not supported on Windows")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -3561,6 +3865,10 @@ def cmd_launch(args) -> int:
 
 def launch_session(args) -> int:
     telegram = getattr(args, "telegram", False)
+    managed = getattr(args, "managed_headless", False)
+    if managed:
+        validate_managed_headless(args, HARNESSES[args.agent], args.image or "")
+        args.detach = True
     if telegram and (args.outpost or args.claude_env or args.agent in ("ant", "openai") or args.detach):
         raise SystemExit("error: --telegram requires a CLI agent and cannot be combined with --detach or worker backends")
     if telegram and not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -3672,6 +3980,7 @@ def launch_session(args) -> int:
         env=env,
         mode=args.mode,
         restore_snapshot_id=None,
+        managed_headless=managed,
     )
     try:
         configure_wandb_opencode(sb, wandb_config)
@@ -3755,6 +4064,10 @@ def launch_session(args) -> int:
         return start_launched_telegram(sb, harness, args, env)
     if args.local_dir and not getattr(args, "no_snapshot", False):
         automatic_snapshot(sb, args.name, harness.name)
+    if managed:
+        print(f"Run work: cws-agent run {args.name} 'your task'")
+        print(f"Checkpoint and stop: cws-agent down {args.name} --checkpoint-dir ./checkpoint")
+        return 0
     if harness.name == "claude":
         if "CLAUDE_CODE_OAUTH_TOKEN" in env:
             pass  # interactive auth with no login prompt (onboarding pre-seeded)
@@ -3781,6 +4094,7 @@ def cmd_attach(args) -> int:
     if args.cmd and (args.yolo or args.permission_mode not in (None, "accept-edits")):
         raise SystemExit("error: permission flags cannot be combined with --cmd")
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'interactive connections')
     harness = active_harness(sb, args.agent)
     if not args.cmd:
         sync_agent_config(sb, harness, args)
@@ -4566,6 +4880,7 @@ def cmd_bridge_telegram(args) -> int:
     if setup and not interactive:
         raise SystemExit("error: Telegram setup requires an interactive terminal")
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'messaging bridges')
     harness = active_harness(sb)
     if harness.name in ("ant", "openai"):
         raise SystemExit("error: Telegram bridge supports agent CLIs, not Managed Agents workers")
@@ -5003,6 +5318,7 @@ def cmd_discord(args) -> int:
     if not token:
         raise SystemExit("error: set DISCORD_BOT_TOKEN in the bridge host's environment")
     sb = discord_sandbox(args)
+    reject_managed_headless(sb, "messaging bridges")
     harness = active_harness(sb)
     if harness.name not in ("claude", "opencode", "cursor"):
         raise SystemExit("error: Discord sessions currently support Claude, OpenCode, and Cursor CLI")
@@ -5067,6 +5383,7 @@ def cmd_discord(args) -> int:
 
 def cmd_login(args) -> int:
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'interactive login; export credentials before launch')
     harness = active_harness(sb)
     if harness.name == "claude":
         print("Opening Claude Code — type `/login` and complete the browser OAuth.")
@@ -5220,6 +5537,10 @@ def cmd_resume(args) -> int:
     if getattr(args, "telegram", False) and (harness.name in ("ant", "openai") or args.claude_env or args.outpost):
         raise SystemExit("error: Telegram requires a CLI-agent snapshot, not worker backends")
     image = checkpoint["image"] if checkpoint else args.image or harness.image
+    managed = (getattr(args, "managed_headless", False)
+               or bool(checkpoint and checkpoint["gate"] == BUILTIN_WRITER_GATE))
+    if managed:
+        validate_managed_headless(args, harness, image)
     env = build_env(harness, args.env, args.env_passthrough, wandb=getattr(args, "wandb", False))
     wandb_config = wandb_opencode_config(args, harness, env)
     if harness.name == "openai":
@@ -5248,6 +5569,7 @@ def cmd_resume(args) -> int:
         env=env,
         mode=args.mode,
         restore_snapshot_id=snap.file_system_snapshot_id,
+        managed_headless=managed,
     )
     try:
         configure_wandb_opencode(sb, wandb_config)
@@ -5255,6 +5577,7 @@ def cmd_resume(args) -> int:
                  backend_config("outpost", args.outpost, args.workers or 1) if args.outpost else
                  read_backend_config(sb))
         if state:
+            reject_managed_headless(sb, "saved worker backends")
             if getattr(args, "telegram", False):
                 raise SystemExit("error: Telegram requires a CLI-agent snapshot, not worker backends")
             expected = {"claude": "ant", "outpost": "devin", "openai": "openai"}[state["kind"]]
@@ -5283,7 +5606,10 @@ def cmd_resume(args) -> int:
             allow_chat=None, allow_user=None, yolo=args.yolo, permission_mode=args.permission_mode))
     if args.attach:
         return pty_attach(sb, "exec bash" if state else interactive_command(harness, args))
-    print(f"connect with: cws-agent connect {args.name}")
+    if managed:
+        print(f"Managed headless admission ready. Run work: cws-agent run {args.name} 'your task'")
+    else:
+        print(f"connect with: cws-agent connect {args.name}")
     return 0
 
 
@@ -5322,6 +5648,17 @@ def cmd_status(args) -> int:
     if sb:
         print(f"session {args.name!r}: ACTIVE")
         print(f"  sandbox: {sb.sandbox_id}  status: {getattr(sb, 'status', '?')}")
+        if managed_headless_environment(sb):
+            raw = sb.sandbox if isinstance(sb, ManagedHeadlessSandbox) else sb
+            result = raw.exec(["python3", MANAGED_GATE_PATH, "status", sb.sandbox_id],
+                              timeout_seconds=30).result(timeout=35)
+            if result.returncode not in (0, None):
+                raise CheckpointError("managed gate status unavailable; admission was not reset")
+            status = json.loads(result.stdout)
+            print(f"  managed admission: {'closed' if status['owner'] else 'open'}; "
+                  f"pending commands: {status['pending']}; unconfirmed: {len(status['unconfirmed'])}")
+            if status["unconfirmed"]:
+                print("  checkpoint refused: a command lost its supervisor; inspect or discard this source")
         if active_harness(sb).name == "openai":
             state = read_backend_config(sb)
             if state and state["kind"] == "openai":
@@ -5371,6 +5708,7 @@ def cmd_prune(args) -> int:
 
 def cmd_rc(args) -> int:
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'Remote Control')
     _, harness_name = probe_session_meta(sb)
     if harness_name != "claude":
         raise SystemExit("error: remote-control is a Claude Code feature")
@@ -6183,6 +6521,7 @@ def cmd_session_transfer(args) -> int:
 
 def cmd_session_resume(args) -> int:
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'interactive native resume; use exec with the native CLI instead')
     # These IDs are resolved by the native CLI; private storage is not parsed.
     if args.agent in ("devin", "cursor"):
         agent, cwd = args.agent, args.cwd or PROJECT_DIR
@@ -6203,6 +6542,7 @@ def cmd_session_resume(args) -> int:
 def cmd_session_restart(args) -> int:
     wt = worktree_path(args.session)
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'tmux worktree sessions')
     rows = [r for r in read_session_sessions(sb) if r["name"] == args.session]
     if not rows:
         raise SystemExit("error: no existing worktree session; use `session start`")
@@ -6255,6 +6595,7 @@ def read_session_sessions(sb: Sandbox):
 def cmd_session_start(args) -> int:
     wt = worktree_path(args.session)
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'tmux worktree sessions')
     harness = active_harness(sb, args.agent)
     if harness.name in ("ant", "openai"):
         raise SystemExit("error: worktree sessions require a CLI harness, not Managed Agents workers")
@@ -6360,6 +6701,7 @@ def session_attach(sb: Sandbox, session: str) -> int:
 def cmd_session_attach(args) -> int:
     worktree_path(args.session)
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'interactive sessions')
     if not read_session_matches(sb, args.session):
         raise SystemExit(f"error: no session {args.session!r} in {args.name!r} "
                          f"(list: cws-agent session ls {args.name})")
@@ -6407,6 +6749,7 @@ def cmd_session_diff(args) -> int:
 def cmd_session_stop(args) -> int:
     wt = worktree_path(args.session)
     sb = require_active(args.name)
+    reject_managed_headless(sb, 'tmux worktree sessions')
     if not read_session_matches(sb, args.session):
         raise SystemExit("error: no existing worktree session")
     delbr = (f"br=$(git -C {shlex.quote(wt)} symbolic-ref --short HEAD); "
@@ -6464,6 +6807,8 @@ def add_create_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--wandb", action="store_true", help="OpenCode with W&B Serverless Inference and the recommended coding model (needs WANDB_API_KEY)")
     p.add_argument("--wandb-model", metavar="MODEL_ID", help="override --wandb's model with a W&B catalog ID")
     p.add_argument("--image", help="override the harness container image")
+    p.add_argument("--managed-headless", action="store_true",
+                   help="coordinate headless commands/uploads with checkpoints; requires a pinned image and implies --detach on launch")
     p.add_argument("--lifetime", default="8h",
                    help="max sandbox lifetime, e.g. 90m / 8h / 7d (default: 8h)")
     p.add_argument("--cpu", default="2", help="CPU request/limit (default: 2)")
@@ -6568,7 +6913,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("down", help="snapshot (unless --no-snapshot) and stop the sandbox")
     p.add_argument("name")
     p.add_argument("--no-snapshot", action="store_true")
-    p.add_argument("--checkpoint-dir", metavar="PATH", help="opt in to durable checkpoint/stop recovery (requires --writer-gate)")
+    p.add_argument("--checkpoint-dir", metavar="PATH", help="durable checkpoint/stop recovery; managed headless sessions use a built-in writer gate")
     p.add_argument("--writer-gate", metavar="EXECUTABLE", help="external durable quiesce/release hook; see docs/checkpoints.md")
     p.add_argument("--checkpoint-timeout", type=int, metavar="SECONDS", help="checkpoint attempt deadline (default: 180, max: 600)")
     p.add_argument("--abort-checkpoint", action="store_true", help="abandon an uncommitted checkpoint and release its writer gate")
