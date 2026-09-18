@@ -118,6 +118,10 @@ SSH remotes need SSH credentials there.
 
 ## Snapshots
 
+For applications that control all workspace writers, see
+[recoverable checkpoint and stop](checkpoints.md) for an opt-in durable journal,
+retry recovery, and restore from an exact committed snapshot.
+
 ```bash
 cws-agent snapshot my-claude          # save without stopping
 cws-agent down my-claude              # save and stop compute

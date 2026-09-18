@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "cwsandbox[wandb]>=1.10,<2",
+#     "cwsandbox[wandb]>=1.14.2,<2",
 #     "segno>=1.6,<2",
 #     "truststore>=0.10,<1",
 #     "markdown-it-py>=3,<5",
@@ -81,11 +81,9 @@ AGENT_HOME = "/opt/agent"              # ephemeral: agent BINARY (NEVER snapshot
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
-# Snapshot creation fails when the snapshotted volume contains ANY symlink
-# (verified: a single symlink in a 4KB volume fails; a 300MB regular file
-# succeeds). The agent installers (e.g. Claude Code native) create a
-# bin -> versions/<v> symlink, so we keep the binary OUT of /workspace (in
-# AGENT_HOME) and snapshot only symlink-free state+project.
+# Older snapshot helpers reject symlinks, so ordinary snapshots use a metadata
+# workaround. Checkpoint mode requires native permission/symlink support.
+# Keep installed agent binaries outside /workspace to keep both archives small.
 
 # Agent env shared by every invocation: agent binary from AGENT_HOME on PATH,
 # persistent state via HOME. Tool caches and the agent's own auto-update are
@@ -649,7 +647,7 @@ def snapshot_request_id(name: str, harness_name: str, suffix: str = "") -> str:
 
 
 def harness_from_request_id(request_id: str | None) -> str | None:
-    if request_id and request_id.startswith("cwsa1|"):
+    if request_id and request_id.startswith(("cwsa1|", "cwcp1|")):
         parts = request_id.split("|")
         if len(parts) >= 3 and parts[2] in HARNESSES:
             return parts[2]
@@ -842,9 +840,325 @@ def session_snapshots(name: str):
 
 def latest_ready_snapshot(name: str):
     for s in session_snapshots(name):
-        if "ready" in str(s.status).lower():
+        if "ready" in str(s.status).lower() and not is_managed_checkpoint(s):
             return s
     return None
+
+
+def is_managed_checkpoint(snapshot) -> bool:
+    # A late READY response may belong to an abandoned operation. Only its
+    # committed manifest can authorize restore; ordinary pruning must retain it.
+    return (getattr(snapshot, "request_id", None) or "").startswith("cwcp1|")
+
+
+class CheckpointError(Exception):
+    """A checkpoint could not advance safely; the journal remains recoverable."""
+
+
+class CheckpointJournal:
+    """One local coordinator, atomic records, and fsync before destructive steps."""
+
+    def __init__(self, directory):
+        from pathlib import Path
+        path = Path(directory).expanduser().absolute()
+        self.root = path.parent.resolve(strict=True) / path.name
+        self.lock = None
+
+    @staticmethod
+    def private_file(fd):
+        import stat
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1):
+            raise CheckpointError("checkpoint files must be private, owned regular files")
+
+    @staticmethod
+    def sync_directory(path):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def __enter__(self):
+        import fcntl
+        import stat
+        # Require an existing parent so its creation cannot escape the durability
+        # boundary. Use a local filesystem that supports flock and directory fsync.
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        info = self.root.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077):
+            raise CheckpointError("checkpoint directory must be owned by you with mode 0700")
+        self.sync_directory(self.root.parent)
+        fd = os.open(self.root / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            self.private_file(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.lock = fd
+        return self
+
+    def __exit__(self, *unused):
+        os.close(self.lock)
+        self.lock = None
+
+    def read(self, name):
+        try:
+            fd = os.open(self.root / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            self.private_file(stream.fileno())
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            raise CheckpointError("checkpoint record is too large")
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise CheckpointError("invalid checkpoint record")
+        return value
+
+    def write(self, name, value):
+        import tempfile
+        fd, temporary = tempfile.mkstemp(prefix=".checkpoint-", dir=self.root)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(value, stream, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.root / name)
+            self.sync_directory(self.root)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def checkpoint_route() -> str:
+    import hashlib
+    auth = sandbox_auth()
+    # Do not serialize credentials or potentially credential-bearing URLs.
+    route = str(getattr(auth, "value", auth)) + "|" + os.environ.get("CWSANDBOX_BASE_URL", "")
+    return hashlib.sha256(route.encode()).hexdigest()
+
+
+def checkpoint_status(value) -> str:
+    return str(getattr(value, "value", value)).lower()
+
+
+def checkpoint_plan(sb, name, gate):
+    import uuid
+    containers = sb.containers
+    if len(containers) != 1:
+        raise CheckpointError("checkpoint mode requires a single-container CLI session")
+    container = containers[0]
+    env = container.environment_variables or {}
+    harness = env.get("CWS_AGENT_HARNESS")
+    if env.get("CWS_AGENT_NAME") != name or harness not in HARNESSES or harness in ("ant", "openai"):
+        raise CheckpointError("source must be a named CLI-agent session")
+    image = container.image
+    if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
+        raise CheckpointError("launch with an OCI image pinned by @sha256 before using checkpoint mode")
+    mounts = container.volume_mounts or ()
+    if len(mounts) != 1 or mounts[0].mount_path != MOUNT_PATH or mounts[0].sub_path or mounts[0].read_only:
+        raise CheckpointError("checkpoint mode requires one writable volume mounted at /workspace")
+    disk = env.get("CWS_AGENT_DISK", "")
+    if not re.fullmatch(r"[1-9][0-9]*(?:Gi|Mi|Ti)", disk):
+        raise CheckpointError("source has no valid saved workspace disk size")
+    resources = container.resources
+    requests = (resources.get("requests", {}) if isinstance(resources, dict)
+                else getattr(resources, "requests", None)) or {}
+    operation = uuid.uuid4().hex
+    return {"version": 1, "name": name, "harness": harness,
+            "source_id": str(uuid.UUID(sb.sandbox_id)), "volume": mounts[0].volume,
+            "image": image, "disk": disk, "cpu": requests.get("cpu", "2"),
+            "memory": requests.get("memory", "4Gi"), "operation": operation,
+            "request_id": f"cwcp1|{name}|{harness}|{operation}|disk={disk}",
+            "route": checkpoint_route(), "gate": gate}
+
+
+def validate_checkpoint_state(state, name, gate=None):
+    import uuid
+    plan = state["plan"]
+    if (plan["version"] != 1 or plan["name"] != name or plan["route"] != checkpoint_route()
+            or (gate is not None and plan["gate"] != gate)):
+        raise CheckpointError("checkpoint name, API route, authentication mode, or writer gate changed")
+    if state["phase"] not in {"QUIESCING", "SNAPSHOTTING", "COMMITTED", "STOPPING", "SUSPENDED", "ABANDONED"}:
+        raise CheckpointError("invalid checkpoint phase")
+    uuid.UUID(plan["source_id"])
+    uuid.UUID(plan["operation"])
+    expected = f"cwcp1|{name}|{plan['harness']}|{plan['operation']}|disk={plan['disk']}"
+    if plan["request_id"] != expected or len(expected.encode()) > 128:
+        raise CheckpointError("invalid checkpoint request ID")
+    return plan
+
+
+class CheckpointCoordinator:
+    def __init__(self, journal, timeout):
+        self.journal = journal
+        self.deadline = time.monotonic() + timeout
+
+    def remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise CheckpointError("checkpoint deadline reached; retry the same directory")
+        return remaining
+
+    def result(self, operation):
+        return operation.result(timeout=self.remaining())
+
+    def source(self, plan):
+        return self.result(Sandbox.from_id(plan["source_id"], auth=sandbox_auth(),
+                                          timeout_seconds=min(30, self.remaining())))
+
+    def gate(self, plan, action):
+        import subprocess
+        # Hooks must persist ownership before acknowledging quiesce. Killing this
+        # local child on timeout is not permission to release remote admission.
+        result = subprocess.run([plan["gate"], action, plan["source_id"], plan["operation"], str(self.journal.root)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=self.remaining(), check=False)
+        if result.returncode:
+            raise CheckpointError(f"writer gate {action} failed; its output was suppressed")
+
+    def receipt(self, plan, snapshot_id):
+        snapshot = self.result(Sandbox.get_snapshot(snapshot_id, auth=sandbox_auth(),
+                                                   timeout_seconds=min(30, self.remaining())))
+        if (snapshot.file_system_snapshot_id != snapshot_id or snapshot.source_sandbox_id != plan["source_id"]
+                or snapshot.source_volume_name != plan["volume"] or snapshot.request_id != plan["request_id"]):
+            raise CheckpointError("snapshot receipt does not match this checkpoint")
+        return snapshot
+
+    def manifest(self, state):
+        expected = {"version": 1, "plan": state["plan"], "snapshot_id": state["snapshot_id"]}
+        manifest = self.journal.read("manifest.json")
+        if manifest is not None and manifest != expected:
+            raise CheckpointError("committed manifest does not match the journal")
+        return manifest, expected
+
+    def save(self, state, phase):
+        state["phase"] = phase
+        self.journal.write("journal.json", state)
+
+    def release(self, state):
+        if not state.get("gate_released"):
+            self.gate(state["plan"], "release")
+            state["gate_released"] = True
+            self.journal.write("journal.json", state)
+
+    def suspend(self, state, *, abort=False):
+        from cwsandbox import SandboxNotFoundError
+        plan = state["plan"]
+        manifest, expected = self.manifest(state)
+        if abort:
+            if manifest is not None or state["phase"] in {"COMMITTED", "STOPPING", "SUSPENDED"}:
+                raise CheckpointError("a committed checkpoint cannot be aborted; retry to finish stopping its source")
+            # A late READY snapshot can no longer be committed after this write.
+            self.save(state, "ABANDONED")
+            self.release(state)
+            return None
+        if state["phase"] == "ABANDONED":
+            raise CheckpointError("checkpoint was abandoned; use --abort-checkpoint to retry release, or a new directory")
+        if state["phase"] == "SUSPENDED":
+            if manifest is None:
+                raise CheckpointError("suspended checkpoint is missing its manifest")
+            self.release(state)
+            return state["snapshot_id"]
+        if manifest is None:
+            if state["phase"] in {"COMMITTED", "STOPPING"}:
+                raise CheckpointError("committed checkpoint is missing its manifest")
+            source = self.source(plan)
+            if checkpoint_status(source.status) != "running":
+                raise CheckpointError("source is no longer running; inspect its lifetime and checkpoint before recovery")
+            print("quiescing workspace writers ...", flush=True)
+            self.gate(plan, "quiesce")
+            self.save(state, "SNAPSHOTTING")
+            if state["snapshot_id"] is None:
+                print("requesting checkpoint snapshot ...", flush=True)
+                state["snapshot_id"] = self.result(source.snapshot(wait_for_ready=False, request_id=plan["request_id"]))
+                self.journal.write("journal.json", state)
+            print("waiting for the checkpoint snapshot to be READY ...", flush=True)
+            while True:
+                snapshot = self.receipt(plan, state["snapshot_id"])
+                status = checkpoint_status(snapshot.status)
+                if status == "ready":
+                    break
+                if status not in {"pending", "creating", "uploading"}:
+                    raise CheckpointError("snapshot is not READY; source retained and writer gate held")
+                time.sleep(min(1, self.remaining()))
+            _, expected = self.manifest(state)
+        else:
+            if checkpoint_status(self.receipt(plan, state["snapshot_id"]).status) != "ready":
+                raise CheckpointError("committed snapshot is no longer READY; refusing to stop source")
+        # Rewrite even a recovered manifest: a crash after rename might precede
+        # directory fsync. Re-establish durability before ever requesting Stop.
+        self.journal.write("manifest.json", expected)
+        self.save(state, "COMMITTED")
+        print("checkpoint manifest committed; stopping source ...", flush=True)
+        self.save(state, "STOPPING")
+        try:
+            source = self.source(plan)
+            if checkpoint_status(source.status) not in {"terminated", "completed", "failed"}:
+                self.result(source.stop(snapshot_on_stop=False, missing_ok=True))
+            while checkpoint_status(self.source(plan).status) not in {"terminated", "completed", "failed"}:
+                time.sleep(min(1, self.remaining()))
+        except SandboxNotFoundError:
+            pass  # Typed absence is terminal; auth/network failures are not.
+        self.save(state, "SUSPENDED")
+        self.release(state)
+        return state["snapshot_id"]
+
+
+def checkpoint_down(args):
+    from pathlib import Path
+    timeout = 180 if args.checkpoint_timeout is None else args.checkpoint_timeout
+    if (not args.checkpoint_dir or not args.writer_gate or args.no_snapshot
+            or not 0 < timeout <= 600 or not NAME_RE.fullmatch(args.name)):
+        raise SystemExit("error: checkpoint mode requires --checkpoint-dir and --writer-gate, "
+                         "a valid name, a timeout of 1–600 seconds, and no --no-snapshot")
+    gate = str(Path(args.writer_gate).expanduser().resolve(strict=True))
+    if not os.path.isfile(gate) or not os.access(gate, os.X_OK):
+        raise SystemExit("error: --writer-gate must be an executable file")
+    with CheckpointJournal(args.checkpoint_dir) as journal:
+        coordinator = CheckpointCoordinator(journal, timeout)
+        state = journal.read("journal.json")
+        if state is None:
+            if args.abort_checkpoint or journal.read("manifest.json") is not None:
+                raise CheckpointError("no journal found; refusing to create or abandon a checkpoint")
+            boxes = coordinator.result(Sandbox.list(tags=[SESSION_TAG, name_tag(args.name)], auth=sandbox_auth(),
+                                                     timeout_seconds=min(30, coordinator.remaining())))
+            if len(boxes) != 1:
+                raise CheckpointError("checkpoint mode requires exactly one active sandbox for this name")
+            plan = checkpoint_plan(boxes[0], args.name, gate)
+            state = {"plan": plan, "phase": "QUIESCING", "snapshot_id": None, "gate_released": False}
+            validate_checkpoint_state(state, args.name, gate)
+            journal.write("journal.json", state)
+        else:
+            validate_checkpoint_state(state, args.name, gate)
+        snapshot_id = coordinator.suspend(state, abort=args.abort_checkpoint)
+    if snapshot_id:
+        print(f"checkpoint {snapshot_id} committed; source stopped. Restore with --checkpoint-dir pointing to this directory.")
+    else:
+        print("checkpoint abandoned; writer gate released. Its snapshot will not be selected by ordinary restore.")
+    return 0
+
+
+def checkpoint_restore(directory, name):
+    with CheckpointJournal(directory) as journal:
+        state = journal.read("journal.json")
+        if state is None:
+            raise CheckpointError("checkpoint journal is missing")
+        plan = validate_checkpoint_state(state, name)
+        coordinator = CheckpointCoordinator(journal, 60)
+        manifest, _ = coordinator.manifest(state)
+        if manifest is None or state["phase"] != "SUSPENDED" or not state.get("gate_released"):
+            raise CheckpointError("finish checkpoint down recovery before restoring")
+        snapshot = coordinator.receipt(plan, state["snapshot_id"])
+        if checkpoint_status(snapshot.status) != "ready":
+            raise CheckpointError("committed snapshot is no longer READY")
+        return snapshot, plan
 
 
 # ---------------------------------------------------------------------------
@@ -4856,6 +5170,9 @@ def cmd_snapshot(args) -> int:
 
 
 def cmd_down(args) -> int:
+    if (args.checkpoint_dir or args.writer_gate or args.abort_checkpoint
+            or args.checkpoint_timeout is not None):
+        return checkpoint_down(args)
     sb = require_active(args.name)
     if not args.no_snapshot:
         _, harness_name = probe_session_meta(sb)
@@ -4882,7 +5199,15 @@ def cmd_resume(args) -> int:
         raise SystemExit(
             f"error: session {args.name!r} is already active — use `cws-agent connect {args.name}`"
         )
-    snap = latest_ready_snapshot(args.name)
+    checkpoint = None
+    if getattr(args, "checkpoint_dir", None):
+        if args.claude_env or args.outpost or args.workers is not None:
+            raise CheckpointError("checkpoint restore does not support managed worker overrides")
+        snap, checkpoint = checkpoint_restore(args.checkpoint_dir, args.name)
+        if args.image and args.image != checkpoint["image"]:
+            raise CheckpointError("checkpoint restore requires its recorded OCI image digest")
+    else:
+        snap = latest_ready_snapshot(args.name)
     if snap is None:
         raise SystemExit(f"error: no READY snapshot found for session {args.name!r}")
 
@@ -4894,7 +5219,7 @@ def cmd_resume(args) -> int:
         raise SystemExit("error: OpenAI restore uses its saved API session and one executor; worker overrides and CLI permissions do not apply")
     if getattr(args, "telegram", False) and (harness.name in ("ant", "openai") or args.claude_env or args.outpost):
         raise SystemExit("error: Telegram requires a CLI-agent snapshot, not worker backends")
-    image = args.image or harness.image
+    image = checkpoint["image"] if checkpoint else args.image or harness.image
     env = build_env(harness, args.env, args.env_passthrough, wandb=getattr(args, "wandb", False))
     wandb_config = wandb_opencode_config(args, harness, env)
     if harness.name == "openai":
@@ -4917,8 +5242,8 @@ def cmd_resume(args) -> int:
         repo_url=None,  # project restored from FSS
         image=image,
         lifetime_seconds=parse_duration(args.lifetime),
-        cpu=args.cpu,
-        memory=args.memory,
+        cpu=args.cpu or (checkpoint["cpu"] if checkpoint else "2"),
+        memory=args.memory or (checkpoint["memory"] if checkpoint else "4Gi"),
         disk=args.disk or (saved_disk.group(1) if saved_disk else "10Gi"),
         env=env,
         mode=args.mode,
@@ -5032,7 +5357,8 @@ def cmd_snapshots(args) -> int:
 def cmd_prune(args) -> int:
     if args.keep < 0:
         raise SystemExit("error: --keep must be nonnegative")
-    snaps = [s for s in session_snapshots(args.name) if "ready" in str(s.status).lower()]
+    snaps = [s for s in session_snapshots(args.name) if "ready" in str(s.status).lower()
+             and (getattr(args, "include_checkpoints", False) or not is_managed_checkpoint(s))]
     doomed = snaps[args.keep:]  # sorted newest-first; keep the N most recent
     if not doomed:
         print(f"nothing to prune ({len(snaps)} READY snapshot(s), keeping {args.keep})")
@@ -6242,17 +6568,22 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("down", help="snapshot (unless --no-snapshot) and stop the sandbox")
     p.add_argument("name")
     p.add_argument("--no-snapshot", action="store_true")
+    p.add_argument("--checkpoint-dir", metavar="PATH", help="opt in to durable checkpoint/stop recovery (requires --writer-gate)")
+    p.add_argument("--writer-gate", metavar="EXECUTABLE", help="external durable quiesce/release hook; see docs/checkpoints.md")
+    p.add_argument("--checkpoint-timeout", type=int, metavar="SECONDS", help="checkpoint attempt deadline (default: 180, max: 600)")
+    p.add_argument("--abort-checkpoint", action="store_true", help="abandon an uncommitted checkpoint and release its writer gate")
     p.set_defaults(func=cmd_down)
 
     p = sub.add_parser("restore", aliases=["resume"], help="restore the latest snapshot into a fresh sandbox (resume is a compatibility alias)")
     p.add_argument("name")
     add_create_flags(p)
+    p.add_argument("--checkpoint-dir", metavar="PATH", help="restore the exact committed checkpoint instead of the latest ordinary snapshot")
     p.add_argument("--claude-env", help="Claude worker target for legacy snapshots, or explicit override")
     p.add_argument("--outpost", help="Devin worker target for legacy snapshots, or explicit override")
     p.add_argument("--workers", type=int, default=None, help="override saved worker count")
     p.add_argument("--connect", "--attach", dest="attach", action="store_true", help="open a terminal after restoring (--attach is a compatibility alias)")
     p.add_argument("--telegram", action="store_true", help="restore workspace and reconnect its saved Telegram bot")
-    p.set_defaults(func=cmd_resume)
+    p.set_defaults(func=cmd_resume, cpu=None, memory=None)
 
     p = sub.add_parser("list", help="list active agent sessions")
     p.set_defaults(func=cmd_list)
@@ -6268,6 +6599,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("prune", help="delete old READY snapshots, keeping the newest N")
     p.add_argument("name")
     p.add_argument("--keep", type=int, default=3, help="snapshots to keep (default: 3)")
+    p.add_argument("--include-checkpoints", action="store_true", help="also prune snapshots protected by checkpoint manifests")
     p.set_defaults(func=cmd_prune)
 
     p = sub.add_parser("rc", help="start Claude Code remote-control in the session")
@@ -6394,6 +6726,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+    except CheckpointError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except Exception as error:
+        if not getattr(args, "checkpoint_dir", None):
+            raise
+        # SDK/hook exceptions can contain credentials or request bodies.
+        print(f"error: checkpoint operation interrupted ({type(error).__name__}). "
+              "Keep the directory and retry the same command; source state and writer gate may be unchanged.",
+              file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
