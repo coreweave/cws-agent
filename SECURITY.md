@@ -20,6 +20,9 @@ separate products with their own reporting channels.
 
 ## Known operating constraints
 
+- `--import-codex-auth` explicitly copies a local ChatGPT login into the sandbox.
+  Sandbox processes can read those tokens, and workspace snapshots retain them.
+  The import does not export OS-keyring credentials or change local login files.
 - `launch --local-dir` and `sync` upload the directory as-is and do not honor
   `.gitignore`. Exclude secret files before uploading.
 - Snapshot preparation temporarily widens file permissions inside the sandbox

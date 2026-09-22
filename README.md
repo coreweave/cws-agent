@@ -30,6 +30,16 @@ choose OpenCode with `--agent opencode --wandb` ([setup](docs/opencode.md)).
 Agents use [YOLO mode](docs/permissions.md) by default; `--permission-mode native`
 uses the agent's own approval settings. [Other credentials](docs/usage.md#authentication).
 
+To start Codex using your existing local ChatGPT login, without remote device codes:
+
+```bash
+cws-agent launch my-codex --agent codex --import-codex-auth
+```
+
+This copies your local login into the sandbox before Codex opens.
+See [Codex login import](docs/usage.md#reuse-a-local-codex-login) for existing sessions
+and credential storage details.
+
 ## Bring your skills and tools
 
 Launch offers to import local skills and MCP tools. Review or update them later:

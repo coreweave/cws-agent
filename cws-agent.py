@@ -1215,6 +1215,158 @@ def build_env(harness: Harness, extra_env: list[str], passthrough: list[str],
     return env
 
 
+def local_codex_auth(harness: Harness, args, env: dict | None = None) -> bytes | None:
+    """Read only an explicitly requested ChatGPT cache, before provisioning."""
+    if not getattr(args, "import_codex_auth", False):
+        return None
+    if harness.name != "codex":
+        raise SystemExit("error: --import-codex-auth requires the Codex CLI harness")
+    from pathlib import Path
+    import stat
+
+    folder = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    try:
+        fd = os.open(folder / "auth.json", os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("not a regular auth cache")
+            payload = source.read(1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            raise ValueError("oversized cache")
+        auth = json.loads(payload)
+        tokens = auth.get("tokens")
+        if (auth.get("auth_mode") not in (None, "chatgpt") or auth.get("OPENAI_API_KEY")
+                or not isinstance(tokens, dict)
+                or not all(isinstance(tokens.get(key), str) and tokens[key].strip()
+                           for key in ("access_token", "refresh_token", "id_token"))):
+            raise ValueError("not a ChatGPT cache")
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+        raise SystemExit("error: cannot read a ChatGPT login from $CODEX_HOME/auth.json "
+                         "(default ~/.codex/auth.json). Sign in locally with "
+                         '`codex -c cli_auth_credentials_store=\'"file"\' login` first. '
+                         "OS-keyring credentials are not imported.") from None
+    if env is not None:
+        if env.get("CODEX_HOME", f"{HOME_DIR}/.codex") != f"{HOME_DIR}/.codex":
+            raise SystemExit("error: --import-codex-auth requires the default sandbox CODEX_HOME")
+        # Explicit ChatGPT import takes precedence over API-key passthrough.
+        env.pop("OPENAI_API_KEY", None)
+    return payload
+
+
+CODEX_AUTH_IMPORT_SCRIPT = r'''
+import fcntl, os, secrets, stat, subprocess, sys
+
+def main():
+    folder = "/workspace/home/.codex"
+    if os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_HOME", folder) != folder:
+        raise ValueError("conflicting sandbox authentication environment")
+    payload = sys.stdin.buffer.read(1024 * 1024 + 1)
+    if not payload or len(payload) > 1024 * 1024:
+        raise ValueError("invalid cache size")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open("/", flags)
+    lock = None
+    try:
+        # Open each component without following links from a restored workspace.
+        for component in folder.strip("/").split("/"):
+            try:
+                os.mkdir(component, 0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            child = os.open(component, flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        os.fchmod(directory, 0o700)
+        # Keep this inode in place so concurrent imports share the same lock.
+        lock = os.open(".cws-auth-import.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                       0o600, dir_fd=directory)
+        if not stat.S_ISREG(os.fstat(lock).st_mode):
+            raise ValueError("not a regular lock file")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def write_cache(data):
+            name = ".auth-" + secrets.token_hex(16)
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+            try:
+                with os.fdopen(fd, "wb") as target:
+                    target.write(data)
+                os.replace(name, "auth.json", src_dir_fd=directory, dst_dir_fd=directory)
+            finally:
+                try:
+                    os.unlink(name, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+
+        previous = None
+        try:
+            fd = os.open("auth.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        else:
+            with os.fdopen(fd, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError("not a regular auth cache")
+                previous = source.read(1024 * 1024 + 1)
+                if len(previous) > 1024 * 1024:
+                    raise ValueError("oversized existing cache")
+
+        write_cache(payload)
+        try:
+            result = subprocess.run(["/opt/agent/bin/codex", "login", "status"],
+                                    env={**os.environ, "HOME": "/workspace/home"},
+                                    stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, timeout=30)
+            if result.returncode != 0 or "Logged in using ChatGPT" not in result.stdout + result.stderr:
+                raise ValueError("Codex did not recognize ChatGPT authentication")
+        except BaseException:
+            if previous is None:
+                os.unlink("auth.json", dir_fd=directory)
+            else:
+                write_cache(previous)
+            raise
+    finally:
+        if lock is not None:
+            os.close(lock)
+        os.close(directory)
+
+try:
+    main()
+except Exception:
+    print("Could not import the Codex ChatGPT cache; check sandbox auth settings and paths.", file=sys.stderr)
+    sys.exit(1)
+'''
+
+
+def import_codex_auth(sb: Sandbox, payload: bytes) -> None:
+    """Send secrets only over exec stdin, never command arguments or logs."""
+    proc = None
+    closed = False
+    try:
+        # Match the working directory and saved environment of interactive Codex.
+        command = "exec python3 -c " + shlex.quote(CODEX_AUTH_IMPORT_SCRIPT)
+        proc = sb.exec(["sh", "-lc", SH_WRAP.format(cmd=command)], stdin=True, timeout_seconds=60)
+        proc.stdin.write(payload).result(timeout=30)
+        proc.stdin.close().result(timeout=30)
+        closed = True
+        result = proc.result(timeout=75)
+        if result.returncode != 0:
+            raise RuntimeError("import failed")
+    except Exception:
+        # Transport exceptions and remote output may contain credentials.
+        raise SystemExit("error: Codex auth import failed. Check the sandbox's auth settings, "
+                         "remove conflicting OPENAI_API_KEY/CODEX_HOME overrides, and retry. "
+                         "No agent was started by this import.") from None
+    finally:
+        if proc is not None and not closed:
+            try:
+                proc.stdin.close().result(timeout=5)
+            except Exception:
+                pass
+    print("Imported local ChatGPT login; Codex recognizes it. Workspace snapshots include this credential.")
+
+
 WANDB_OPENCODE_MODEL = "deepseek-ai/DeepSeek-V4-Pro-0813"
 
 
@@ -3601,6 +3753,7 @@ def launch_session(args) -> int:
     harness = HARNESSES[agent]
     image = args.image or harness.image
     env = build_env(harness, args.env, args.env_passthrough, wandb=getattr(args, "wandb", False))
+    codex_auth = local_codex_auth(harness, args, env)
     wandb_config = wandb_opencode_config(args, harness, env)
     if harness.name == "openai":
         if not env.get("CODEX_API_KEY"):
@@ -3750,6 +3903,12 @@ def launch_session(args) -> int:
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
             raise
+    if codex_auth is not None:
+        try:
+            import_codex_auth(sb, codex_auth)
+        except (Exception, SystemExit, KeyboardInterrupt):
+            stop_failed_sandbox(sb)
+            raise
     print("session ready.")
     if telegram:
         return start_launched_telegram(sb, harness, args, env)
@@ -3768,9 +3927,10 @@ def launch_session(args) -> int:
     if harness.name == "devin":
         print("  note: run `cws-agent login " + args.name + "` once; creds persist across restores.")
     if harness.name == "codex":
-        if "OPENAI_API_KEY" not in env:
+        if "OPENAI_API_KEY" not in env and codex_auth is None:
             print("  note: no OPENAI_API_KEY in your env — run `cws-agent login " + args.name + "`")
-            print("        (Sign in with ChatGPT), or set OPENAI_API_KEY before launch.")
+            print("        (Sign in with ChatGPT), add --import-codex-auth to import your local login,")
+            print("        or set OPENAI_API_KEY before launch.")
     if args.detach:
         print(f"connect later with: cws-agent connect {args.name}")
         return 0
@@ -3782,8 +3942,13 @@ def cmd_attach(args) -> int:
         raise SystemExit("error: permission flags cannot be combined with --cmd")
     sb = require_active(args.name)
     harness = active_harness(sb, args.agent)
+    if args.cmd and getattr(args, "import_codex_auth", False):
+        raise SystemExit("error: --import-codex-auth cannot be combined with --cmd")
+    codex_auth = local_codex_auth(harness, args)
     if not args.cmd:
         sync_agent_config(sb, harness, args)
+    if codex_auth is not None:
+        import_codex_auth(sb, codex_auth)
     remote_cmd = f"exec sh -c {shlex.quote(args.cmd)}" if args.cmd else interactive_command(harness, args)
     return pty_attach(sb, remote_cmd)
 
@@ -5068,6 +5233,10 @@ def cmd_discord(args) -> int:
 def cmd_login(args) -> int:
     sb = require_active(args.name)
     harness = active_harness(sb)
+    codex_auth = local_codex_auth(harness, args)
+    if codex_auth is not None:
+        import_codex_auth(sb, codex_auth)
+        return 0
     if harness.name == "claude":
         print("Opening Claude Code — type `/login` and complete the browser OAuth.")
         print("(Subscription auth; also required before `cws-agent rc`. Ctrl-D to exit.)")
@@ -5221,6 +5390,7 @@ def cmd_resume(args) -> int:
         raise SystemExit("error: Telegram requires a CLI-agent snapshot, not worker backends")
     image = checkpoint["image"] if checkpoint else args.image or harness.image
     env = build_env(harness, args.env, args.env_passthrough, wandb=getattr(args, "wandb", False))
+    codex_auth = local_codex_auth(harness, args, env)
     wandb_config = wandb_opencode_config(args, harness, env)
     if harness.name == "openai":
         if not env.get("CODEX_API_KEY"):
@@ -5270,6 +5440,8 @@ def cmd_resume(args) -> int:
                              "restore with --claude-env ENV_ID --workers N")
         if not state:
             sync_agent_config(sb, harness, args)
+            if codex_auth is not None:
+                import_codex_auth(sb, codex_auth)
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
         raise
@@ -6455,9 +6627,15 @@ def add_verbose_flag(p: argparse.ArgumentParser) -> None:
                    help="show import sizes, hashes, sources, and configuration details")
 
 
+def add_codex_auth_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--import-codex-auth", action="store_true",
+                   help="copy your local Codex ChatGPT login into the sandbox before starting Codex (included in snapshots)")
+
+
 def add_create_flags(p: argparse.ArgumentParser) -> None:
     add_verbose_flag(p)
     add_permission_flags(p)
+    add_codex_auth_flag(p)
     p.add_argument("--no-config-sync", action="store_true", help="skip automatic local skills/MCP update preview")
     p.add_argument("--agent", choices=sorted(HARNESSES), default="claude",
                    help="agent harness (default: claude)")
@@ -6538,6 +6716,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("connect", aliases=["attach"], help="open a terminal in a running sandbox (attach is a compatibility alias)")
     add_verbose_flag(p)
     add_permission_flags(p)
+    add_codex_auth_flag(p)
     p.add_argument("--no-config-sync", action="store_true", help="skip local skills/MCP update preview")
     p.add_argument("name")
     p.add_argument("--cmd", help="command to run instead of the agent (e.g. bash)")
@@ -6553,6 +6732,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("login", help="authenticate the agent inside the session (one-time)")
     p.add_argument("name")
+    add_codex_auth_flag(p)
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("exec", help="run a non-interactive shell command in the session")
