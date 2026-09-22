@@ -113,7 +113,8 @@ directories are excluded. **`.gitignore` is not applied.** Exclude secrets expli
 
 CLI launches and `sync` save a snapshot after upload unless you pass `--no-snapshot`.
 If snapshot creation fails, the files remain uploaded; retry with `cws-agent snapshot project1`.
-Worker launch modes do not take this automatic snapshot.
+Worker launch modes do not take this automatic snapshot. Managed headless
+sessions use `down --checkpoint-dir` instead; see [checkpoint coordination](checkpoints.md#managed-headless-sessions).
 
 Launch sizes the disk to fit your files with headroom; `--disk` overrides it.
 Without local files, the default is 10 GiB. `sync` cannot resize an existing disk.
