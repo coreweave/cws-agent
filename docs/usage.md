@@ -49,6 +49,57 @@ the printed token into `CLAUDE_CODE_OAUTH_TOKEN`. API keys use API billing.
 Saved logins survive snapshots; re-export environment-only credentials before restore.
 To pass another variable, add `--env-passthrough VARIABLE_NAME` to launch or restore.
 
+### Reuse a local Codex login
+
+If device-code sign-in is unavailable, sign in to Codex on your local machine
+using its browser flow, then opt in to importing that ChatGPT login at startup:
+
+```bash
+codex login
+cws-agent launch my-codex --agent codex --import-codex-auth
+```
+
+The CLI reads `auth.json` from your local `CODEX_HOME` (default `~/.codex`), sends
+it over the sandbox connection, and stores it at `/workspace/home/.codex/auth.json`
+with mode `0600` in a `0700` directory. It checks `codex login status` before opening
+Codex. This checks that Codex recognizes the cache; it does not make a model request
+or prove that a saved token can still access the service.
+
+The import is explicit. Normal launch/connect never reads your local login.
+With the option, launch/restore omit `OPENAI_API_KEY` from the sandbox environment
+so the imported ChatGPT login is selected. API-key launch still works without it.
+Local OS-keyring credentials are not exported. If your login is stored in a keyring,
+create a file-based cache with `codex -c cli_auth_credentials_store='"file"' login`,
+if your workspace policy allows file storage.
+
+For an existing Codex sandbox, import and open its terminal in one command, or
+import without opening a terminal:
+
+```bash
+cws-agent connect my-codex --import-codex-auth
+cws-agent login my-codex --import-codex-auth
+```
+
+Stop already-open Codex processes before importing, then reconnect. Existing
+sandboxes with an `OPENAI_API_KEY` environment variable or a custom `CODEX_HOME`
+cannot use this import; launch a fresh sandbox with `--import-codex-auth` instead.
+The flag is only available for the Codex CLI harness, not the `openai` executor backend.
+
+Snapshots retain the imported login. To replace a restored cache with your current
+local login before reconnecting:
+
+```bash
+cws-agent restore my-codex --import-codex-auth --connect
+```
+
+Treat the cache and snapshots containing it as credentials: the sandbox can read
+the tokens. Import replaces an existing remote cache; a failed login-status check
+restores the previous file. Concurrent imports are rejected while one is in progress.
+The local cache is never modified or copied back from the sandbox.
+If remote authentication later expires or is revoked, sign in
+locally again and explicitly re-import it. See the
+[official headless authentication guidance](https://learn.chatgpt.com/docs/auth#fallback-authenticate-locally-and-copy-your-auth-cache).
+
 ## Upload your project
 
 ```bash
