@@ -186,15 +186,18 @@ They do not preserve running processes. Use [session restart](sessions.md) for
 saved worktrees, and take another snapshot after later edits.
 Only READY snapshots can be restored.
 
-**During capture, file read permissions are temporarily broadened, including on
+**During agent workspace capture, file read permissions are temporarily broadened, including on
 saved credentials, and symlinks become placeholders.** The CLI restores their
 original permissions and targets afterward. Use trusted processes in the sandbox
 and pause unrelated writers during capture; only this host's Telegram requests
 coordinate automatically.
 
-Restore reuses the saved disk size; override it with `--disk`. Older snapshots
-without disk metadata default to 10 GiB. `down --no-snapshot` stops compute without
-saving current changes; snapshots remain until pruned.
+[Shell sandboxes](shell.md#save-work-and-stop-compute) use native filesystem
+snapshots without this metadata helper. Restore them with `shell --snapshot`.
+
+`cws-agent restore` reuses the saved disk size; override it with `--disk`. For this
+command, snapshots without disk metadata default to 10 GiB. `down --no-snapshot`
+stops compute without saving current changes; snapshots remain until pruned.
 
 ## Reconnect from another machine
 

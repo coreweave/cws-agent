@@ -28,6 +28,7 @@ Usage:
     cws-agent launch  dev1 [--agent claude|codex|devin|opencode|cursor] [--local-dir .]
     cws-agent launch  box1 --outpost my-outpost --workers 2
     cws-agent connect  dev1 [--cmd bash]
+    cws-agent shell   dev1 [--gpu any:1] [--cmd nvidia-smi]
     cws-agent run     dev1 "fix the failing test" [--yolo]
     cws-agent snapshot dev1
     cws-agent down    dev1 [--no-snapshot]
@@ -639,6 +640,8 @@ def active_harness(sb: Sandbox, override: str | None = None) -> Harness:
     if override:
         return HARNESSES[override]
     _, h = probe_session_meta(sb)
+    if h == "shell":
+        raise SystemExit("error: this is a shell sandbox; use `cws-agent shell NAME` or `cws-agent exec NAME COMMAND`")
     return HARNESSES.get(h, HARNESSES["claude"])
 
 
@@ -649,13 +652,21 @@ def snapshot_request_id(name: str, harness_name: str, suffix: str = "") -> str:
 def harness_from_request_id(request_id: str | None) -> str | None:
     if request_id and request_id.startswith(("cwsa1|", "cwcp1|")):
         parts = request_id.split("|")
-        if len(parts) >= 3 and parts[2] in HARNESSES:
+        if len(parts) >= 3 and (parts[2] in HARNESSES or parts[2] == "shell"):
             return parts[2]
     return None
 
 
 def take_snapshot(sb: Sandbox, name: str, harness_name: str) -> str:
     """Make FSS-compatible placeholders, then restore live links and permissions."""
+    if harness_name == "shell":
+        # Plain shell images need not contain Python or the agent metadata helper.
+        result = exec_retry(sb, ["sh", "-c", 'printf %s "$CWS_AGENT_DISK"'], timeout_seconds=20)
+        if result.returncode:
+            raise SystemExit("error: could not read shell workspace size before snapshot")
+        disk = (result.stdout or "").strip()
+        suffix = "|disk=" + disk if re.fullmatch(r"[1-9][0-9]*(?:Gi|Mi|Ti)", disk) else ""
+        return sb.snapshot(request_id=snapshot_request_id(name, harness_name, suffix)).result()
     with workspace_access(name):
         try:
             print("  Preparing workspace links and permissions ...", flush=True)
@@ -2799,7 +2810,8 @@ def command_uses_claude(remote_cmd: str) -> bool:
             (words[:1] == ["cd"] and words[2:5] == ["&&", "exec", "claude"]))
 
 
-def pty_attach(sb: Sandbox, remote_cmd: str, *, image_paste: bool | None = None) -> int:
+def pty_attach(sb: Sandbox, remote_cmd: str, *, image_paste: bool | None = None,
+               plain_shell: bool = False) -> int:
     if os.name == "nt":
         raise SystemExit("error: interactive terminal connections are not supported on Windows")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -2818,9 +2830,9 @@ def pty_attach(sb: Sandbox, remote_cmd: str, *, image_paste: bool | None = None)
     old_sigwinch = signal.getsignal(signal.SIGWINCH)
     # The wrapper shell execs the agent, so this PID keeps fd 0 on the PTY.
     pid_file = f"/tmp/cws-attach-{uuid.uuid4().hex}.pid"
+    wrapped = shell_command(remote_cmd) if plain_shell else clipboard_setup() + SH_WRAP.format(cmd=remote_cmd)
     session = sb.shell(
-        ["sh", "-lc", terminal_env() + clipboard_setup() + f"echo $$ > {pid_file}; "
-         + SH_WRAP.format(cmd=remote_cmd)],
+        ["sh", "-lc", terminal_env() + f"echo $$ > {pid_file}; " + wrapped],
         width=size.columns,
         height=size.lines,
     )
@@ -3935,6 +3947,240 @@ def launch_session(args) -> int:
         print(f"connect later with: cws-agent connect {args.name}")
         return 0
     return pty_attach(sb, interactive_command(harness, args))
+
+
+def shell_gpu(value: str) -> dict:
+    match = re.fullmatch(r"(any|rtxp6000|rtxp6000-v2)(?::([1-8]))?", value)
+    if not match:
+        raise argparse.ArgumentTypeError("use any[:COUNT], with COUNT from 1 to 8")
+    if match[1] != "any":
+        raise argparse.ArgumentTypeError("rtxp6000 and rtxp6000-v2 are host variants that the sandbox API cannot select; use any[:COUNT]")
+    return {"count": int(match[2] or 1)}
+
+
+def shell_cpu(value: str) -> str:
+    if not re.fullmatch(r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)m?", value) or float(value.rstrip("m")) <= 0:
+        raise argparse.ArgumentTypeError("CPU must be positive, e.g. 2, 0.5, or 500m")
+    return value
+
+
+def shell_memory(value: str) -> str:
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMGT]i|[kMGT])?", value)
+    if not match or float(match[1]) <= 0:
+        raise argparse.ArgumentTypeError("memory must be positive MiB or a quantity, e.g. 4096 or 4Gi")
+    return value if match[2] else value + "Mi"
+
+
+def shell_text(value: str) -> str:
+    if not value.strip() or "\x00" in value:
+        raise argparse.ArgumentTypeError("value must not be empty or contain NUL")
+    return value
+
+
+def shell_secret(value: str):
+    from cwsandbox import Secret
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise argparse.ArgumentTypeError("use a W&B secret name that is a valid environment variable name")
+    if value.startswith("CWS_AGENT_"):
+        raise argparse.ArgumentTypeError("CWS_AGENT_ names are reserved for session metadata")
+    return Secret(store="wandb", name=value)
+
+
+def shell_volume(value: str):
+    from pathlib import PurePosixPath
+    from cwsandbox import RegisteredVolumeOptions
+    volume_id, separator, path = value.partition(":")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", volume_id):
+        raise argparse.ArgumentTypeError("volume must be ID[:/mnt/PATH], with a lowercase alphanumeric or hyphen ID")
+    path = path if separator else "/mnt/" + volume_id
+    parts = PurePosixPath(path).parts
+    if (not path.startswith("/mnt/") or len(parts) < 3 or ".." in parts
+            or str(PurePosixPath(path)) != path or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in path)):
+        raise argparse.ArgumentTypeError("volume mount path must be a normalized path below /mnt/")
+    return RegisteredVolumeOptions(name=volume_id, volume_id=volume_id, mount_path=path)
+
+
+def shell_local_files(paths, volumes):
+    """Inventory explicit copies before creating compute; do not follow links."""
+    from pathlib import Path, PurePosixPath
+    import stat
+    destinations = [PurePosixPath(v.mount_path) for v in volumes]
+    if len({v.volume_id for v in volumes}) != len(volumes):
+        raise SystemExit("error: each --volume ID may only be specified once")
+    roots = []
+    for value in paths:
+        path = Path(os.path.abspath(os.path.expanduser(value)))
+        if not path.name or path.name in {".", ".."}:
+            raise SystemExit("error: --add-local must name a file or directory, not the filesystem root")
+        destination = PurePosixPath("/mnt") / path.name
+        destinations.append(destination)
+        roots.append((path, destination))
+    for index, destination in enumerate(destinations):
+        for previous in destinations[:index]:
+            if destination == previous or destination in previous.parents or previous in destination.parents:
+                raise SystemExit(f"error: overlapping --add-local/--volume destinations: {previous} and {destination}")
+    entries = []
+    for root, destination in roots:
+        def visit(path, remote):
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                entries.append((path, str(remote), mode))
+                for child in sorted(path.iterdir()):
+                    visit(child, remote / child.name)
+            elif stat.S_ISREG(mode):
+                entries.append((path, str(remote), mode))
+            else:
+                raise SystemExit(f"error: --add-local supports regular files and directories only: {path}")
+        try:
+            visit(root, destination)
+        except OSError as error:
+            raise SystemExit(f"error: cannot read --add-local path {root}: {error.strerror}") from None
+    return entries
+
+
+def shell_snapshot(reference: str):
+    snapshots = Sandbox.list_snapshots(auth=sandbox_auth()).result()
+    matches = [s for s in snapshots if s.file_system_snapshot_id == reference]
+    if not matches:
+        matches = [s for s in snapshots if s.request_id == reference]
+    if len(matches) > 1:
+        raise SystemExit("error: snapshot name is ambiguous; use its snapshot ID")
+    snapshot = matches[0] if matches else latest_ready_snapshot(reference)
+    if snapshot is None or checkpoint_status(snapshot.status) != "ready":
+        raise SystemExit("error: no READY snapshot found for that ID or name")
+    if is_managed_checkpoint(snapshot):
+        raise SystemExit("error: restore managed checkpoints with `cws-agent restore --checkpoint-dir`, not shell --snapshot")
+    return snapshot
+
+
+def shell_command(command: str) -> str:
+    return f"export HOME={HOME_DIR}; cd {PROJECT_DIR} || exit; " + command
+
+
+def shell_copy_files(sb, entries):
+    import stat
+    # Uploads are creation-only and never target a registered volume or /workspace.
+    roots = []
+    for _, remote, _ in entries:
+        root = "/".join(remote.split("/")[:3])
+        if root not in roots:
+            roots.append(root)
+    for root in roots:
+        quoted = shlex.quote(root)
+        result = exec_retry(sb, ["sh", "-c", f"test ! -L /mnt && test ! -e {quoted} && test ! -L {quoted}"], attempts=1)
+        if result.returncode:
+            raise SystemExit(f"error: --add-local destination already exists or /mnt is a symlink: {root}")
+    for path, remote, mode in entries:
+        if stat.S_ISDIR(mode):
+            result = exec_retry(sb, ["mkdir", "-p", "--", remote], attempts=1)
+        else:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise SystemExit("error: --add-local source changed to a non-regular file")
+                sb.write_file_streaming(remote, iter(lambda: source.read(1024 * 1024), b"")).result()
+            result = exec_retry(sb, ["chmod", format(mode & 0o777, "o"), "--", remote], attempts=1)
+        if result.returncode:
+            raise SystemExit("error: could not copy --add-local files")
+    for _, remote, mode in reversed(entries):
+        if stat.S_ISDIR(mode):
+            if exec_retry(sb, ["chmod", format(mode & 0o777, "o"), "--", remote], attempts=1).returncode:
+                raise SystemExit("error: could not preserve --add-local directory permissions")
+
+
+def cmd_shell(args) -> int:
+    from dataclasses import replace
+    import stat
+    import uuid
+    if args.name is None:
+        args.name = "shell-" + uuid.uuid4().hex[:8]
+    if not NAME_RE.fullmatch(args.name):
+        raise SystemExit("error: session name must match [a-z0-9][a-z0-9-]{0,39}")
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if args.cmd is None and not interactive:
+        raise SystemExit("error: shell requires a terminal; use --cmd COMMAND for non-interactive execution")
+    if interactive and os.name == "nt":
+        raise SystemExit("error: interactive terminal connections are not supported on Windows")
+    mode = args.mode or ("cks" if args.volume else "serverless")
+    if args.volume and mode != "cks":
+        raise SystemExit("error: --volume requires CKS placement; use --mode cks or omit --mode")
+    if args.secret and args.volume:
+        raise SystemExit("error: --secret requires W&B serverless placement and cannot be combined with --volume")
+    if args.secret and mode != "serverless":
+        raise SystemExit("error: --secret requires serverless placement and cannot be combined with --mode cks")
+    if args.secret and sandbox_auth() != AuthStrategy.WANDB:
+        raise SystemExit("error: --secret requires W&B authentication. CWSANDBOX_API_KEY is set; "
+                         "unset it and configure WANDB_API_KEY or run `wandb login`.")
+    if mode == "cks" and sandbox_auth() != AuthStrategy.COREWEAVE_API_KEY:
+        raise SystemExit("error: CKS placement requires a CoreWeave API access token (CWSANDBOX_API_KEY)")
+    if len({s.name for s in args.secret}) != len(args.secret):
+        raise SystemExit("error: each --secret name may only be specified once")
+    if not sys.stdin.isatty():
+        try:
+            stdin_mode = os.fstat(sys.stdin.fileno()).st_mode
+        except (OSError, ValueError):
+            stdin_mode = 0
+        if stat.S_ISFIFO(stdin_mode) or stat.S_ISREG(stdin_mode):
+            print("warning: shell --cmd does not forward piped or redirected stdin; input will be ignored.",
+                  file=sys.stderr)
+    entries = shell_local_files(args.add_local, args.volume)
+    boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(args.name)], auth=sandbox_auth()).result()
+    if len(boxes) > 1:
+        raise SystemExit("error: multiple running sandboxes have this name; use a unique session name")
+    creation = [flag for flag in ("image", "cpu", "gpu", "memory", "secret", "snapshot", "volume", "add_local", "mode")
+                if getattr(args, flag)]
+    if boxes:
+        if creation:
+            raise SystemExit("error: creation options cannot change a running sandbox: " +
+                             ", ".join("--" + flag.replace("_", "-") for flag in creation))
+        sb = boxes[0]
+    else:
+        snapshot = shell_snapshot(args.snapshot) if args.snapshot else None
+        disk = "10Gi"
+        if snapshot:
+            saved_disk = re.search(r"\|disk=([1-9][0-9]*(?:Gi|Mi|Ti))$", snapshot.request_id or "")
+            disk = saved_disk[1] if saved_disk else f"{max(10, ((snapshot.size_bytes or 0) + 2**30 - 1) // 2**30)}Gi"
+        kwargs = dict(
+            container_image=args.image or "python:3.11",
+            tags=session_tags(args.name, "shell"),
+            max_lifetime_seconds=8 * 3600,
+            environment_variables={"CWS_AGENT_NAME": args.name, "CWS_AGENT_HARNESS": "shell",
+                                   "CWS_AGENT_DISK": disk},
+            resources=ResourceOptions(requests={"cpu": args.cpu or "2", "memory": args.memory or "4Gi"},
+                                      limits={"cpu": args.cpu or "2", "memory": args.memory or "4Gi"},
+                                      gpu=args.gpu),
+            file_system_snapshot=FileSystemSnapshotOptions(
+                mount_path=MOUNT_PATH, size=disk,
+                file_system_snapshot_id=snapshot.file_system_snapshot_id if snapshot else None),
+            secrets=args.secret,
+            volumes=[replace(volume, name=f"shell-volume-{index}") for index, volume in enumerate(args.volume)],
+            placement_mode=mode,
+        )
+        print(f"Creating shell sandbox {args.name!r} ...", file=sys.stderr, flush=True)
+        sb = Sandbox.run("sh", "-c", "sleep infinity", auth=sandbox_auth(), **kwargs)
+        try:
+            result = exec_retry(sb, ["mkdir", "-p", HOME_DIR, PROJECT_DIR, "/mnt"], attempts=1)
+            if result.returncode:
+                raise SystemExit("error: image must allow creating /workspace/home, /workspace/project, and /mnt")
+            if snapshot and harness_from_request_id(snapshot.request_id) not in (None, "shell"):
+                snapshot_metadata(sb, "restore-snapshot")
+            shell_copy_files(sb, entries)
+        except (Exception, SystemExit, KeyboardInterrupt):
+            stop_failed_sandbox(sb)
+            raise
+        print(f"Sandbox {args.name!r} will keep running after this command exits. "
+              f"Stop: cws-agent down {args.name} --no-snapshot", file=sys.stderr)
+    command = ("exec sh -c " + shlex.quote(args.cmd) if args.cmd is not None else
+               "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi")
+    if interactive:
+        return pty_attach(sb, command, image_paste=False, plain_shell=True)
+    result = exec_retry(sb, ["sh", "-lc", shell_command(command) + HEADLESS_STDIN],
+                        timeout_seconds=300, attempts=1)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+    return result.returncode or 0
 
 
 def cmd_attach(args) -> int:
@@ -5353,7 +5599,9 @@ def cmd_down(args) -> int:
     if args.no_snapshot:
         print(f"session {args.name!r} stopped without a new snapshot; restore requires an existing READY snapshot.")
     else:
-        print(f"session {args.name!r} stopped. `cws-agent restore {args.name}` brings it back.")
+        restore = (f"cws-agent shell {args.name} --snapshot {args.name}" if harness_name == "shell"
+                   else f"cws-agent restore {args.name}")
+        print(f"session {args.name!r} stopped. `{restore}` brings its workspace back.")
     return 0
 
 
@@ -5382,6 +5630,8 @@ def cmd_resume(args) -> int:
 
     # Recover harness from the snapshot's metadata-bearing request_id.
     harness_name = harness_from_request_id(getattr(snap, "request_id", None))
+    if harness_name == "shell":
+        raise SystemExit(f"error: restore shell workspaces with `cws-agent shell {args.name} --snapshot {args.name}`; repeat the image, resources, secrets, and volumes you need")
     harness = HARNESSES[harness_name or args.agent or "claude"]
     if harness.name == "openai" and (args.claude_env or args.outpost or args.workers not in (None, 1)
                                     or args.yolo or args.permission_mode not in (None, "accept-edits")):
@@ -6660,6 +6910,25 @@ def main(argv: list[str] | None = None) -> int:
     add_verbose_flag(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser("shell", help="create or reconnect to a sandbox terminal", allow_abbrev=False)
+    p.add_argument("name", nargs="?", help="session name (default: generate a new shell name)")
+    p.add_argument("--add-local", type=shell_text, action="append", default=[], metavar="PATH",
+                   help="copy a file or directory to /mnt/BASENAME on creation (repeatable)")
+    p.add_argument("--image", type=shell_text, help="container image (default: python:3.11)")
+    p.add_argument("--cpu", type=shell_cpu, help="CPUs, e.g. 2 or 500m (default: 2)")
+    p.add_argument("--gpu", type=shell_gpu, metavar="any[:COUNT]", help="request 1 to 8 GPUs (default: none; any means any:1)")
+    p.add_argument("--memory", type=shell_memory, help="MiB or a quantity, e.g. 4096 or 4Gi (default: 4Gi)")
+    p.add_argument("--mode", choices=["serverless", "cks"],
+                   help="placement on creation (default: serverless; --volume selects cks)")
+    p.add_argument("--secret", type=shell_secret, action="append", default=[], metavar="NAME",
+                   help="W&B secret name to inject as an environment variable (repeatable; serverless only)")
+    p.add_argument("--snapshot", type=shell_text, metavar="ID_OR_NAME",
+                   help="restore /workspace from a snapshot ID, request name, or session's latest READY snapshot")
+    p.add_argument("--volume", type=shell_volume, action="append", default=[], metavar="ID[:/mnt/PATH]",
+                   help="mount a registered volume (repeatable; selects CKS; default path: /mnt/ID)")
+    p.add_argument("-c", "--cmd", type=shell_text, help="command instead of Bash/sh; runs without a PTY when input/output is not a terminal")
+    p.set_defaults(func=cmd_shell)
+
     p = sub.add_parser("launch", help="create a session sandbox and attach")
     name = p.add_mutually_exclusive_group(required=True)
     name.add_argument("name", nargs="?", default=argparse.SUPPRESS,
@@ -6900,7 +7169,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except CWSandboxAuthenticationError:
+    except CWSandboxAuthenticationError as error:
+        if getattr(args, "command", None) == "shell":
+            # The SDK also uses this class for permission/entitlement failures.
+            print(f"error: {error}", file=sys.stderr)
+            return 1
         print("error: sandbox authentication failed. Set WANDB_API_KEY or run `wandb login`; "
               "CoreWeave accounts can set CWSANDBOX_API_KEY.", file=sys.stderr)
         return 1
@@ -6910,6 +7183,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except Exception as error:
+        if getattr(args, "command", None) == "shell":
+            print(f"error: shell operation failed ({type(error).__name__}); check sandbox status, image, access, and resource availability.",
+                  file=sys.stderr)
+            return 1
         if not getattr(args, "checkpoint_dir", None):
             raise
         # SDK/hook exceptions can contain credentials or request bodies.
