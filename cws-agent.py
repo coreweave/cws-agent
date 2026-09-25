@@ -1594,12 +1594,14 @@ BACKEND_STATE = f"{MOUNT_PATH}/.cws-agent-backend.json"
 
 
 def backend_config(kind: str, target: str, workers: int) -> dict:
-    if kind not in ("claude", "outpost", "openai"):
+    if kind not in ("claude", "outpost", "openai", "claude-cloud"):
         raise SystemExit("error: unrecognized saved worker backend")
     if not isinstance(target, str) or not target or len(target) > 200 or any(ord(c) < 32 for c in target):
         raise SystemExit("error: invalid worker target")
     if kind == "claude" and not re.fullmatch(r"env_[A-Za-z0-9_-]+", target):
         raise SystemExit("error: --claude-env must be an environment ID beginning with env_")
+    if kind == "claude-cloud" and (workers != 1 or not re.fullmatch(r"ccpool_[A-Za-z0-9_-]+", target)):
+        raise SystemExit("error: Claude Code Cloud needs a ccpool_ environment and one runner per sandbox")
     if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
         raise SystemExit("error: --workers must be positive")
     if kind == "openai" and (workers != 1 or not re.fullmatch(r"[A-Za-z0-9_-]+", target)):
@@ -1626,6 +1628,8 @@ def read_backend_config(sb: Sandbox) -> dict | None:
 def start_backend(sb: Sandbox, state: dict, name: str, env: dict) -> None:
     # Persist only our documented fields, never extra input or credentials.
     state = backend_config(state["kind"], state["target"], state["workers"])
+    if state["kind"] == "claude-cloud":
+        raise SystemExit("error: start a fresh Claude Code Cloud runner with `cws-agent cloud start`; cloud runner snapshots cannot be restored")
     key = {"claude": "ANTHROPIC_ENVIRONMENT_KEY", "outpost": "DEVIN_OUTPOSTS_TOKEN",
            "openai": "CODEX_API_KEY"}[state["kind"]]
     if not env.get(key):
@@ -5903,7 +5907,7 @@ def cmd_resume(args) -> int:
         if state:
             if getattr(args, "telegram", False):
                 raise SystemExit("error: Telegram requires a CLI-agent snapshot, not worker backends")
-            expected = {"claude": "ant", "outpost": "devin", "openai": "openai"}[state["kind"]]
+            expected = {"claude": "ant", "outpost": "devin", "openai": "openai", "claude-cloud": "claude"}[state["kind"]]
             if expected != harness.name:
                 raise SystemExit("error: worker backend does not match the snapshot harness")
             if args.workers is not None:
@@ -7187,11 +7191,211 @@ def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) ->
                    help="copy a local env var into the sandbox (repeatable)")
 
 
+CLOUD_LOG = "/workspace/claude-cloud/worker.log"
+CLOUD_SECRET = "SELF_HOSTED_RUNNER_ENVIRONMENT_SECRET"
+
+
+def cloud_backend(sb):
+    state = read_backend_config(sb)
+    if not state or state["kind"] != "claude-cloud":
+        raise SystemExit("error: this sandbox is not a Claude Code Cloud runner")
+    return state
+
+
+def cloud_health(sb):
+    # HTTP 200 alone only means alive. Require a registered runner and a recent poll.
+    script = """import json, urllib.request
+try:
+    with urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3) as r:
+        d = json.load(r)
+    print(json.dumps({k: d.get(k) for k in ('runner_id', 'active_sessions', 'last_poll_age_ms')}))
+except Exception:
+    print('{}')
+"""
+    result = exec_retry(sb, ["python3", "-c", script], timeout_seconds=10, attempts=1)
+    try:
+        health = json.loads(result.stdout or "{}") if result.returncode == 0 else {}
+        return health if isinstance(health, dict) else {}
+    except ValueError:
+        return {}
+
+
+def cloud_ready(health):
+    age = health.get("last_poll_age_ms")
+    return bool(health.get("runner_id")) and isinstance(age, (int, float)) and 0 <= age < 60000
+
+
+def cloud_dispatch(args, environment):
+    """Use the documented local CLI, keeping account OAuth off the runner host."""
+    import subprocess
+    from pathlib import Path
+
+    binary = shutil.which("claude")
+    if not binary:
+        raise SystemExit("error: install Claude Code locally and run `claude auth login` to send cloud goals")
+    command = [binary, "-p", "--output-format", "json"]
+    session = getattr(args, "session", None)
+    if session:
+        if not re.fullmatch(r"(?:session|cse)_[A-Za-z0-9_-]+", session):
+            raise SystemExit("error: --session must be a Claude cloud session ID")
+        if getattr(args, "ref", None):
+            raise SystemExit("error: --ref applies only to a new cloud session")
+        command += ["--cloud", session]
+    else:
+        command += ["--environment", environment]
+        if getattr(args, "ref", None):
+            command += ["--ref", args.ref]
+    directory = str(Path(args.repo).expanduser().resolve())
+    try:
+        result = subprocess.run(command, input=args.goal, text=True, capture_output=True,
+                                cwd=directory, timeout=90)
+    except subprocess.TimeoutExpired:
+        raise SystemExit("error: cloud dispatch timed out; check claude.ai/code before retrying because the goal may have been accepted") from None
+    except OSError:
+        raise SystemExit("error: cannot run local Claude Code; check --repo and your Claude installation") from None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        data = {}
+    if result.returncode or data.get("ok") is False or not re.fullmatch(
+            r"(?:session|cse)_[A-Za-z0-9_-]+", str(data.get("session_id", ""))):
+        # CLI errors can contain account or token details; don't echo arbitrary output.
+        raise SystemExit("error: Claude rejected the cloud goal; check `claude auth status`, cloud access, and your repository. Check claude.ai/code before retrying")
+    session = data["session_id"]
+    print(f"Goal sent: https://claude.ai/code/{session}")
+    print(f"Follow up: cws-agent cloud run {args.name} 'your message' --session {session}")
+    return 0
+
+
+def cmd_cloud_start(args):
+    from pathlib import Path
+
+    if not NAME_RE.fullmatch(args.name):
+        raise SystemExit("error: invalid sandbox name")
+    state = backend_config("claude-cloud", args.environment, 1)
+    lifetime = parse_duration(args.lifetime)
+    if lifetime < 600:
+        raise SystemExit("error: cloud runners need a lifetime of at least 10m (includes a 5m retirement margin)")
+    if args.ref and not args.goal:
+        raise SystemExit("error: --ref requires --goal when starting a cloud runner")
+    secret = os.environ.get(CLOUD_SECRET, "").strip()
+    if not secret or any(c.isspace() for c in secret):
+        raise SystemExit(f"error: export {CLOUD_SECRET} from your Claude Code Cloud environment; Managed Agents keys cannot be used here")
+    setup = Path(args.setup).expanduser().read_bytes() if args.setup else None
+    if args.goal and not shutil.which("claude"):
+        raise SystemExit("error: install Claude Code locally and run `claude auth login` before sending a goal")
+    if find_active(args.name):
+        raise SystemExit(f"error: {args.name!r} already has an active sandbox; use `cws-agent cloud status {args.name}`")
+    # Deliberately exclude local inference, OAuth, and sandbox control credentials.
+    env = {CLOUD_SECRET: secret}
+    retire_at = int(time.time()) + lifetime - 300
+    harness = HARNESSES["claude"]
+    sb = provision_session(name=args.name, harness=harness, repo_url=None,
+        image=args.image or harness.image, lifetime_seconds=lifetime, cpu=args.cpu,
+        memory=args.memory, disk=args.disk, env=env, mode=args.mode, restore_snapshot_id=None)
+    try:
+        if setup is not None:
+            sb.write_file("/opt/cws-cloud-setup.sh", setup).result(timeout=30)
+            result = exec_retry(sb, ["bash", "-e", "/opt/cws-cloud-setup.sh"], timeout_seconds=900, attempts=1)
+            if result.returncode != 0:
+                raise SystemExit("error: cloud setup script failed; its output was suppressed to protect environment credentials")
+        check = exec_retry(sb, ["sh", "-lc", AGENT_ENV + "claude --version && claude self-hosted-runner --help"],
+                           timeout_seconds=30, attempts=1)
+        version = re.match(r"(\d+)\.(\d+)\.(\d+)\b", check.stdout or "")
+        if (check.returncode != 0 or not version or tuple(map(int, version.groups())) < (2, 1, 267)
+                or "--use-anthropic-git-proxy" not in (check.stdout or "")):
+            raise SystemExit("error: this image needs Claude Code 2.1.267 or later for self-hosted git proxy registration")
+        sb.write_file(BACKEND_STATE, json.dumps(state).encode()).result(timeout=30)
+        command = ("claude self-hosted-runner --capacity 1 --base-dir /workspace/claude-cloud "
+                   "--use-anthropic-git-proxy --configure-git --drain-grace-sec 3600 "
+                   f"--retire-at {retire_at} --client-label {shlex.quote(args.name)}")
+        start_checked_worker(sb, "claude-cloud", "/workspace/claude-cloud", command)
+        with startup_step("Waiting for Claude runner registration"):
+            for _ in range(30):
+                if cloud_ready(cloud_health(sb)):
+                    break
+                time.sleep(2)
+            else:
+                raise SystemExit("error: Claude cloud runner did not register and poll within 60s; verify the environment secret and organization policy")
+    except (Exception, SystemExit, KeyboardInterrupt):
+        stop_failed_sandbox(sb)
+        raise
+    session_summary("Claude Code Cloud runner ready", [
+        ("Name", args.name), ("Sandbox", sb.sandbox_id), ("Environment", args.environment),
+    ])
+    print(f"Send a goal: cws-agent cloud run {args.name} 'your task' --repo .")
+    print(f"Stop compute: cws-agent down {args.name} --no-snapshot")
+    if args.goal:
+        return cloud_dispatch(args, args.environment)
+    return 0
+
+
+def cmd_cloud_run(args):
+    sb = require_active(args.name)
+    state = cloud_backend(sb)
+    if not cloud_ready(cloud_health(sb)):
+        raise SystemExit("error: runner is not polling; inspect `cws-agent cloud status` and start a fresh runner if it has exited")
+    return cloud_dispatch(args, state["target"])
+
+
+def cmd_cloud_status(args):
+    sb = require_active(args.name)
+    state = cloud_backend(sb)
+    health = cloud_health(sb)
+    print(f"Environment: {state['target']}")
+    print(f"Runner: {'polling' if cloud_ready(health) else 'not ready (stopped or poll stale)'}")
+    print(f"Active sessions: {health.get('active_sessions', 'unknown')}")
+    print(f"Last poll age (ms): {health.get('last_poll_age_ms', 'unknown')}")
+    return 0 if cloud_ready(health) else 1
+
+
+def cmd_cloud_logs(args):
+    sb = require_active(args.name)
+    cloud_backend(sb)
+    # Redact the environment secret at the source, never fetching it to the client.
+    script = ("import os\nfrom collections import deque\n"
+              f"with open({CLOUD_LOG!r}) as f: output = ''.join(deque(f, maxlen=100))\n"
+              f"secret = os.environ.get({CLOUD_SECRET!r})\n"
+              "print(output.replace(secret, '[REDACTED]') if secret else output, end='')\n")
+    result = exec_retry(sb, ["python3", "-c", script], timeout_seconds=30, attempts=1)
+    if result.stdout:
+        print(result.stdout, end="")
+    return result.returncode or 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
     add_verbose_flag(parser)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    cloud = sub.add_parser("cloud", help="run Claude Code Cloud sessions on a sandbox")
+    commands = cloud.add_subparsers(dest="cloud_command", required=True)
+    p = commands.add_parser("start", help="create a dedicated self-hosted Claude Code runner")
+    p.add_argument("name")
+    p.add_argument("--environment", required=True, metavar="CCPOOL_ID")
+    p.add_argument("--image", help="custom Debian-compatible image with Python, bash, and apt-get")
+    p.add_argument("--setup", help="local Bash setup script to run before starting the runner")
+    p.add_argument("--lifetime", default="8h")
+    p.add_argument("--cpu", default="2")
+    p.add_argument("--memory", default="4Gi")
+    p.add_argument("--disk", default="10Gi")
+    p.add_argument("--mode", choices=["serverless", "cks"])
+    p.add_argument("--goal", help="send a goal after the runner is ready")
+    p.add_argument("--repo", default=".", help="local Git checkout used by Claude to identify the remote repository")
+    p.add_argument("--ref", help="remote branch or ref for a new session")
+    p.set_defaults(func=cmd_cloud_start)
+    p = commands.add_parser("run", help="send a new goal or follow-up using your local Claude login")
+    p.add_argument("name")
+    p.add_argument("goal")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--ref")
+    p.add_argument("--session", help="existing cloud session ID for a follow-up")
+    p.set_defaults(func=cmd_cloud_run)
+    for command, function in (("status", cmd_cloud_status), ("logs", cmd_cloud_logs)):
+        p = commands.add_parser(command)
+        p.add_argument("name")
+        p.set_defaults(func=function)
 
     p = sub.add_parser("shell", help="create or reconnect to a sandbox terminal", allow_abbrev=False)
     p.add_argument("name", nargs="?", help="session name (default: generate a new shell name)")
