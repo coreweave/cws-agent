@@ -2,6 +2,7 @@
 import contextlib
 import io
 import unittest
+import types
 from unittest.mock import patch
 
 from test_consolidation import cli_parser, subcommands
@@ -40,7 +41,7 @@ class LifecycleNameTests(unittest.TestCase):
         names = set()
         for command in ("claude", "claude", "codex", "cursor", "devin", "opencode"):
             output = io.StringIO()
-            sandbox = object()
+            sandbox = types.SimpleNamespace(sandbox_id="sb-example")
             inventory = agent.LocalDirectoryInventory("/project", [], 0, 0, set())
             with self.subTest(command=command), contextlib.redirect_stdout(output), \
                     patch.object(agent, "find_active", return_value=None), \
@@ -56,7 +57,7 @@ class LifecycleNameTests(unittest.TestCase):
             names.add(name)
             self.assertEqual(upload.call_args.kwargs["session_name"], name)
             snapshot.assert_called_once_with(sandbox, name, command)
-            self.assertIn(f"launching session '{name}'", output.getvalue())
+            self.assertIn(f"Name: {name}", output.getvalue())
             self.assertIn(f"cws-agent connect {name}", output.getvalue())
 
     def test_agent_shortcuts_match_explicit_launch(self):

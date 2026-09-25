@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import types
 from unittest.mock import patch
 
 from test_messaging import app
@@ -18,8 +19,8 @@ class TelegramLaunchTests(unittest.TestCase):
     def test_launch_creates_signs_in_and_bridges_with_permission_choice(self):
         args = self.args("--dangerously-skip-permissions")
         events = []
-        sb = object()
-        with contextlib.redirect_stdout(io.StringIO()), \
+        sb = types.SimpleNamespace(sandbox_id="sb-example")
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
                 patch.object(app.sys.stdin, "isatty", return_value=True), \
                 patch.object(app.sys.stdout, "isatty", return_value=True), \
                 patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "123:test"}), \
@@ -31,6 +32,9 @@ class TelegramLaunchTests(unittest.TestCase):
                 patch.object(app, "cmd_bridge_telegram", side_effect=lambda a: events.append("bridge") or 0) as bridge:
             self.assertEqual(app.cmd_launch(args), 0)
         self.assertEqual(events, ["create", "login", "bridge"])
+        self.assertIn("Telegram setup", output.getvalue())
+        self.assertNotIn("Session ready", output.getvalue())
+        self.assertNotIn("cws-agent connect", output.getvalue())
         self.assertTrue(bridge.call_args.args[0].yolo)
         self.assertEqual(bridge.call_args.args[0].name, "tg-new")
 

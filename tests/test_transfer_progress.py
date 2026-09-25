@@ -49,6 +49,7 @@ class TransferProgressTests(unittest.TestCase):
 
     def test_terminal_bar_and_narrow_terminal(self):
         with patch.object(self.output, "isatty", return_value=True), \
+                patch.dict(os.environ, {"TERM": "xterm"}), \
                 patch.object(cli.shutil, "get_terminal_size", return_value=os.terminal_size((100, 30))):
             with cli.TransferProgress("Uploading", 100) as progress:
                 progress.advance(50)
@@ -58,11 +59,34 @@ class TransferProgressTests(unittest.TestCase):
         self.output.seek(0)
         self.output.truncate()
         with patch.object(self.output, "isatty", return_value=True), \
+                patch.dict(os.environ, {"TERM": "xterm"}), \
                 patch.object(cli.shutil, "get_terminal_size", return_value=os.terminal_size((30, 30))):
-            with cli.TransferProgress("Uploading", 0):
-                pass
-        for line in self.output.getvalue().split("\r")[1:]:
-            self.assertLessEqual(len(line.replace("\033[2K", "").rstrip("\n")), 29)
+            with cli.TransferProgress("Uploading", 0) as progress:
+                self.assertLessEqual(len(progress.spinner.text.plain), 27)
+
+    def test_live_transfer_refreshes_without_new_bytes_and_stops_on_error(self):
+        stdout = io.StringIO()
+        with patch.object(self.output, "isatty", return_value=True), \
+                patch.dict(os.environ, {"TERM": "xterm"}), \
+                contextlib.redirect_stdout(stdout), self.assertRaises(RuntimeError):
+            with cli.TransferProgress("Uploading", 100) as progress:
+                self.assertTrue(progress.live.is_started)
+                self.assertTrue(progress.live.auto_refresh)
+                self.assertEqual(progress.done, 0)
+                print("transfer stdout")
+                raise RuntimeError("connection failed")
+        self.assertFalse(progress.live.is_started)
+        self.assertEqual(stdout.getvalue(), "transfer stdout\n")
+        self.assertNotIn("transfer stdout", self.output.getvalue())
+        self.assertIn("failed", self.output.getvalue())
+        self.assertNotIn("100%", self.output.getvalue())
+
+    def test_dumb_terminal_transfer_has_no_control_sequences(self):
+        with patch.object(self.output, "isatty", return_value=True), \
+                patch.dict(os.environ, {"TERM": "dumb"}):
+            with cli.TransferProgress("Uploading", 1) as progress:
+                progress.advance(1)
+        self.assertNotIn("\033", self.output.getvalue())
 
     def test_failure_and_interrupt_never_claim_success_even_after_all_bytes(self):
         for error in (RuntimeError("failed"), KeyboardInterrupt()):

@@ -127,7 +127,7 @@ class DocumentedSessionCommands(unittest.TestCase):
 
     def test_session_start_creates_isolated_worktree_and_records_base(self):
         self.init_repo()
-        with patch.object(app, "require_active", return_value=object()), \
+        with patch.object(app, "require_active", return_value=types.SimpleNamespace(sandbox_id="sb-example")), \
                 patch.object(app, "active_harness", return_value=app.HARNESSES["claude"]), \
                 patch.object(app, "exec_retry", side_effect=self.local_git_exec):
             self.assertEqual(self.call(["session", "start", "work", "fix", "--base", "main",
@@ -155,7 +155,7 @@ class DocumentedSessionCommands(unittest.TestCase):
 
     def test_documented_restart_after_snapshot_reuses_existing_worktree(self):
         self.init_repo()
-        with patch.object(app, "require_active", return_value=object()), \
+        with patch.object(app, "require_active", return_value=types.SimpleNamespace(sandbox_id="sb-example")), \
                 patch.object(app, "active_harness", return_value=app.HARNESSES["claude"]), \
                 patch.object(app, "exec_retry", side_effect=self.local_git_exec):
             self.call(["session", "start", "work", "fix", "--base", "main"])
@@ -196,7 +196,7 @@ class DocumentedSessionCommands(unittest.TestCase):
 
     def test_stop_retains_dirty_worktree_without_force(self):
         self.init_repo()
-        with patch.object(app, "require_active", return_value=object()), \
+        with patch.object(app, "require_active", return_value=types.SimpleNamespace(sandbox_id="sb-example")), \
                 patch.object(app, "active_harness", return_value=app.HARNESSES["claude"]), \
                 patch.object(app, "exec_retry", side_effect=self.local_git_exec):
             self.call(["session", "start", "work", "fix", "--base", "main"])
@@ -210,7 +210,7 @@ class DocumentedSessionCommands(unittest.TestCase):
 
     def test_stop_can_delete_clean_worktree_and_explicitly_delete_branch(self):
         self.init_repo()
-        with patch.object(app, "require_active", return_value=object()), \
+        with patch.object(app, "require_active", return_value=types.SimpleNamespace(sandbox_id="sb-example")), \
                 patch.object(app, "active_harness", return_value=app.HARNESSES["claude"]), \
                 patch.object(app, "exec_retry", side_effect=self.local_git_exec):
             self.call(["session", "start", "work", "fix", "--base", "main"])
@@ -364,7 +364,7 @@ class DocumentedSnapshotCommands(unittest.TestCase):
                 patch.object(app, "build_env", return_value={}), \
                 patch.object(app, "read_backend_config", return_value=None), \
                 patch.object(app, "sync_agent_config") as config_sync, \
-                patch.object(app, "provision_session", return_value=object()) as provision, \
+                patch.object(app, "provision_session", return_value=types.SimpleNamespace(sandbox_id="sb-example")) as provision, \
                 patch.object(app, "pty_attach", return_value=0) as attach:
             self.assertEqual(self.call(["resume", "dev1", "--attach"]), 0)
         self.assertEqual(provision.call_args.kwargs["restore_snapshot_id"], "ready")

@@ -184,7 +184,7 @@ class ImportTests(unittest.TestCase):
                 patch.object(app, "exec_retry", return_value=types.SimpleNamespace(stdout="{}")), \
                 patch.object(app, "find_active", return_value=None), \
                 patch.object(app, "build_env", return_value={}), \
-                patch.object(app, "provision_session", return_value=types.SimpleNamespace(exec=unittest.mock.Mock())), \
+                patch.object(app, "provision_session", return_value=types.SimpleNamespace(sandbox_id="sb-example", exec=unittest.mock.Mock())), \
                 patch.object(sys.stdin, "isatty", return_value=True), \
                 patch("builtins.input") as prompt, \
                 contextlib.redirect_stdout(output):
@@ -369,7 +369,7 @@ class ImportPromptTests(unittest.TestCase):
                     files={"SKILL.md": "review"} if kind == "skill" else {},
                     url="https://example.com/mcp" if kind == "mcp" and not blocked else None)
 
-    def run_prompt(self, answers=(), **options):
+    def run_prompt(self, answers=(), checklist_selection=None, previous=None, **options):
         output = io.StringIO()
         operation = types.SimpleNamespace(result=lambda **kw: None)
         proc = types.SimpleNamespace(
@@ -380,10 +380,12 @@ class ImportPromptTests(unittest.TestCase):
         self.proc, self.sb, self.output = proc, sb, output
         with contextlib.redirect_stdout(output), \
                 patch.object(app, "discover_imports", return_value=self.items), \
-                patch.object(app, "exec_retry", return_value=types.SimpleNamespace(stdout="{}")), \
+                patch.object(app, "exec_retry", return_value=types.SimpleNamespace(stdout=json.dumps(previous or {}))), \
+                patch.object(app, "terminal_ui", return_value=checklist_selection is not None), \
+                patch.object(app, "import_checklist", return_value=checklist_selection) as checklist, \
                 patch.object(sys.stdin, "isatty", return_value=True), \
                 patch("builtins.input", side_effect=answers) as prompt:
-            self.prompt = prompt
+            self.prompt, self.checklist = prompt, checklist
             app.sync_agent_config(sb, app.HARNESSES["claude"], types.SimpleNamespace(**options))
         return output.getvalue()
 
@@ -430,13 +432,43 @@ class ImportPromptTests(unittest.TestCase):
         self.assertEqual(self.imported_ids(), ["mcp:docs", "skill:review"])
         self.assertEqual(output.count("Try again."), 2)
 
-    def test_bad_confirmation_reprompts_and_accepts_quoted_yes(self):
-        self.run_prompt(["a", "maybe", "'y'"])
-        self.assertEqual(self.prompt.call_count, 3)
+    def test_explicit_selection_confirmation_reprompts(self):
+        self.run_prompt(["maybe", "'y'"], select=["all"])
+        self.assertEqual(self.prompt.call_count, 2)
         self.assertEqual(self.sb.exec.call_count, 1)
 
-    def test_skip_eof_and_decline_never_write(self):
-        for answers in ([""], ["s"], ["'skip'"], [EOFError()], ["a", "n"], ["a", EOFError()]):
+    def test_checklist_applies_once_without_dumping_names_or_asking_again(self):
+        output = self.run_prompt(checklist_selection={"skill:review"})
+        self.prompt.assert_not_called()
+        self.assertEqual(self.sb.exec.call_count, 1)
+        self.assertEqual(self.imported_ids(), ["skill:review"])
+        self.assertNotIn("docs", output)
+        self.assertNotIn("review", output)
+        self.assertIn("Imported 1 items", output)
+
+    def test_checklist_skip_does_not_write(self):
+        self.run_prompt(checklist_selection=set())
+        self.sb.exec.assert_not_called()
+        self.prompt.assert_not_called()
+
+    def test_checklist_only_offers_changed_items(self):
+        self.run_prompt(checklist_selection={"skill:review"},
+                        previous={"claude": {"mcp:docs": {"hash": self.items[0]["hash"]}}})
+        offered = self.checklist.call_args.args[0]
+        self.assertNotIn("mcp:docs", [item["id"] for item in offered])
+        self.assertEqual(self.imported_ids(), ["skill:review"])
+
+    def test_text_fallback_enter_skips_and_explicit_selection_requires_confirmation(self):
+        for answers in ([""], ["a", ""], ["a", "n"], ["a", EOFError()]):
+            with self.subTest(answers=answers):
+                self.run_prompt(answers)
+                self.sb.exec.assert_not_called()
+        self.run_prompt(["a", "y"])
+        self.assertEqual(self.prompt.call_count, 2)
+        self.assertEqual(self.imported_ids(), ["mcp:docs", "skill:review"])
+
+    def test_skip_and_eof_never_write(self):
+        for answers in (["s"], ["'skip'"], [EOFError()]):
             with self.subTest(answers=answers):
                 self.run_prompt(answers)
                 self.sb.exec.assert_not_called()
