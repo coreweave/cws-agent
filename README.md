@@ -108,6 +108,8 @@ cws-agent restore SANDBOX --connect
 
 `down` snapshots your workspace and stops the sandbox; `restore` brings the files
 back. Exiting the agent alone leaves compute running. [Snapshot details](docs/usage.md#snapshots).
+For [Claude Code cloud runners](docs/claude-cloud.md#monitor-and-stop), stop with
+`down --no-snapshot` and create a fresh runner when needed.
 
 ## Self-hosted sandboxes
 
@@ -123,6 +125,9 @@ cws-agent openai api1
 
 Send work through Devin Cloud or the Claude Managed Agents API; for OpenAI, use
 `cws-agent run api1 "your task"` ([API setup](docs/openai-agents.md)).
+
+To run Claude Code cloud sessions on sandbox compute with your own image and
+resources, see [Run Claude Code cloud sessions in a sandbox](docs/claude-cloud.md).
 
 ## Run agents in parallel
 
