@@ -1,6 +1,8 @@
 # Terminal and clipboard
 
-[Back to README](../README.md). These features work in interactive CLI sessions.
+[Back to README](../README.md). These features work in interactive agent sessions.
+The [plain shell command](shell.md) does not install clipboard helpers or intercept
+image paste.
 
 ## Paste clipboard images into remote Claude Code
 

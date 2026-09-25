@@ -40,6 +40,18 @@ This copies your local login into the sandbox before Codex opens.
 See [Codex login import](docs/usage.md#reuse-a-local-codex-login) for existing sessions
 and credential storage details.
 
+## Open a shell
+
+Create or reconnect to a sandbox terminal without starting a coding agent:
+
+```bash
+cws-agent shell dev1
+cws-agent shell gpu1 --gpu any:1
+```
+
+Exiting leaves the sandbox running. Stop it with `cws-agent down dev1 --no-snapshot`.
+See the [shell guide](docs/shell.md) for images, files, secrets, snapshots, and CKS volumes.
+
 ## Bring your skills and tools
 
 Launch offers to import local skills and MCP tools. Review or update them later:

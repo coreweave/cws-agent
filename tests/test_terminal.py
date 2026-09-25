@@ -73,6 +73,12 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"Ghostty'; exit 42; #")
 
     def test_raw_bytes_resize_and_cleanup(self):
+        self.check_raw_bytes_resize_and_cleanup(plain_shell=False)
+
+    def test_plain_shell_raw_bytes_resize_and_cleanup(self):
+        self.check_raw_bytes_resize_and_cleanup(plain_shell=True)
+
+    def check_raw_bytes_resize_and_cleanup(self, *, plain_shell):
         received = []
         resized = threading.Event()
         resized_again = threading.Event()
@@ -122,13 +128,17 @@ class TerminalTests(unittest.TestCase):
             def shell(self, command, **kwargs):
                 outer.assertEqual(kwargs, {"width": 123, "height": 37})
                 outer.assertIn("export TERM=", command[2])
+                if plain_shell:
+                    outer.assertNotIn("python3", command[2])
+                    outer.assertNotIn("cws-copy", command[2])
+                    outer.assertIn("cd /workspace/project || exit", command[2])
                 return session
 
         before = termios.tcgetattr(self.slave)
         handler = signal.getsignal(signal.SIGWINCH)
         stdout = TerminalFile(self.slave)
         with patch.object(sys, "stdin", TerminalFile(self.slave)), patch.object(sys, "stdout", stdout):
-            self.assertEqual(agent.pty_attach(Sandbox(), "exec bash"), 7)
+            self.assertEqual(agent.pty_attach(Sandbox(), "exec bash", plain_shell=plain_shell), 7)
         self.assertEqual(stdout.buffer.getvalue(), b"".join(chunks))
         self.assertEqual(b"".join(received), b"\x1b[A\x03\xff")
         after = termios.tcgetattr(self.slave)
