@@ -2,6 +2,61 @@
 
 [Back to README](../README.md). Run these commands from your local shell.
 
+## Launch an agent
+
+Choose an agent directly:
+
+```bash
+cws-agent claude
+cws-agent codex --import-codex-auth
+cws-agent claude --local-dir . --detach
+cws-agent devin my-devin
+cws-agent opencode my-opencode --wandb
+cws-agent cursor my-cursor
+```
+
+Names are optional for shortcuts and `launch`. When omitted, the CLI generates
+`HARNESS-` followed by 8 random lowercase hexadecimal characters, such as
+`claude-fa97da5d`. Claude Managed Agents uses the `anthropic-` prefix;
+`--claude-env` and `--outpost` select the worker's prefix. The generated name is
+printed during launch; use it with `connect`, `status`, or `down` afterward.
+Pass `NAME` or `--name NAME` to choose your own name.
+
+Each `cws-agent AGENT [NAME]` shortcut is equivalent to
+`cws-agent launch [NAME] --agent AGENT`, except `anthropic` selects the existing
+`ant` backend (`launch NAME --agent ant`). Supported agents and backends:
+
+| Command | Agent or backend |
+| --- | --- |
+| `claude` | Claude Code |
+| `codex` | Codex CLI |
+| `devin` | Devin CLI; add `--outpost NAME` for a Devin outpost worker |
+| `opencode` | OpenCode; add `--wandb` for W&B inference |
+| `cursor` | Cursor CLI |
+| `anthropic` | Claude Managed Agents worker; requires `--claude-env ENV_ID` |
+| `openai` | OpenAI Agents API executor |
+
+Worker backends keep the agent in the provider's service while tools execute in
+your sandbox. Set up the [provider credentials](self-hosted.md), then launch:
+
+```bash
+cws-agent anthropic claude-worker --claude-env env_REPLACE_ME
+cws-agent openai api1
+cws-agent devin devin-worker --outpost my-outpost
+```
+
+For creation, shortcuts accept the same options as `launch` except `--agent`, including the
+`--name NAME` compatibility form. Existing backend requirements still apply.
+Use `cws-agent AGENT --help` to see the options for an agent.
+To continue a saved agent session, use `cws-agent claude --resume SESSION_ID` (or
+`codex` / `opencode`). This finds its running sandbox; it does not create one.
+See [sandbox restoration and agent sessions](sessions.md#sandbox-or-agent-session) for
+explicit sandbox selection, other agents, and stopped sandboxes.
+
+Existing `launch` commands remain supported, including the default Claude Code
+agent and other `--agent` choices. To reconnect to a running sandbox, use
+`cws-agent connect NAME`.
+
 ## Authentication
 
 ### W&B accounts
@@ -209,7 +264,7 @@ cws-agent status my-claude
 cws-agent connect my-claude
 ```
 
-If stopped, use `restore my-claude --connect`. To continue a saved conversation,
+If stopped, use `restore my-claude --connect`. To continue a saved agent session,
 use [session resume](sessions.md). Connections do not reconnect automatically.
 
 ## Claude Remote Control
