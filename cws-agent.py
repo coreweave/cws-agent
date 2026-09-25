@@ -25,7 +25,14 @@ instead of hosting a CLI you drive: `launch --outpost NAME` runs Devin outpost
 workers that claim sessions from Devin Cloud.
 
 Usage:
-    cws-agent launch  dev1 [--agent claude|codex|devin|opencode|cursor] [--local-dir .]
+    cws-agent claude  [NAME] [--local-dir .]
+    cws-agent codex   [NAME] [--import-codex-auth]
+    cws-agent devin   [NAME]
+    cws-agent opencode [NAME] [--wandb]
+    cws-agent cursor  [NAME]
+    cws-agent anthropic [NAME] --claude-env ENV_ID
+    cws-agent openai  [NAME]
+    cws-agent launch  [NAME] [--agent claude|codex|devin|opencode|cursor] [--local-dir .]
     cws-agent launch  box1 --outpost my-outpost --workers 2
     cws-agent connect  dev1 [--cmd bash]
     cws-agent shell   dev1 [--gpu any:1] [--cmd nvidia-smi]
@@ -3724,6 +3731,11 @@ def cmd_launch(args) -> int:
 
 
 def launch_session(args) -> int:
+    if getattr(args, "name", None) is None:
+        import secrets
+        harness = "ant" if args.claude_env else "devin" if args.outpost else args.agent
+        prefix = "anthropic" if harness == "ant" else harness
+        args.name = f"{prefix}-{secrets.token_hex(4)}"
     telegram = getattr(args, "telegram", False)
     if telegram and (args.outpost or args.claude_env or args.agent in ("ant", "openai") or args.detach):
         raise SystemExit("error: --telegram requires a CLI agent and cannot be combined with --detach or worker backends")
@@ -6603,8 +6615,49 @@ def cmd_session_transfer(args) -> int:
             print(f"warning: could not remove temporary history bundle {remote_temp}", file=sys.stderr)
 
 
+def cmd_agent_resume(args) -> int:
+    native_resume_command(args.agent, args.session_id)  # validate before remote access
+    if args.cwd and not args.cwd.startswith("/"):
+        raise SystemExit("error: --cwd must be an absolute sandbox directory")
+    if getattr(args, "name", None) is not None:
+        if not NAME_RE.fullmatch(args.name):
+            raise SystemExit("error: sandbox name must match [a-z0-9][a-z0-9-]{0,39}")
+        return cmd_session_resume(args)
+    if args.agent in ("devin", "cursor"):
+        raise SystemExit(f"error: {args.agent} requires a sandbox name to resume; use "
+                         f"`cws-agent {args.agent} SANDBOX --resume SESSION_ID`")
+
+    boxes = Sandbox.list(tags=[SESSION_TAG], auth=sandbox_auth()).result()
+    matches = []
+    for sb in boxes:
+        if getattr(getattr(sb, "status", None), "value", None) != "running":
+            continue
+        name, harness = probe_session_meta(sb)
+        if not NAME_RE.fullmatch(name):
+            raise SystemExit("error: could not identify a running sandbox; specify its name before --resume")
+        if harness in ("ant", "openai", "shell"):
+            continue
+        rows = (remote_native_history(sb, opencode_cwd=args.cwd)
+                if args.agent == "opencode" and args.cwd else remote_native_history(sb))
+        if any(row["agent"] == args.agent and row["id"] == args.session_id for row in rows):
+            matches.append((sb, name))
+    if not matches:
+        raise SystemExit("error: agent session not found in running sandboxes. Use `cws-agent list` and "
+                         "`cws-agent session history SANDBOX`. If stopped, run `cws-agent restore SANDBOX` first.")
+    if len(matches) > 1:
+        names = ", ".join(sorted(name for _, name in matches))
+        raise SystemExit(f"error: agent session found in multiple sandboxes ({names}); use "
+                         f"`cws-agent {args.agent} SANDBOX --resume SESSION_ID`")
+    sb, args.name = matches[0]
+    print(f"Resuming {args.agent} session in sandbox {args.name!r}.")
+    return resume_conversation(sb, args)
+
+
 def cmd_session_resume(args) -> int:
-    sb = require_active(args.name)
+    return resume_conversation(require_active(args.name), args)
+
+
+def resume_conversation(sb, args) -> int:
     # These IDs are resolved by the native CLI; private storage is not parsed.
     if args.agent in ("devin", "cursor"):
         agent, cwd = args.agent, args.cwd or PROJECT_DIR
@@ -6882,13 +6935,23 @@ def add_codex_auth_flag(p: argparse.ArgumentParser) -> None:
                    help="copy your local Codex ChatGPT login into the sandbox before starting Codex (included in snapshots)")
 
 
-def add_create_flags(p: argparse.ArgumentParser) -> None:
+class RejectAgentFlag(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(f"--agent is not supported with '{parser.prog}'; the command already selects the agent. "
+                     "Remove --agent or use 'cws-agent launch NAME --agent AGENT'.")
+
+
+def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) -> None:
     add_verbose_flag(p)
     add_permission_flags(p)
     add_codex_auth_flag(p)
     p.add_argument("--no-config-sync", action="store_true", help="skip automatic local skills/MCP update preview")
-    p.add_argument("--agent", choices=sorted(HARNESSES), default="claude",
-                   help="agent harness (default: claude)")
+    if agent is None:
+        p.add_argument("--agent", choices=sorted(HARNESSES), default="claude",
+                       help="agent harness (default: claude)")
+    else:
+        p.set_defaults(agent=agent)
+        p.add_argument("--agent", action=RejectAgentFlag, nargs="?", help=argparse.SUPPRESS)
     p.add_argument("--wandb", action="store_true", help="OpenCode with W&B Serverless Inference and the recommended coding model (needs WANDB_API_KEY)")
     p.add_argument("--wandb-model", metavar="MODEL_ID", help="override --wandb's model with a W&B catalog ID")
     p.add_argument("--image", help="override the harness container image")
@@ -6906,6 +6969,7 @@ def add_create_flags(p: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
     add_verbose_flag(parser)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -6929,37 +6993,46 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-c", "--cmd", type=shell_text, help="command instead of Bash/sh; runs without a PTY when input/output is not a terminal")
     p.set_defaults(func=cmd_shell)
 
-    p = sub.add_parser("launch", help="create a session sandbox and attach")
-    name = p.add_mutually_exclusive_group(required=True)
-    name.add_argument("name", nargs="?", default=argparse.SUPPRESS,
-                      help="session name ([a-z0-9-], <=40 chars)")
-    name.add_argument("--name", dest="name", default=argparse.SUPPRESS,
-                      help="compatibility alias for the positional session name")
-    add_create_flags(p)
-    p.add_argument("--repo-url", help="git URL to clone into /workspace/project")
-    p.add_argument("--local-dir", metavar="PATH",
-                   help="sync a local directory into /workspace/project (wins over --repo-url)")
-    p.add_argument("--no-snapshot", action="store_true", help="skip the automatic snapshot after project upload")
-    p.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
-                   help="upload/extraction deadline, e.g. 4h (default: size-based)")
-    p.add_argument("--no-git", action="store_true", help="exclude .git when syncing --local-dir")
-    p.add_argument("--exclude", action="append", default=[], metavar="NAME",
-                   help="extra dir/file name to exclude from --local-dir sync (repeatable)")
-    p.add_argument("--claude-env", metavar="ENV_ID",
-                   help="serve this Claude Managed Agents self-hosted environment "
-                        "(env_...); implies --agent ant. Needs ANTHROPIC_ENVIRONMENT_KEY.")
-    p.add_argument("--openai-session", metavar="SESSION_ID",
-                   help="connect an existing self-hosted Agents API session (requires --agent openai)")
-    p.add_argument("--openai-model", metavar="MODEL",
-                   help="model for a new Agents API session (default: gpt-6-astra)")
-    p.add_argument("--outpost", metavar="NAME",
-                   help="run Devin outpost worker(s) for this outpost "
-                        "(needs DEVIN_OUTPOSTS_TOKEN; implies --agent devin)")
-    p.add_argument("--workers", type=int, default=1,
-                   help="Claude/Devin workers to run (default: 1)")
-    p.add_argument("--detach", action="store_true", help="do not attach after launch")
-    p.add_argument("--telegram", action="store_true", help="create sandbox, guide agent sign-in, pair Telegram, and start its bridge in one command")
-    p.set_defaults(func=cmd_launch)
+    for shortcut_agent in (None, *sorted(HARNESSES)):
+        command = {None: "launch", "ant": "anthropic"}.get(shortcut_agent, shortcut_agent)
+        help_text = ("create a session sandbox and attach" if shortcut_agent is None else
+                     f"shortcut for launch --agent {shortcut_agent}")
+        p = sub.add_parser(command, help=help_text)
+        name = p.add_mutually_exclusive_group()
+        name.add_argument("name", nargs="?", default=argparse.SUPPRESS,
+                          help="session name ([a-z0-9-], <=40 chars; default: harness prefix plus a random suffix)")
+        name.add_argument("--name", dest="name", default=argparse.SUPPRESS,
+                          help="compatibility alias for the positional session name")
+        add_create_flags(p, agent=shortcut_agent)
+        p.add_argument("--repo-url", help="git URL to clone into /workspace/project")
+        p.add_argument("--local-dir", metavar="PATH",
+                       help="sync a local directory into /workspace/project (wins over --repo-url)")
+        p.add_argument("--no-snapshot", action="store_true", help="skip the automatic snapshot after project upload")
+        p.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
+                       help="upload/extraction deadline, e.g. 4h (default: size-based)")
+        p.add_argument("--no-git", action="store_true", help="exclude .git when syncing --local-dir")
+        p.add_argument("--exclude", action="append", default=[], metavar="NAME",
+                       help="extra dir/file name to exclude from --local-dir sync (repeatable)")
+        p.add_argument("--claude-env", metavar="ENV_ID",
+                       help="serve this Claude Managed Agents self-hosted environment "
+                            "(env_...); implies --agent ant. Needs ANTHROPIC_ENVIRONMENT_KEY.")
+        p.add_argument("--openai-session", metavar="SESSION_ID",
+                       help="connect an existing self-hosted Agents API session (requires --agent openai)")
+        p.add_argument("--openai-model", metavar="MODEL",
+                       help="model for a new Agents API session (default: gpt-6-astra)")
+        p.add_argument("--outpost", metavar="NAME",
+                       help="run Devin outpost worker(s) for this outpost "
+                            "(needs DEVIN_OUTPOSTS_TOKEN; implies --agent devin)")
+        p.add_argument("--workers", type=int, default=1,
+                       help="Claude/Devin workers to run (default: 1)")
+        p.add_argument("--detach", action="store_true", help="do not attach after launch")
+        p.add_argument("--telegram", action="store_true", help="create sandbox, guide agent sign-in, pair Telegram, and start its bridge in one command")
+        if shortcut_agent not in (None, "ant", "openai"):
+            p.add_argument("--resume", dest="session_id", default=argparse.SUPPRESS, metavar="SESSION_ID",
+                           help="continue a saved agent session in a running sandbox (does not create or restore one)")
+            p.add_argument("--cwd", default=argparse.SUPPRESS,
+                           help="sandbox directory for --resume (default: saved session directory)")
+        p.set_defaults(func=cmd_launch)
 
     p = sub.add_parser("sync", help="push a local directory into a running session's project")
     p.add_argument("name")
@@ -7167,6 +7240,23 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(func=cmd_config, preview=command == "preview")
 
     args = parser.parse_args(argv)
+    if getattr(args, "command", None) in set(HARNESSES) - {"ant", "openai"}:
+        command_parser = sub.choices[args.command]
+        if hasattr(args, "session_id"):
+            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose"}
+            option_tokens = argv[:argv.index("--")] if "--" in argv else argv
+            supplied_options = [token.partition("=")[0] for token in option_tokens if token.startswith("--")]
+            for action in command_parser._actions:
+                explicit = any(option.startswith(token) for option in action.option_strings
+                               for token in supplied_options)
+                if (action.dest not in resume_options
+                        and (explicit or getattr(args, action.dest, action.default) != action.default)):
+                    command_parser.error(f"{action.option_strings[0]} cannot be combined with --resume; "
+                                         "resume continues an existing agent session")
+            args.cwd = getattr(args, "cwd", None)
+            args.func = cmd_agent_resume
+        elif hasattr(args, "cwd"):
+            command_parser.error("--cwd requires --resume")
     try:
         return args.func(args)
     except CWSandboxAuthenticationError as error:

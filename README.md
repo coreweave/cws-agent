@@ -20,20 +20,25 @@ Set your [W&B API key](https://wandb.ai/authorize):
 
 ```bash
 export WANDB_API_KEY='YOUR_WANDB_KEY'
-cws-agent launch my-claude
+cws-agent claude
 ```
 
-`my-claude` names your sandbox. Claude Code opens; type `/login` to sign in.
-CLI choices for `--agent`: `claude` (default), `codex`, `devin`, `opencode`, `cursor`.
+The command creates a sandbox, prints its generated name (for example,
+`claude-fa97da5d`), and opens Claude Code. Type `/login` to sign in.
+In the commands below, replace `SANDBOX` with that full name.
+Use `cws-agent AGENT [NAME]` to choose `claude`, `codex`, `devin`, `opencode`, or
+`cursor`. These are shortcuts for `cws-agent launch [NAME] --agent AGENT`;
+existing `launch` commands remain supported, with Claude Code as the default.
+See [all agents and worker backends](docs/usage.md#launch-an-agent).
 To use an open-source model hosted by W&B instead of the default proprietary models,
-choose OpenCode with `--agent opencode --wandb` ([setup](docs/opencode.md)).
+choose OpenCode with `cws-agent opencode --wandb` ([setup](docs/opencode.md)).
 Agents use [YOLO mode](docs/permissions.md) by default; `--permission-mode native`
 uses the agent's own approval settings. [Other credentials](docs/usage.md#authentication).
 
 To start Codex using your existing local ChatGPT login, without remote device codes:
 
 ```bash
-cws-agent launch my-codex --agent codex --import-codex-auth
+cws-agent codex --import-codex-auth
 ```
 
 This copies your local login into the sandbox before Codex opens.
@@ -57,8 +62,8 @@ See the [shell guide](docs/shell.md) for images, files, secrets, snapshots, and 
 Launch offers to import local skills and MCP tools. Review or update them later:
 
 ```bash
-cws-agent config preview my-claude
-cws-agent config sync my-claude
+cws-agent config preview SANDBOX
+cws-agent config sync SANDBOX
 ```
 
 You choose what gets copied. [Supported configuration](docs/config-import.md).
@@ -66,7 +71,7 @@ You choose what gets copied. [Supported configuration](docs/config-import.md).
 ## Move your workspace to the cloud
 
 ```bash
-cws-agent launch project1 --local-dir .
+cws-agent claude project1 --local-dir .
 ```
 
 Uploads the current directory to `/workspace/project` and saves a snapshot when
@@ -75,20 +80,30 @@ project1 .` for later changes. [Upload options and recovery](docs/usage.md#uploa
 
 ## Continue a session
 
-Find a saved conversation inside the `my-claude` sandbox, then resume it by ID:
+A sandbox holds your workspace and agent files. An agent session is a saved chat
+inside that sandbox. Its ID comes from the harness (for example, Claude Code or
+Codex). Find a running sandbox by its full `NAME`, then list its agent sessions:
 
 ```bash
-cws-agent session history my-claude
-cws-agent session resume my-claude SESSION_ID
+cws-agent list
+cws-agent session history SANDBOX
+cws-agent claude --resume SESSION_ID
 ```
 
-To open a fresh agent terminal in that sandbox, use `cws-agent connect my-claude`.
+`--resume` takes the `SESSION_ID` shown by `session history`, finds that session
+in running agent sandboxes, and continues it.
+Use the matching agent command (`claude`, `codex`, or `opencode`); add `SANDBOX`
+before `--resume` if a copied session exists in multiple sandboxes.
+`connect SANDBOX` opens a fresh agent terminal. If the sandbox was stopped, run
+`cws-agent restore SANDBOX` first to recreate it from its snapshot.
+Top-level `cws-agent resume SANDBOX` is an alias for `restore`; it does not
+select an agent session. [Sessions guide](docs/sessions.md).
 
 ## Save your work and stop compute
 
 ```bash
-cws-agent down my-claude
-cws-agent restore my-claude --connect
+cws-agent down SANDBOX
+cws-agent restore SANDBOX --connect
 ```
 
 `down` snapshots your workspace and stops the sandbox; `restore` brings the files
@@ -101,9 +116,9 @@ OpenAI Agents API while tools execute in your sandbox. After setting up the
 [provider credentials](docs/self-hosted.md), choose one:
 
 ```bash
-cws-agent launch devinbox --outpost my-outpost
-cws-agent launch claudebox --claude-env env_REPLACE_ME
-cws-agent launch api1 --agent openai
+cws-agent devin devinbox --outpost my-outpost
+cws-agent anthropic claudebox --claude-env env_REPLACE_ME
+cws-agent openai api1
 ```
 
 Send work through Devin Cloud or the Claude Managed Agents API; for OpenAI, use
@@ -130,7 +145,7 @@ Use [Telegram](docs/messaging.md) to chat with your agent while your project upl
 in the background:
 
 ```bash
-cws-agent launch telegram1 --local-dir . --telegram
+cws-agent claude telegram1 --local-dir . --telegram
 ```
 
 The upload survives closing its terminal.
@@ -139,7 +154,7 @@ Keep your laptop awake and online; the Telegram bridge needs a running terminal.
 ## Chat with your agent in Discord
 
 Chat with Claude Code, OpenCode, or Cursor CLI from Discord. Start with a running,
-signed-in sandbox, such as `my-claude` above, and exit the agent to your local shell.
+signed-in sandbox, such as `SANDBOX` above, and exit the agent to your local shell.
 
 [Create a Discord bot and install it in your server](docs/discord.md#2-create-and-install-your-bot).
 The guide walks through the Developer Portal, bot permissions, token, and server ID.
@@ -147,7 +162,7 @@ Then enter the bot token privately and start listening:
 
 ```bash
 export DISCORD_BOT_TOKEN="$(uv run --no-project python -c 'import getpass; print(getpass.getpass("Discord bot token: "))')"
-cws-agent discord --server 234567890123456789 --sandbox my-claude
+cws-agent discord --server 234567890123456789 --sandbox SANDBOX
 ```
 
 Replace the example server ID with the first number after `/channels/` in a Discord
