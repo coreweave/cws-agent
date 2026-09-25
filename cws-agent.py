@@ -9,6 +9,8 @@
 #     "python-dotenv>=1,<2",
 #     "openai>=3.14,<4",
 #     "discord.py>=2.6,<3",
+#     "prompt-toolkit>=3.0.50,<4",
+#     "rich>=14,<15",
 # ]
 # ///
 # SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
@@ -64,6 +66,7 @@ import shlex
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from cwsandbox import (
@@ -73,6 +76,56 @@ from cwsandbox import (
     ResourceOptions,
     Sandbox,
 )
+
+
+def terminal_ui(stream) -> bool:
+    return stream.isatty() and os.environ.get("TERM") != "dumb"
+
+
+@contextmanager
+def startup_step(label):
+    """Animate slow startup operations, leaving one completed line per step."""
+    if not terminal_ui(sys.stderr):
+        print(label + " ...", file=sys.stderr, flush=True)
+        yield
+        return
+    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+    from rich.text import Text
+
+    console = Console(stderr=True)
+    started = time.monotonic()
+    try:
+        with Progress(SpinnerColumn(style="cyan"), TextColumn("{task.description}"),
+                      TimeElapsedColumn(), console=console, transient=True) as progress:
+            progress.add_task(label, total=None)
+            yield
+    except BaseException:
+        console.print(Text("! " + label + " — interrupted or failed", style="yellow"))
+        raise
+    console.print(Text(f"✓ {label}  {time.monotonic() - started:.0f}s", style="cyan"))
+
+
+def session_summary(title, rows):
+    """A small, copyable summary; no markup interpretation of remote values."""
+    if not terminal_ui(sys.stdout):
+        print(title)
+        for label, value in rows:
+            print(f"  {label}: {value}")
+        return
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console()
+    console.print(Text("\n" + title, style="bold cyan"))
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim")
+    table.add_column()
+    for label, value in rows:
+        table.add_row(Text(label), Text(str(value)))
+    console.print(table)
+    console.print()
 
 # ---------------------------------------------------------------------------
 # Session model
@@ -1492,8 +1545,8 @@ def provision_session(*, name: str, harness: Harness, repo_url: str | None,
     starts in a row, so retry a handful of times before giving up."""
     last: Exception | None = None
     for i in range(attempts):
-        sb = create_session_sandbox(name=name, harness=harness, **create_kwargs)
-        print(f"  sandbox: {sb.sandbox_id}")
+        with startup_step("Creating sandbox"):
+            sb = create_session_sandbox(name=name, harness=harness, **create_kwargs)
         try:
             if create_kwargs.get("restore_snapshot_id"):
                 snapshot_metadata(sb, "restore-snapshot")
@@ -1516,13 +1569,16 @@ def run_bootstrap(sb: Sandbox, harness: Harness, repo_url: str | None) -> None:
     script = "set -e\n" + PREREQS_SNIPPET + harness.bootstrap
     if repo_url:
         script += REPO_CLONE_SNIPPET.format(url=shlex.quote(repo_url))
-    result = exec_retry(sb, ["sh", "-lc", script], timeout_seconds=900)
+    with startup_step(f"Preparing {harness.name}" + (" and cloning repository" if repo_url else "")):
+        result = exec_retry(sb, ["sh", "-lc", script], timeout_seconds=900)
+        if result.returncode not in (0, None):
+            for line in (result.stdout or "").splitlines():
+                print(f"  {line}")
+            for line in (result.stderr or "").splitlines()[-15:]:
+                print(f"  ! {line}", file=sys.stderr)
+            raise SystemExit(f"error: bootstrap failed (exit {result.returncode})")
     for line in (result.stdout or "").splitlines():
         print(f"  {line}")
-    if result.returncode not in (0, None):
-        for line in (result.stderr or "").splitlines()[-15:]:
-            print(f"  ! {line}", file=sys.stderr)
-        raise SystemExit(f"error: bootstrap failed (exit {result.returncode})")
 
 
 def stop_failed_sandbox(sb: Sandbox) -> None:
@@ -3565,6 +3621,142 @@ write(state_path, json.dumps(state, indent=2))
 '''
 
 
+def import_selection_error(items):
+    if (sum(item["bytes"] for item in items) > IMPORT_MAX_BYTES
+            or sum(len(item.get("files", {})) for item in items) > IMPORT_MAX_FILES):
+        return "selected import exceeds 5 MiB / 500 files; choose fewer items"
+    return ""
+
+
+def import_checklist(items):
+    """Inline, collapsible selection. Enter is the only upload confirmation."""
+    from prompt_toolkit import Application
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.styles import Style
+
+    groups = [(title, [item for item in items if item["kind"] == kind])
+              for kind, title in (("skill", "Skills"), ("mcp", "Tools (MCP)"))]
+    groups = [(title, group) for title, group in groups if group]
+    selected = {item["id"] for item in items if not item["blocked"]}
+    expanded, cursor, error = set(), 0, ""
+    keys = KeyBindings()
+
+    def rows():
+        return [(index, item) for index, (_, group) in enumerate(groups)
+                for item in ([None] + group if index in expanded else [None])]
+
+    def clean(value):
+        return "".join(c if c.isprintable() else " " for c in str(value))
+
+    def content():
+        result = []
+        for position, (index, item) in enumerate(rows()):
+            title, group = groups[index]
+            if item is None:
+                count = sum(entry["id"] in selected for entry in group)
+                available = sum(not entry["blocked"] for entry in group)
+                blocked = len(group) - available
+                suffix = f" · {blocked} unavailable" if blocked else ""
+                line = f"{'▾' if index in expanded else '▸'} {title}  {count}/{available} selected{suffix}"
+            else:
+                mark = "-" if item["blocked"] else "x" if item["id"] in selected else " "
+                line = f"  [{mark}] {item['name']}" + (" (unavailable)" if item["blocked"] else "")
+            style = "class:focus" if position == cursor else "class:muted" if item and item["blocked"] else ""
+            result.append((style, ("› " if position == cursor else "  ") + clean(line) + "\n"))
+        return result[:-1] + [(result[-1][0], result[-1][1].rstrip("\n"))]
+
+    def detail():
+        if error:
+            return [("class:warning", error)]
+        _, item = rows()[cursor]
+        if item is None:
+            return [("class:muted", "Expand to review items. Space selects or clears the section.")]
+        details = []
+        if item["blocked"]:
+            details.append("Unavailable: " + item["blocked"])
+        else:
+            config = item.get("config", {})
+            if item.get("command"):
+                details.append("Requires " + item["command"] + " in the sandbox")
+            names = sorted(set(item.get("environment", {})) | set(config.get("env", config.get("environment", {}))))
+            if names:
+                details.append("Environment: " + ", ".join(names))
+            if item.get("missing_env"):
+                details.append("Needed remotely: " + ", ".join(item["missing_env"]))
+            if any(config.get(key) for key in ("headers", "http_headers", "oauth")):
+                details.append("Includes headers/OAuth settings (values hidden)")
+        return [("class:muted", clean(" · ".join(details) or item["id"]))]
+
+    @keys.add("up")
+    @keys.add("down")
+    def move(event):
+        nonlocal cursor
+        cursor = (cursor + (1 if event.key_sequence[0].key == "down" else -1)) % len(rows())
+
+    @keys.add("right")
+    @keys.add("left")
+    def expand(event):
+        nonlocal cursor
+        index, _ = rows()[cursor]
+        if event.key_sequence[0].key == "right":
+            expanded.add(index)
+        else:
+            expanded.discard(index)
+            cursor = rows().index((index, None))
+
+    @keys.add(" ")
+    def toggle(event):
+        nonlocal error
+        index, item = rows()[cursor]
+        targets = {entry["id"] for entry in ([item] if item else groups[index][1]) if not entry["blocked"]}
+        if targets <= selected:
+            selected.difference_update(targets)
+        else:
+            selected.update(targets)
+        error = ""
+
+    @keys.add("enter")
+    def accept(event):
+        nonlocal error
+        chosen = [item for item in items if item["id"] in selected]
+        error = import_selection_error(chosen)
+        if not error:
+            event.app.exit(result=selected)
+
+    @keys.add("s")
+    @keys.add("c-d")
+    def skip(event):
+        event.app.exit(result=set())
+
+    @keys.add("c-c")
+    def cancel(event):
+        event.app.exit(exception=KeyboardInterrupt())
+
+    control = FormattedTextControl(content, focusable=True, get_cursor_position=lambda: Point(0, cursor))
+    layout = HSplit([
+        Window(FormattedTextControl([("class:title", "Upload to sandbox")]), height=1),
+        Window(control, height=lambda: min(len(rows()), 10), dont_extend_height=True),
+        Window(FormattedTextControl(detail), height=2, wrap_lines=True),
+        Window(FormattedTextControl("Referenced credentials are included and saved in snapshots.\n"
+                                   "Tools connect on agent start; dependencies are not installed."),
+               dont_extend_height=True, style="class:muted", wrap_lines=True),
+        Window(FormattedTextControl("↑↓ move  →← expand/collapse  Space toggle\n"
+                                   "Enter upload selected  s skip all  Ctrl-C cancel"),
+               dont_extend_height=True, wrap_lines=True),
+    ])
+    style = {} if "NO_COLOR" in os.environ else {
+        "title": "bold ansicyan", "focus": "reverse", "muted": "ansibrightblack", "warning": "ansiyellow"}
+    app = Application(layout=Layout(layout, focused_element=control), key_bindings=keys,
+                      style=Style.from_dict(style), full_screen=False, erase_when_done=True)
+    try:
+        return app.run()
+    except EOFError:
+        return set()
+
+
 def sync_agent_config(sb, harness, args) -> None:
     import json
 
@@ -3583,6 +3775,9 @@ def sync_agent_config(sb, harness, args) -> None:
     if not pending:
         return
     verbose = getattr(args, "verbose", False)
+    supplied = getattr(args, "select", None)
+    checklist = (supplied is None and not getattr(args, "preview", False)
+                 and terminal_ui(sys.stdin) and terminal_ui(sys.stdout))
     def show_environment(item):
         config = item.get("config", {})
         copied = sorted(set(item.get("environment", {})) | set(config.get("env", config.get("environment", {}))))
@@ -3598,28 +3793,28 @@ def sync_agent_config(sb, harness, args) -> None:
             print("    HTTP headers included (values hidden): " + ", ".join(sorted(headers)))
         if isinstance(config.get("oauth"), dict) and config["oauth"]:
             print("    OAuth configuration included (values hidden): " + ", ".join(sorted(config["oauth"])))
-    for kind, title in (("mcp", "Tools (MCP)"), ("skill", "Skills")):
-        group = [item for item in pending if item["kind"] == kind]
-        if not group:
-            continue
-        print(title + ":")
-        for item in group:
-            print("  " + item["name"] + (" (skipped)" if item["blocked"] else ""))
-            if verbose:
-                detail = ("SKIP: " + item["blocked"]) if item["blocked"] else f"{item['bytes']} bytes; {item['hash'][:12]}"
-                print(f"    {item['id']}: {detail}; source={item['source']!r}")
-                if item.get("url"):
-                    endpoint = "<environment-based endpoint>" if IMPORT_ENV_RE.search(item['url']) else item['url']
-                    print(f"    endpoint: {endpoint!r}; remote name: cws-import-{item['name']}")
-                if item.get("command"):
-                    arguments = [IMPORT_ENV_RE.sub(lambda m: "${" + m[1] + "}", value) for value in item.get('arguments', item['config'].get('args', []))]
-                    print(f"    command: {item['command']!r} {arguments!r}; dependencies are not installed during import")
-                show_environment(item)
-    if not verbose:
-        print("Details and skip reasons: --verbose")
+    if not checklist or verbose:
+        for kind, title in (("mcp", "Tools (MCP)"), ("skill", "Skills")):
+            group = [item for item in pending if item["kind"] == kind]
+            if not group:
+                continue
+            print(title + ":")
+            for item in group:
+                print("  " + item["name"] + (" (skipped)" if item["blocked"] else ""))
+                if verbose:
+                    detail = ("SKIP: " + item["blocked"]) if item["blocked"] else f"{item['bytes']} bytes; {item['hash'][:12]}"
+                    print(f"    {item['id']}: {detail}; source={item['source']!r}")
+                    if item.get("url"):
+                        endpoint = "<environment-based endpoint>" if IMPORT_ENV_RE.search(item['url']) else item['url']
+                        print(f"    endpoint: {endpoint!r}; remote name: cws-import-{item['name']}")
+                    if item.get("command"):
+                        arguments = [IMPORT_ENV_RE.sub(lambda m: "${" + m[1] + "}", value) for value in item.get('arguments', item['config'].get('args', []))]
+                        print(f"    command: {item['command']!r} {arguments!r}; dependencies are not installed during import")
+                    show_environment(item)
+        if not verbose:
+            print("Details and skip reasons: --verbose")
     if getattr(args, "preview", False):
         return
-    supplied = getattr(args, "select", None)
     interactive = supplied is None
     if interactive:
         if not sys.stdin.isatty():
@@ -3637,13 +3832,23 @@ def sync_agent_config(sb, harness, args) -> None:
             value = value[1:-1].strip()
         return value
 
+    if interactive and not checklist:
+        print("Selected skills/tools and referenced credentials will be uploaded and included in snapshots.")
+        print("Tools connect on agent start; dependencies are not installed.")
     while True:
+        if checklist:
+            selected = import_checklist(pending)
+            chosen = [item for item in pending if item["id"] in selected and not item["blocked"]]
+            total = sum(item["bytes"] for item in chosen)
+            break
         try:
-            values = [input("Import: [a] all, [s] skip, or names separated by commas (Enter skips): ")] if interactive else supplied
+            values = [input("Upload: Enter/a all, s skip, or comma-separated names: ")] if interactive else supplied
         except EOFError:
             print("No configuration imported.")
             return
         selected = {unquote(value) for entry in values for value in unquote(entry).split(",") if unquote(value)}
+        if not selected and interactive and all(not entry.strip() for entry in values):
+            selected = {"all"}
         if not selected or {v.lower() for v in selected} in ({"s"}, {"skip"}):
             return
         if {v.lower() for v in selected} in ({"a"}, {"all"}):
@@ -3659,9 +3864,8 @@ def sync_agent_config(sb, harness, args) -> None:
                 errors.append("unavailable or blocked import: " + value)
         chosen = [eligible[key] for key in sorted(resolved) if key in pending_ids]
         total = sum(item["bytes"] for item in chosen)
-        files = sum(len(item.get("files", {})) for item in chosen)
-        if total > IMPORT_MAX_BYTES or files > IMPORT_MAX_FILES:
-            errors.append("selected import exceeds 5 MiB / 500 files; choose fewer items")
+        if size_error := import_selection_error(chosen):
+            errors.append(size_error)
         if errors:
             message = "; ".join(errors)
             if not interactive:
@@ -3670,16 +3874,18 @@ def sync_agent_config(sb, harness, args) -> None:
             continue
         break
     if not chosen:
+        print("No configuration imported.")
         return
-    print("Selected: " + ", ".join(item["name"] for item in chosen))
-    for item in chosen:
-        if item.get("command"):
-            print(f"  {item['name']}: requires {item['command']!r} in the sandbox; dependencies are not installed.")
-        show_environment(item)
-    if any(item.get("environment") or any(item.get("config", {}).get(key) for key in ("env", "environment", "headers", "http_headers", "oauth")) for item in chosen):
-        print("Selected environment values are stored privately in /workspace/home and included in snapshots.")
-    print("Skills become available to the agent; selected MCP endpoints connect on the next agent start.")
-    if not getattr(args, "yes", False):
+    if not checklist or verbose:
+        print("Selected: " + ", ".join(item["name"] for item in chosen))
+        for item in chosen:
+            if item.get("command"):
+                print(f"  {item['name']}: requires {item['command']!r} in the sandbox; dependencies are not installed.")
+            show_environment(item)
+        if any(item.get("environment") or any(item.get("config", {}).get(key) for key in ("env", "environment", "headers", "http_headers", "oauth")) for item in chosen):
+            print("Selected environment values are stored privately in /workspace/home and included in snapshots.")
+        print("Skills become available to the agent; selected MCP endpoints connect on the next agent start.")
+    if not interactive and not getattr(args, "yes", False):
         while True:
             try:
                 answer = unquote(input("Apply imports? [y/n] (Enter skips): ")).lower() if sys.stdin.isatty() else "n"
@@ -3892,6 +4098,11 @@ def launch_session(args) -> int:
             stop_failed_sandbox(sb)
             raise
 
+    if state:
+        session_summary("Workers ready", [
+            ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
+            ("Session" if state["kind"] == "openai" else "Target", state["target"]),
+        ])
     if harness.name == "openai":
         print(f"Send work: cws-agent run {args.name} 'your task'")
         print(f"Open a shell: cws-agent connect {args.name}")
@@ -3933,7 +4144,10 @@ def launch_session(args) -> int:
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
             raise
-    print("session ready.")
+    session_summary("Session ready", [
+        ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
+        ("Connect", f"cws-agent connect {args.name}"),
+    ])
     if telegram:
         return start_launched_telegram(sb, harness, args, env)
     if args.local_dir and not getattr(args, "no_snapshot", False):
@@ -5707,7 +5921,9 @@ def cmd_resume(args) -> int:
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
         raise
-    print("session restored — workspace and stored agent state restored.")
+    session_summary("session restored — workspace and stored agent state restored.", [
+        ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
+    ])
     if state:
         print(f"restarted {state['workers']} {state['kind']} worker(s) for {state['target']}")
     if getattr(args, "telegram", False):
@@ -6774,7 +6990,10 @@ def cmd_session_start(args) -> int:
     if launch.returncode not in (0, None):
         raise SystemExit(f"error: tmux launch failed: {(launch.stderr or '').strip()[:300]}")
 
-    print(f"session {args.session!r} started [{harness.name}] on {branch!r}.")
+    session_summary("Agent session ready", [
+        ("Session", args.session), ("Name", args.name), ("Agent", harness.name),
+        ("Sandbox", sb.sandbox_id), ("Branch", branch),
+    ])
     if args.attach:
         return session_attach(sb, args.session)
     print(f"attach: cws-agent session attach {args.name} {args.session}")

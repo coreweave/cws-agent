@@ -3,8 +3,17 @@
 [Back to README](../README.md).
 
 Launch, connect, and restore offer to import changed local skills and MCP tools.
-Choose **a** for all, comma-separated names for a few, or Enter to skip; then
-confirm with **y**. Nothing is copied without confirmation.
+In an interactive terminal, Skills and Tools (MCP) appear as collapsed sections
+with all available updates selected. Press **Enter** to upload both in one step,
+or **s** to skip all imports.
+
+To customize the selection, use **Up/Down** to move, **Right/Left** to expand or
+collapse a section, and **Space** to toggle an item or a whole section. Unavailable
+items cannot be selected. Press **Enter** to upload your selection, or **Ctrl-C**
+to cancel the command. Clearing an item leaves any existing remote copy intact.
+
+Terminals without interactive display support use a text prompt: Enter or **a**
+uploads all available updates, **s** skips, and comma-separated names select a few.
 
 ```sh
 cws-agent config preview dev1 --verbose
@@ -35,9 +44,10 @@ unrelated settings remain. **Restart the agent to load changes.**
 ## Review before importing
 
 `--verbose` shows sources, sizes, commands, endpoints, and skip reasons.
-Before confirmation, the importer lists required executables and environment
-variable names, including missing variables. Values stay hidden.
-Use `skill:NAME` or `mcp:NAME` for ambiguous names.
+Expand a section and highlight an item to see its requirements or skip reason.
+Details include required executables and environment variable names, including
+missing variables. Values stay hidden. For the text prompt or `--select`, use
+`skill:NAME` or `mcp:NAME` for ambiguous names.
 
 - Limit: **5 MiB / 500 text files per selection**, 256 KiB per file.
 - Binary files and symlinks block a skill. Dotfiles, key files, caches,

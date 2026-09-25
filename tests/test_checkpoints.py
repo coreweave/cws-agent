@@ -280,7 +280,7 @@ class CheckpointTests(unittest.TestCase):
                 patch.object(app, "configure_wandb_opencode"), \
                 patch.object(app, "read_backend_config", return_value=None), \
                 patch.object(app, "sync_agent_config"), \
-                patch.object(app, "provision_session", return_value=object()) as provision, \
+                patch.object(app, "provision_session", return_value=types.SimpleNamespace(sandbox_id="sb-example")) as provision, \
                 contextlib.redirect_stdout(self.stdout):
             self.assertEqual(app.main(["restore", "example", "--checkpoint-dir", str(self.directory)]), 0)
         latest.assert_not_called()
