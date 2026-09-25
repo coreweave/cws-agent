@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import types
 from unittest.mock import patch
 
 from test_messaging import app
@@ -18,7 +19,7 @@ class TelegramLaunchTests(unittest.TestCase):
     def test_launch_creates_signs_in_and_bridges_with_permission_choice(self):
         args = self.args("--dangerously-skip-permissions")
         events = []
-        sb = object()
+        sb = types.SimpleNamespace(sandbox_id="sb-example")
         with contextlib.redirect_stdout(io.StringIO()), \
                 patch.object(app.sys.stdin, "isatty", return_value=True), \
                 patch.object(app.sys.stdout, "isatty", return_value=True), \

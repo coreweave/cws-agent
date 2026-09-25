@@ -56,7 +56,7 @@ class DiskSizingTests(unittest.TestCase):
                 patch.object(cli, "find_active", return_value=None), \
                 patch.object(cli, "build_env", return_value={}), \
                 patch.object(cli, "scan_local_dir", side_effect=scan) as scanning, \
-                patch.object(cli, "provision_session", side_effect=lambda **kw: events.append("provision") or object()) as provision, \
+                patch.object(cli, "provision_session", side_effect=lambda **kw: events.append("provision") or types.SimpleNamespace(sandbox_id="sb-example")) as provision, \
                 patch.object(cli, "sync_local_dir", side_effect=lambda *a, **kw: events.append("package/upload")) as sync:
             self.provision = provision
             self.assertEqual(cli.cmd_launch(args), 0)

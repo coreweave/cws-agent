@@ -5,7 +5,7 @@ tests in `tests/` and optional live smoke scripts. Clone the repository, then ru
 the offline suite from the checkout:
 
 ```bash
-uv run --no-project --with 'cwsandbox[wandb]>=1.14.2,<2' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' --with 'openai>=3.14,<4' --with 'discord.py>=2.6,<3' python -m unittest discover -s tests
+uv run --no-project --with 'cwsandbox[wandb]>=1.14.2,<2' --with 'segno>=1.6,<2' --with 'truststore>=0.10,<1' --with 'markdown-it-py>=3,<5' --with 'python-dotenv>=1,<2' --with 'openai>=3.14,<4' --with 'discord.py>=2.6,<3' --with 'prompt-toolkit>=3.0.50,<4' --with 'rich>=14,<15' python -m unittest discover -s tests
 ```
 
 ## Checklist
