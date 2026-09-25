@@ -96,8 +96,9 @@ def startup_step(label):
     console = Console(stderr=True)
     started = time.monotonic()
     try:
-        with Progress(SpinnerColumn(style="cyan"), TextColumn("{task.description}"),
-                      TimeElapsedColumn(), console=console, transient=True) as progress:
+        with Progress(SpinnerColumn(style="cyan"), TextColumn("{task.description}", markup=False),
+                      TimeElapsedColumn(), console=console, transient=True,
+                      redirect_stdout=False, redirect_stderr=False) as progress:
             progress.add_task(label, total=None)
             yield
     except BaseException:
@@ -106,18 +107,19 @@ def startup_step(label):
     console.print(Text(f"✓ {label}  {time.monotonic() - started:.0f}s", style="cyan"))
 
 
-def session_summary(title, rows):
+def session_summary(title, rows, *, file=None):
     """A small, copyable summary; no markup interpretation of remote values."""
-    if not terminal_ui(sys.stdout):
-        print(title)
+    stream = file if file is not None else sys.stdout
+    if not terminal_ui(stream):
+        print(title, file=stream)
         for label, value in rows:
-            print(f"  {label}: {value}")
+            print(f"  {label}: {value}", file=stream)
         return
     from rich.console import Console
     from rich.table import Table
     from rich.text import Text
 
-    console = Console()
+    console = Console(file=stream)
     console.print(Text("\n" + title, style="bold cyan"))
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim")
@@ -852,9 +854,9 @@ def workspace_access(name):
 
 
 def automatic_snapshot(sb, name, harness_name):
-    print("Saving workspace, skills, MCP configuration, and stored agent state to a snapshot ...", flush=True)
     try:
-        sid = take_snapshot(sb, name, harness_name)
+        with startup_step("Saving workspace snapshot"):
+            sid = take_snapshot(sb, name, harness_name)
     except Exception as error:
         print(f"Snapshot failed ({type(error).__name__}). Upload is intact. Retry: cws-agent snapshot {name}", flush=True)
         return None
@@ -1545,8 +1547,9 @@ def provision_session(*, name: str, harness: Harness, repo_url: str | None,
     starts in a row, so retry a handful of times before giving up."""
     last: Exception | None = None
     for i in range(attempts):
-        with startup_step("Creating sandbox"):
+        with startup_step(f"Creating {name!r} [{harness.name}] on {create_kwargs.get('image', harness.image)}"):
             sb = create_session_sandbox(name=name, harness=harness, **create_kwargs)
+        print(f"  Sandbox: {sb.sandbox_id}", file=sys.stderr, flush=True)
         try:
             if create_kwargs.get("restore_snapshot_id"):
                 snapshot_metadata(sb, "restore-snapshot")
@@ -1782,10 +1785,12 @@ class TransferProgress:
         self.label, self.total, self.done = label, total, initial
         self.initial = initial
         self.stream = sys.stderr
-        self.tty = self.stream.isatty()
+        self.tty = terminal_ui(self.stream)
+        self.live = None
         self.started = time.monotonic()
         self.last = self.started
-        self.render()
+        if not self.tty:
+            self.render()
 
     def advance(self, size):
         self.done += size
@@ -1811,18 +1816,36 @@ class TransferProgress:
         line = f"{self.label}: {detail} | {transfer_size((self.done - self.initial) / elapsed)}/s"
         if status:
             line += " | " + status
-        if self.tty:
-            width = max(1, shutil.get_terminal_size().columns - 1)
-            self.stream.write("\r\033[2K" + line[:width] + ("\n" if status else ""))
+        self.line = line
+        if self.live is not None:
+            from rich.text import Text
+            width = max(1, shutil.get_terminal_size().columns - 3)
+            self.spinner.update(text=Text(line[:width], no_wrap=True, overflow="ellipsis"))
+            self.live.refresh()
         else:
             self.stream.write(line + "\n")
         self.stream.flush()
 
     def __enter__(self):
+        if self.tty:
+            from rich.console import Console
+            from rich.live import Live
+            from rich.spinner import Spinner
+            self.spinner = Spinner("dots", style="cyan")
+            self.live = Live(self.spinner, console=Console(file=self.stream), transient=True,
+                             refresh_per_second=8, redirect_stdout=False, redirect_stderr=False)
+            self.live.start()
+            self.render()
         return self
 
     def __exit__(self, kind, value, traceback):
-        self.render("interrupted" if kind is KeyboardInterrupt else "failed" if kind else "done")
+        try:
+            self.render("interrupted" if kind is KeyboardInterrupt else "failed" if kind else "done")
+        finally:
+            if self.live is not None:
+                from rich.text import Text
+                self.live.stop()
+                self.live.console.print(Text(self.line, no_wrap=True, overflow="ellipsis"))
 
 
 @dataclass
@@ -2444,8 +2467,8 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
     with upload_open(folder / "archive.tar.gz") as archive:
         if os.fstat(archive.fileno()).st_size != manifest["size"]:
             raise ValueError("cached archive size changed")
-        print("Checking saved remote chunks ...", flush=True)
-        state = status()
+        with startup_step("Checking saved remote chunks"):
+            state = status()
         if state["complete"]:
             print("Remote extraction already completed; no upload needed.")
             return
@@ -2503,10 +2526,11 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
         # automatically. The completion marker prevents a second successful apply.
         timeout = budget()
         import contextlib
-        with workspace_access(session_name) if session_name else contextlib.nullcontext():
-            result = sb.exec(upload_command(manifest, "extract", timeout=timeout), timeout_seconds=timeout).result()
-        if json.loads(upload_result(result).stdout).get("complete") is not True:
-            raise ProjectUploadError("missing extraction completion receipt")
+        with startup_step("Extracting uploaded files"):
+            with workspace_access(session_name) if session_name else contextlib.nullcontext():
+                result = sb.exec(upload_command(manifest, "extract", timeout=timeout), timeout_seconds=timeout).result()
+            if json.loads(upload_result(result).stdout).get("complete") is not True:
+                raise ProjectUploadError("missing extraction completion receipt")
 
 
 def sync_local_dir(sb: Sandbox, local_dir: str, *, include_git: bool,
@@ -3628,7 +3652,7 @@ def import_selection_error(items):
     return ""
 
 
-def import_checklist(items):
+def import_checklist(items, *, cancel_label="cancel command"):
     """Inline, collapsible selection. Enter is the only upload confirmation."""
     from prompt_toolkit import Application
     from prompt_toolkit.data_structures import Point
@@ -3743,12 +3767,19 @@ def import_checklist(items):
         Window(FormattedTextControl("Referenced credentials are included and saved in snapshots.\n"
                                    "Tools connect on agent start; dependencies are not installed."),
                dont_extend_height=True, style="class:muted", wrap_lines=True),
-        Window(FormattedTextControl("↑↓ move  →← expand/collapse  Space toggle\n"
-                                   "Enter upload selected  s skip all  Ctrl-C cancel"),
+        Window(FormattedTextControl([
+            ("class:key", "[↑↓]"), ("", " Move  "),
+            ("class:key", "[←→]"), ("", " Expand/collapse  "),
+            ("class:key", "[Space]"), ("", " Toggle\n"),
+            ("class:key", "[Enter]"), ("", " Upload selected  "),
+            ("class:key", "[s]"), ("", " Skip all\n"),
+            ("class:key", "[Ctrl-C]"), ("", " " + cancel_label),
+        ]),
                dont_extend_height=True, wrap_lines=True),
     ])
     style = {} if "NO_COLOR" in os.environ else {
-        "title": "bold ansicyan", "focus": "reverse", "muted": "ansibrightblack", "warning": "ansiyellow"}
+        "title": "bold ansicyan", "key": "bold ansicyan", "focus": "reverse",
+        "muted": "ansibrightblack", "warning": "ansiyellow"}
     app = Application(layout=Layout(layout, focused_element=control), key_bindings=keys,
                       style=Style.from_dict(style), full_screen=False, erase_when_done=True)
     try:
@@ -3757,7 +3788,7 @@ def import_checklist(items):
         return set()
 
 
-def sync_agent_config(sb, harness, args) -> None:
+def sync_agent_config(sb, harness, args, *, cancel_label="cancel command") -> None:
     import json
 
     if harness.name in ("ant", "openai"):
@@ -3837,21 +3868,19 @@ def sync_agent_config(sb, harness, args) -> None:
         print("Tools connect on agent start; dependencies are not installed.")
     while True:
         if checklist:
-            selected = import_checklist(pending)
+            selected = import_checklist(pending, cancel_label=cancel_label)
             chosen = [item for item in pending if item["id"] in selected and not item["blocked"]]
             total = sum(item["bytes"] for item in chosen)
             break
         try:
-            values = [input("Upload: Enter/a all, s skip, or comma-separated names: ")] if interactive else supplied
+            values = [input("Import: Enter/a upload all selected, s skip, or comma-separated names: ")] if interactive else supplied
         except EOFError:
             print("No configuration imported.")
             return
         selected = {unquote(value) for entry in values for value in unquote(entry).split(",") if unquote(value)}
-        if not selected and interactive and all(not entry.strip() for entry in values):
-            selected = {"all"}
-        if not selected or {v.lower() for v in selected} in ({"s"}, {"skip"}):
+        if {v.lower() for v in selected} in ({"s"}, {"skip"}):
             return
-        if {v.lower() for v in selected} in ({"a"}, {"all"}):
+        if (interactive and not selected) or {v.lower() for v in selected} in ({"a"}, {"all"}):
             selected = set(eligible)
         resolved, errors = set(), []
         for value in sorted(selected):
@@ -3888,15 +3917,15 @@ def sync_agent_config(sb, harness, args) -> None:
     if not interactive and not getattr(args, "yes", False):
         while True:
             try:
-                answer = unquote(input("Apply imports? [y/n] (Enter skips): ")).lower() if sys.stdin.isatty() else "n"
+                answer = unquote(input("Apply selected imports? [Y/n] (Enter applies): ")).lower() if sys.stdin.isatty() else "n"
             except EOFError:
                 answer = "n"
-            if answer in ("y", "yes"):
+            if answer in ("", "y", "yes"):
                 break
-            if answer in ("", "n", "no", "s", "skip"):
+            if answer in ("n", "no", "s", "skip"):
                 print("No configuration imported.")
                 return
-            print("Please enter y to apply or n to skip.")
+            print("Please press Enter or y to apply, or n to skip.")
     payload = json.dumps({"agent": harness.name, "items": chosen}).encode()
     proc = sb.exec(["sh", "-lc", AGENT_ENV + "exec python3 -c " + shlex.quote(IMPORT_APPLY_SCRIPT)], stdin=True, timeout_seconds=120)
     proc.stdin.write(payload).result(timeout=30)
@@ -4026,7 +4055,7 @@ def launch_session(args) -> int:
         local_inventory = scan_local_dir(args.local_dir, include_git=not args.no_git, extra_excludes=args.exclude)
     if args.disk is None:
         args.disk = local_directory_disk(local_inventory) if local_inventory is not None else "10Gi"
-        if local_inventory is not None:
+        if local_inventory is not None and getattr(args, "verbose", False):
             print(f"Automatic disk: {args.disk} for {transfer_size(local_inventory.total)} of selected files "
                   "plus filesystem overhead and working space. Override with --disk.", flush=True)
     if harness.name == "openai":
@@ -4042,7 +4071,6 @@ def launch_session(args) -> int:
                 args._created_openai_session = session.id
             openai_environment(session)
             state = backend_config("openai", session.id, 1)
-    print(f"launching session {args.name!r} [{harness.name}] on image {image} ...", flush=True)
     sb = provision_session(
         name=args.name,
         harness=harness,
@@ -4134,7 +4162,7 @@ def launch_session(args) -> int:
         print(f"skills/MCP import skipped for --detach; run: cws-agent config sync {args.name}")
     else:
         try:
-            sync_agent_config(sb, harness, args)
+            sync_agent_config(sb, harness, args, cancel_label="abort launch (stops sandbox)")
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
             raise
@@ -4144,11 +4172,11 @@ def launch_session(args) -> int:
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
             raise
-    session_summary("Session ready", [
-        ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
-        ("Connect", f"cws-agent connect {args.name}"),
-    ])
     if telegram:
+        session_summary("Telegram setup", [
+            ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
+            ("Next", "Finish agent sign-in and Telegram pairing"),
+        ])
         return start_launched_telegram(sb, harness, args, env)
     if args.local_dir and not getattr(args, "no_snapshot", False):
         automatic_snapshot(sb, args.name, harness.name)
@@ -4169,6 +4197,10 @@ def launch_session(args) -> int:
             print("  note: no OPENAI_API_KEY in your env — run `cws-agent login " + args.name + "`")
             print("        (Sign in with ChatGPT), add --import-codex-auth to import your local login,")
             print("        or set OPENAI_API_KEY before launch.")
+    session_summary("Session ready", [
+        ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
+        ("Connect", f"cws-agent connect {args.name}"),
+    ])
     if args.detach:
         print(f"connect later with: cws-agent connect {args.name}")
         return 0
@@ -4382,20 +4414,26 @@ def cmd_shell(args) -> int:
             volumes=[replace(volume, name=f"shell-volume-{index}") for index, volume in enumerate(args.volume)],
             placement_mode=mode,
         )
-        print(f"Creating shell sandbox {args.name!r} ...", file=sys.stderr, flush=True)
-        sb = Sandbox.run("sh", "-c", "sleep infinity", auth=sandbox_auth(), **kwargs)
+        with startup_step(f"Creating shell sandbox {args.name!r}"):
+            sb = Sandbox.run("sh", "-c", "sleep infinity", auth=sandbox_auth(), **kwargs)
+        print(f"  Sandbox: {sb.sandbox_id}", file=sys.stderr, flush=True)
         try:
-            result = exec_retry(sb, ["mkdir", "-p", HOME_DIR, PROJECT_DIR, "/mnt"], attempts=1)
-            if result.returncode:
-                raise SystemExit("error: image must allow creating /workspace/home, /workspace/project, and /mnt")
-            if snapshot and harness_from_request_id(snapshot.request_id) not in (None, "shell"):
-                snapshot_metadata(sb, "restore-snapshot")
-            shell_copy_files(sb, entries)
+            with startup_step("Preparing shell"):
+                result = exec_retry(sb, ["mkdir", "-p", HOME_DIR, PROJECT_DIR, "/mnt"], attempts=1)
+                if result.returncode:
+                    raise SystemExit("error: image must allow creating /workspace/home, /workspace/project, and /mnt")
+                if snapshot and harness_from_request_id(snapshot.request_id) not in (None, "shell"):
+                    snapshot_metadata(sb, "restore-snapshot")
+                shell_copy_files(sb, entries)
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
             raise
         print(f"Sandbox {args.name!r} will keep running after this command exits. "
               f"Stop: cws-agent down {args.name} --no-snapshot", file=sys.stderr)
+        session_summary("Shell ready", [
+            ("Name", args.name), ("Sandbox", sb.sandbox_id),
+            ("Connect", f"cws-agent shell {args.name}"),
+        ], file=sys.stderr)
     command = ("exec sh -c " + shlex.quote(args.cmd) if args.cmd is not None else
                "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi")
     if interactive:
@@ -5915,13 +5953,13 @@ def cmd_resume(args) -> int:
             raise SystemExit("error: legacy snapshot has no saved worker configuration; "
                              "restore with --claude-env ENV_ID --workers N")
         if not state:
-            sync_agent_config(sb, harness, args)
+            sync_agent_config(sb, harness, args, cancel_label="abort restore (stops sandbox)")
             if codex_auth is not None:
                 import_codex_auth(sb, codex_auth)
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
         raise
-    session_summary("session restored — workspace and stored agent state restored.", [
+    session_summary("Session restored", [
         ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
     ])
     if state:

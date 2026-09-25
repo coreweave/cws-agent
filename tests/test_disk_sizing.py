@@ -64,12 +64,15 @@ class DiskSizingTests(unittest.TestCase):
 
     def test_scan_and_choose_disk_before_provision_reuse_scan_for_upload(self):
         inventory = self.inventory(int(20.4 * (1 << 30)), 546291)
-        events, scan, provision, sync, output = self.launch(["--local-dir", "/project", "--no-git", "--exclude", "data"], inventory)
-        self.assertEqual(events, ["scan", "provision", "package/upload"])
-        self.assertEqual(provision.call_args.kwargs["disk"], "65Gi")
-        scan.assert_called_once_with("/project", include_git=False, extra_excludes=["data"])
-        self.assertIs(sync.call_args.kwargs["inventory"], inventory)
-        self.assertIn("Automatic disk: 65Gi", output)
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                flags = ["--local-dir", "/project", "--no-git", "--exclude", "data"]
+                events, scan, provision, sync, output = self.launch(flags + (["--verbose"] if verbose else []), inventory)
+                self.assertEqual(events, ["scan", "provision", "package/upload"])
+                self.assertEqual(provision.call_args.kwargs["disk"], "65Gi")
+                scan.assert_called_once_with("/project", include_git=False, extra_excludes=["data"])
+                self.assertIs(sync.call_args.kwargs["inventory"], inventory)
+                self.assertEqual("Automatic disk: 65Gi" in output, verbose)
 
     def test_explicit_disk_is_not_overridden(self):
         _, _, provision, _, output = self.launch(["--local-dir", "/project", "--disk", "15Gi"], self.inventory(30 << 30))

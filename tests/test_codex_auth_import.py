@@ -138,7 +138,7 @@ class CodexAuthImportTests(unittest.TestCase):
                 patch.object(cli, "latest_ready_snapshot", return_value=snapshot), \
                 patch.object(cli, "read_backend_config", return_value=None), \
                 patch.object(cli, "provision_session", side_effect=provision) as create, \
-                patch.object(cli, "sync_agent_config", side_effect=lambda *a: events.append("config")), \
+                patch.object(cli, "sync_agent_config", side_effect=lambda *a, **kw: events.append("config")), \
                 patch.object(cli, "import_codex_auth", side_effect=transfer), \
                 patch.object(cli, "stop_failed_sandbox") as stop, \
                 patch.object(cli, "pty_attach", side_effect=lambda *a: events.append("attach") or 0), \

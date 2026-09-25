@@ -144,7 +144,7 @@ class BackgroundLaunchTests(unittest.TestCase):
                 patch.object(cli, "scan_local_dir", return_value=cli.LocalDirectoryInventory(str(self.root), [], 0, 0, set())), \
                 patch.object(cli, "provision_session", return_value=self.sb), \
                 patch.object(cli, "sync_local_dir", side_effect=AssertionError("foreground upload blocked launch")), \
-                patch.object(cli, "sync_agent_config", side_effect=lambda *a: events.append("imports")), \
+                patch.object(cli, "sync_agent_config", side_effect=lambda *a, **kw: events.append("imports")), \
                 patch.object(cli, "pty_attach", side_effect=lambda *a: events.append("login") or 0), \
                 patch.object(cli, "start_background_upload", side_effect=lambda *a: events.append("background")), \
                 patch.object(cli, "cmd_bridge_telegram", side_effect=lambda *a: events.append("bridge") or 0):

@@ -458,10 +458,23 @@ class ImportPromptTests(unittest.TestCase):
         self.assertNotIn("mcp:docs", [item["id"] for item in offered])
         self.assertEqual(self.imported_ids(), ["skill:review"])
 
-    def test_enter_uploads_all_in_one_step(self):
-        self.run_prompt([""])
+    def test_text_fallback_enter_applies_only_available_updates_in_one_step(self):
+        self.run_prompt([""], previous={"claude": {"mcp:docs": {"hash": self.items[0]["hash"]}}})
         self.assertEqual(self.prompt.call_count, 1)
-        self.assertEqual(self.imported_ids(), ["mcp:docs", "skill:review"])
+        self.assertEqual(self.imported_ids(), ["skill:review"])
+
+    def test_text_fallback_named_selection_applies_in_one_step(self):
+        self.run_prompt(["review"])
+        self.assertEqual(self.prompt.call_count, 1)
+        self.assertEqual(self.imported_ids(), ["skill:review"])
+
+    def test_explicit_selection_enter_accepts_current_selection_and_skip_never_writes(self):
+        self.run_prompt([""], select=["review"])
+        self.assertEqual(self.imported_ids(), ["skill:review"])
+        for answer in ("n", "s", EOFError()):
+            with self.subTest(answer=answer):
+                self.run_prompt([answer], select=["review"])
+                self.sb.exec.assert_not_called()
 
     def test_skip_and_eof_never_write(self):
         for answers in (["s"], ["'skip'"], [EOFError()]):
