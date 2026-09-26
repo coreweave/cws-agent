@@ -57,7 +57,7 @@ class LifecycleNameTests(unittest.TestCase):
             names.add(name)
             self.assertEqual(upload.call_args.kwargs["session_name"], name)
             snapshot.assert_called_once_with(sandbox, name, command)
-            self.assertIn(f"launching session '{name}'", output.getvalue())
+            self.assertIn(f"Name: {name}", output.getvalue())
             self.assertIn(f"cws-agent connect {name}", output.getvalue())
 
     def test_agent_shortcuts_match_explicit_launch(self):

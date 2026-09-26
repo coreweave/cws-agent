@@ -34,6 +34,7 @@ class ShellTests(unittest.TestCase):
         self.stdout_tty = self.stack.enter_context(patch.object(agent.sys.stdout, "isatty", return_value=True))
         self.auth = self.stack.enter_context(patch.object(agent, "sandbox_auth", return_value=AuthStrategy.WANDB))
         self.sb = Mock()
+        self.sb.sandbox_id = "sb-example"
         self.sb.exec.return_value.result.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
         self.list = self.stack.enter_context(patch.object(agent.Sandbox, "list"))
         self.list.return_value.result.return_value = []
@@ -76,6 +77,10 @@ class ShellTests(unittest.TestCase):
         self.bootstrap.assert_not_called()
         self.config.assert_not_called()
         self.assertEqual(self.stdout.getvalue(), "")
+        self.assertIn("Creating shell sandbox", self.stderr.getvalue())
+        self.assertIn("Preparing shell", self.stderr.getvalue())
+        self.assertIn("Shell ready", self.stderr.getvalue())
+        self.assertIn("sb-example", self.stderr.getvalue())
 
     def test_bare_shell_generates_reconnectable_name(self):
         self.invoke()

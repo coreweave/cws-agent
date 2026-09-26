@@ -10,10 +10,15 @@ or **s** to skip all imports.
 To customize the selection, use **Up/Down** to move, **Right/Left** to expand or
 collapse a section, and **Space** to toggle an item or a whole section. Unavailable
 items cannot be selected. Press **Enter** to upload your selection, or **Ctrl-C**
-to cancel the command. Clearing an item leaves any existing remote copy intact.
+to cancel the command. During launch or restore, the footer labels this as an
+abort: it stops the newly created sandbox. Use **s** to skip imports and continue.
+Clearing an item leaves any existing remote copy intact.
 
-Terminals without interactive display support use a text prompt: Enter or **a**
-uploads all available updates, **s** skips, and comma-separated names select a few.
+Terminals without interactive display support use a text prompt with all
+available updates selected: **Enter** or **a** uploads them, **s** skips, and
+comma-separated names upload only those items. There is no second confirmation.
+With an explicit `--select` selection, **Enter** accepts the selected items at
+the confirmation prompt; **n** or **s** skips.
 
 ```sh
 cws-agent config preview dev1 --verbose

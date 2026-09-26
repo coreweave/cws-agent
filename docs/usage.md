@@ -171,6 +171,7 @@ If snapshot creation fails, the files remain uploaded; retry with `cws-agent sna
 Worker launch modes do not take this automatic snapshot.
 
 Launch sizes the disk to fit your files with headroom; `--disk` overrides it.
+Use `--verbose` to see the automatic disk-sizing explanation.
 Without local files, the default is 10 GiB. `sync` cannot resize an existing disk.
 Large transfers get a size-based timeout; use `--transfer-timeout 4h` to override it.
 This does not extend the sandbox's lifetime.
