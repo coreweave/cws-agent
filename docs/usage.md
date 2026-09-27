@@ -49,8 +49,9 @@ For creation, shortcuts accept the same options as `launch` except `--agent`, in
 `--name NAME` compatibility form. Existing backend requirements still apply.
 Use `cws-agent AGENT --help` to see the options for an agent.
 To continue a saved agent session, use `cws-agent claude --resume SESSION_ID` (or
-`codex` / `opencode`). This finds its running sandbox; it does not create one.
-See [sandbox restoration and agent sessions](sessions.md#sandbox-or-agent-session) for
+`codex` or `opencode`). This reconnects to live compute or restores the latest
+saved workspace. Add `--running-only` to prevent allocation.
+See [workspaces and conversations](sessions.md#resume-work) for
 explicit sandbox selection, other agents, and stopped sandboxes.
 
 Existing `launch` commands remain supported, including the default Claude Code
@@ -298,5 +299,5 @@ Defaults: 2 CPUs, 4 GiB memory, 8-hour lifetime. Disk is automatic for local upl
 otherwise 10 GiB. `--detach` prepares the sandbox; use `login`, `connect`, or
 `session start` afterward.
 
-Compatibility aliases: `attach` → `connect`, `resume` → `restore`,
+Compatibility aliases: `attach` → `connect`, `down` → `stop`,
 `checkpoint` → `snapshot`, and `restore --attach` → `restore --connect`.

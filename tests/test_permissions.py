@@ -90,7 +90,7 @@ class PermissionTests(unittest.TestCase):
     def test_flags_reach_all_agent_entrypoints(self):
         cases = [(["launch", "--name", "dev1"], "cmd_launch"),
                  (["attach", "dev1"], "cmd_attach"),
-                 (["resume", "dev1", "--attach"], "cmd_resume"),
+                 (["restore", "dev1", "--attach"], "cmd_resume"),
                  (["run", "dev1", "task"], "cmd_run"),
                  (["session", "start", "dev1", "task"], "cmd_session_start"),
                  (["session", "resume", "dev1", "session-id"], "cmd_session_resume"),

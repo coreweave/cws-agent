@@ -41,6 +41,7 @@ Usage:
     cws-agent run     dev1 "fix the failing test" [--yolo]
     cws-agent snapshot dev1
     cws-agent stop    dev1 [--no-snapshot]
+    cws-agent resume   [NAME|SESSION_ID]
     cws-agent restore  dev1 [--connect]
     cws-agent list / status dev1 / snapshots dev1
     cws-agent session start|attach|ls|diff|stop   # parallel agents, one worktree each
@@ -331,7 +332,7 @@ if [ ! -x /opt/agent/bin/codex ] || \
 fi
 export PATH="/opt/agent/bin:$PATH"
 echo -n "[bootstrap] codex: "; codex --version
-if [ -n "$OPENAI_API_KEY" ]; then
+if [ -n "$OPENAI_API_KEY" ] && [ ! -f /workspace/home/.codex/auth.json ]; then
   printf '%s' "$OPENAI_API_KEY" | HOME=/workspace/home codex login --with-api-key >/dev/null 2>&1 \
     && echo "[bootstrap] codex: stored API-key auth" \
     || echo "[bootstrap] codex: could not store API-key auth (run: cws-agent login)"
@@ -3058,12 +3059,16 @@ def command_uses_claude(remote_cmd: str) -> bool:
             (words[:1] == ["cd"] and words[2:5] == ["&&", "exec", "claude"]))
 
 
+class ResumeOperationError(SystemExit):
+    """Actionable, client-authored error safe to show during resume."""
+
+
 def pty_attach(sb: Sandbox, remote_cmd: str, *, image_paste: bool | None = None,
                plain_shell: bool = False) -> int:
     if os.name == "nt":
-        raise SystemExit("error: interactive terminal connections are not supported on Windows")
+        raise ResumeOperationError("error: interactive terminal connections are not supported on Windows")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise SystemExit("error: connect requires a TTY (try `run` for headless use)")
+        raise ResumeOperationError("error: connect requires a TTY (try `run` for headless use)")
 
     import signal
     import select
@@ -4093,7 +4098,7 @@ def sync_agent_config(sb, harness, args, *, cancel_label="cancel command") -> No
     proc.stdin.close().result(timeout=30)
     result = proc.result(timeout=130)
     if result.returncode not in (0, None):
-        raise SystemExit("error: configuration import failed; existing remote edits may conflict. " + (result.stderr or "")[-400:])
+        raise ResumeOperationError("error: configuration import failed; inspect the sandbox configuration for conflicting edits or retry with --no-config-sync")
     if result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
     detail = f" ({total} bytes)" if verbose else ""
@@ -4517,10 +4522,10 @@ def cmd_shell(args) -> int:
     if not NAME_RE.fullmatch(args.name):
         raise SystemExit("error: session name must match [a-z0-9][a-z0-9-]{0,39}")
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if args.cmd is None and not interactive:
+    if args.cmd is None and not interactive and not getattr(args, "_prepare_only", False):
         raise SystemExit("error: shell requires a terminal; use --cmd COMMAND for non-interactive execution")
     if interactive and os.name == "nt":
-        raise SystemExit("error: interactive terminal connections are not supported on Windows")
+        raise ResumeOperationError("error: interactive terminal connections are not supported on Windows")
     mode = args.mode or ("cks" if args.volume else "serverless")
     if args.volume and mode != "cks":
         raise SystemExit("error: --volume requires CKS placement; use --mode cks or omit --mode")
@@ -4560,10 +4565,11 @@ def cmd_shell(args) -> int:
         if snapshot:
             saved_disk = re.search(r"\|disk=([1-9][0-9]*(?:Gi|Mi|Ti))$", snapshot.request_id or "")
             disk = saved_disk[1] if saved_disk else f"{max(10, ((snapshot.size_bytes or 0) + 2**30 - 1) // 2**30)}Gi"
+        disk = getattr(args, "_restore_disk", disk)
         kwargs = dict(
             container_image=args.image or "python:3.11",
             tags=session_tags(args.name, "shell"),
-            max_lifetime_seconds=8 * 3600,
+            max_lifetime_seconds=getattr(args, "_restore_lifetime", 8 * 3600),
             environment_variables={"CWS_AGENT_NAME": args.name, "CWS_AGENT_HARNESS": "shell",
                                    "CWS_AGENT_DISK": disk},
             resources=ResourceOptions(requests={"cpu": args.cpu or "2", "memory": args.memory or "4Gi"},
@@ -4592,7 +4598,7 @@ def cmd_shell(args) -> int:
                     "memory": args.memory or "4Gi", "disk": disk, "mode": mode,
                     "gpu": args.gpu, "secrets": [s.name for s in args.secret],
                     "volumes": [v.volume_id + ":" + v.mount_path for v in args.volume],
-                    "lifetime_seconds": 8 * 3600,
+                    "lifetime_seconds": getattr(args, "_restore_lifetime", 8 * 3600),
                 }, restore_snapshot_id=snapshot.file_system_snapshot_id if snapshot else None)
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
@@ -4603,6 +4609,8 @@ def cmd_shell(args) -> int:
             ("Name", args.name), ("Sandbox", sb.sandbox_id),
             ("Connect", f"cws-agent shell {args.name}"),
         ], file=sys.stderr)
+    if getattr(args, "_prepare_only", False):
+        return sb
     command = ("exec sh -c " + shlex.quote(args.cmd) if args.cmd is not None else
                "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi")
     if interactive:
@@ -6032,8 +6040,7 @@ def cmd_stop(args) -> int:
     if args.no_snapshot:
         print(f"session {args.name!r} stopped without a new snapshot; restore requires an existing READY snapshot.")
     else:
-        restore = (f"cws-agent shell {args.name} --snapshot {args.name}" if harness_name == "shell"
-                   else f"cws-agent restore {args.name}")
+        restore = f"cws-agent resume {args.name}"
         print(f"session {args.name!r} stopped. `{restore}` brings its workspace back.")
     return 0
 
@@ -6521,10 +6528,16 @@ def remote_native_history(sb: Sandbox, opencode_cwd: str | None = None) -> list[
               + "print(json.dumps(sorted(rows, key=lambda r: r['modified'], reverse=True)))")
     result = exec_retry(sb, ["python3", "-c", script], timeout_seconds=60)
     if result.returncode not in (0, None):
-        raise SystemExit("error: could not read native session histories: "
-                         + (result.stderr or "")[:300])
+        raise SystemExit("error: could not read native session histories; inspect the agent history in the sandbox")
     try:
-        return json.loads(result.stdout or "[]")
+        rows = json.loads(result.stdout or "[]")
+        if not isinstance(rows, list) or any(not isinstance(row, dict)
+                or row.get("agent") not in ("claude", "codex", "opencode")
+                or not isinstance(row.get("id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", row["id"])
+                or not isinstance(row.get("cwd"), str) or not row["cwd"].startswith("/") for row in rows):
+            raise ValueError("invalid history rows")
+        return rows
     except ValueError:
         raise SystemExit("error: invalid session history response")
 
@@ -7121,46 +7134,443 @@ def cmd_session_transfer(args) -> int:
             print(f"warning: could not remove temporary history bundle {remote_temp}", file=sys.stderr)
 
 
-def cmd_agent_resume(args) -> int:
-    native_resume_command(args.agent, args.session_id)  # validate before remote access
-    if args.cwd and not args.cwd.startswith("/"):
-        raise SystemExit("error: --cwd must be an absolute sandbox directory")
-    if getattr(args, "name", None) is not None:
-        if not NAME_RE.fullmatch(args.name):
-            raise SystemExit("error: sandbox name must match [a-z0-9][a-z0-9-]{0,39}")
-        return cmd_session_resume(args)
-    if args.agent in ("devin", "cursor"):
-        raise SystemExit(f"error: {args.agent} requires a sandbox name to resume; use "
-                         f"`cws-agent {args.agent} SANDBOX --resume SESSION_ID`")
+CLOUD_RUNNER_DOCS = "https://github.com/coreweave/cws-agent/blob/main/docs/sessions.md#cloud-code-runners"
 
-    boxes = Sandbox.list(tags=[SESSION_TAG], auth=sandbox_auth()).result()
-    matches = []
+
+def display_text(value, limit=180):
+    """Untrusted titles and names must never send controls to the terminal."""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value or ""))
+    return " ".join("".join(c if c.isprintable() else " " for c in text).split())[:limit]
+
+
+
+def activity_timestamp(value):
+    import math
+    if type(value) not in (int, float) or not 0 <= value <= 253402300799 or not math.isfinite(value):
+        return None
+    return value
+
+
+def resume_row(name, agent, sandbox_id, *, conversation=None, saved=None, config=None,
+               backend=None, workspace_id=None, sb=None, snapshot=None):
+    conversation = conversation if isinstance(conversation, dict) else {}
+    updated = activity_timestamp(conversation.get("updated_at"))
+    source = conversation.get("updated_source")
+    if updated is None or source not in ("message", "harness", "file_mtime"):
+        source = "unknown"
+    unavailable = bool(backend) or agent in ("ant", "openai")
+    reason = ("Resume unavailable · Cloud runner docs: " + CLOUD_RUNNER_DOCS if backend == "claude-cloud"
+              else "Managed worker: use restore with its provider configuration" if unavailable else None)
+    return {"workspace": name, "workspace_id": workspace_id, "agent": agent,
+            "sandbox_id": sandbox_id, "session_id": conversation.get("id"),
+            "title": display_text(conversation.get("title"), 400) or None,
+            "excerpt": display_text(conversation.get("excerpt"), 1200) or None,
+            "cwd": conversation.get("cwd"), "updated_at": updated,
+            "updated_source": source,
+            "saved_at": activity_timestamp(saved), "state": "unavailable" if unavailable else "live" if sb else "saved",
+            "resumable": not unavailable, "reason": reason,
+            "snapshot_id": getattr(snapshot, "file_system_snapshot_id", None),
+            "backend": backend, "_config": config, "_sb": sb, "_snapshot": snapshot}
+
+
+
+def discover_resume(*, name=None, sandbox=None, opencode_cwd=None):
+    """Join authorized live compute and READY snapshots with a best-effort local index."""
+    scoped_name = name
+    rows, errors, live_sources, live_names = [], [], set(), set()
+    try:
+        boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(name)] if name else [SESSION_TAG], status="running", auth=sandbox_auth()).result()
+    except Exception:
+        boxes = []
+        errors.append({"code": "live_discovery_failed", "message": "Could not list running workspaces; check sandbox credentials and access"})
+    local_records = read_workspace_catalog()
     for sb in boxes:
-        if getattr(getattr(sb, "status", None), "value", None) != "running":
+        if sandbox and sb.sandbox_id != sandbox:
             continue
-        name, harness = probe_session_meta(sb)
-        if not NAME_RE.fullmatch(name):
-            raise SystemExit("error: could not identify a running sandbox; specify its name before --resume")
-        if harness in ("ant", "openai", "shell"):
+        live_sources.add(sb.sandbox_id)
+        if getattr(getattr(sb, "status", None), "value", "running") != "running":
             continue
-        rows = (remote_native_history(sb, opencode_cwd=args.cwd)
-                if args.agent == "opencode" and args.cwd else remote_native_history(sb))
-        if any(row["agent"] == args.agent and row["id"] == args.session_id for row in rows):
-            matches.append((sb, name))
-    if not matches:
-        raise SystemExit("error: agent session not found in running sandboxes. Use `cws-agent list` and "
-                         "`cws-agent session history SANDBOX`. If stopped, run `cws-agent restore SANDBOX` first.")
-    if len(matches) > 1:
-        names = ", ".join(sorted(name for _, name in matches))
-        raise SystemExit(f"error: agent session found in multiple sandboxes ({names}); use "
-                         f"`cws-agent {args.agent} SANDBOX --resume SESSION_ID`")
-    sb, args.name = matches[0]
-    print(f"Resuming {args.agent} session in sandbox {args.name!r}.")
-    return resume_conversation(sb, args)
+        try:
+            name, agent = probe_session_meta(sb)
+            if not NAME_RE.fullmatch(name) or agent not in (*HARNESSES, "shell"):
+                raise ValueError("invalid identity")
+            live_names.add(name)
+            document = read_workspace_document(sb)
+            backend = document.get("kind") or (document.get("backend") or {}).get("kind")
+            trusted = next((r for r in local_records if r["sandbox_id"] == sb.sandbox_id and not r.get("snapshot_id")), {})
+            history = [] if backend or agent in ("shell", "ant", "openai", "cursor", "devin") else remote_native_history(sb, opencode_cwd=opencode_cwd)
+            live_sources.update(trusted.get("sandbox_ids", []))
+            for conversation in history or [{}]:
+                rows.append(resume_row(name, conversation.get("agent", agent), sb.sandbox_id,
+                    conversation=conversation, config=trusted.get("config"), backend=backend,
+                    workspace_id=trusted.get("id"), sb=sb))
+            update_workspace_catalog({"id": trusted.get("id"), "sandbox_ids": trusted.get("sandbox_ids", [sb.sandbox_id]),
+                                      "config": trusted.get("config"), "name": name, "agent": agent, "sandbox_id": sb.sandbox_id,
+                                      "conversations": history, "backend": backend, "observed_at": time.time()})
+        except (Exception, SystemExit):
+            errors.append({"code": "workspace_discovery_failed", "sandbox_id": sb.sandbox_id,
+                           "message": "Could not read workspace history"})
+    try:
+        snapshots = Sandbox.list_snapshots(status="ready", auth=sandbox_auth()).result()
+    except Exception:
+        snapshots = []
+        errors.append({"code": "snapshot_discovery_failed", "message": "Could not list saved workspaces; check sandbox credentials and access"})
+    catalog = {r["snapshot_id"]: r for r in read_workspace_catalog() if r.get("snapshot_id")}
+    source_identity = {}
+    for snap in snapshots:
+        record = catalog.get(snap.file_system_snapshot_id, {})
+        if record.get("id"):
+            source_identity[snap.source_sandbox_id] = record["id"]
+            for source in record.get("sandbox_ids", []):
+                source_identity[source] = record["id"]
+    groups = {}
+    for snap in snapshots:
+        if "ready" not in str(snap.status).lower() or is_managed_checkpoint(snap):
+            continue
+        request = getattr(snap, "request_id", "") or ""
+        match = re.fullmatch(r"cwsa1\|([a-z0-9][a-z0-9-]{0,39})\|([a-z]+)\|([0-9]+)(?:\|disk=([1-9][0-9]*(?:Mi|Gi|Ti)))?", request)
+        record = catalog.get(snap.file_system_snapshot_id, {})
+        if not match and not record:
+            continue  # unrelated snapshots are deliberately absent from the picker
+        name = match[1] if match else record.get("name", "unnamed")
+        agent = match[2] if match else record.get("agent", "shell")
+        if (scoped_name and name != scoped_name) or (sandbox and snap.source_sandbox_id != sandbox):
+            continue
+        if agent not in (*HARNESSES, "shell"):
+            continue
+        source = snap.source_sandbox_id
+        if source in live_sources or (not record.get("id") and name in live_names):
+            continue
+        created = getattr(snap, "created_at", None)
+        stamp = activity_timestamp(created.timestamp() if created else int(match[3]) if match else record.get("saved_at", 0)) or 0
+        key = source_identity.get(source) or (name, source)
+        if key not in groups or stamp > groups[key][0]:
+            groups[key] = (stamp, snap, record, name, agent)
+    for stamp, snap, record, name, agent in groups.values():
+        for conversation in record.get("conversations") or [{}]:
+            rows.append(resume_row(name, conversation.get("agent", agent), snap.source_sandbox_id,
+                conversation=conversation, saved=stamp, config=record.get("config"),
+                backend=record.get("backend"), workspace_id=record.get("id"), snapshot=snap))
+    rows.sort(key=lambda r: (r.get("updated_at") or r.get("saved_at") or 0), reverse=True)
+    return rows, errors
+
+
+
+def updated_label(row):
+    stamp = row.get("updated_at")
+    if stamp is None:
+        return "—"
+    age = max(0, int(time.time() - stamp))
+    label = f"{age // 86400}d ago" if age >= 86400 else f"{age // 3600}h ago" if age >= 3600 else f"{age // 60}m ago"
+    return ("~" if row.get("updated_source") == "file_mtime" else "") + label
+
+
+
+def resolve_resume_rows(rows, args):
+    target = getattr(args, "target", None)
+    name = getattr(args, "name", None)
+    session = getattr(args, "session_id", None)
+    sandbox = getattr(args, "sandbox", None)
+    agent = getattr(args, "agent", None)
+    if session and (name or sandbox or target):
+        rows = [{**r, "session_id": session} if r["agent"] in ("cursor", "devin") and not r["session_id"] else r for r in rows]
+    found = [r for r in rows if (not target or target in (r["workspace"], r["sandbox_id"], r["session_id"]))
+             and (not name or r["workspace"] == name or r["sandbox_id"] == name)
+             and (not sandbox or sandbox == r["sandbox_id"])
+             and (not session or session == r["session_id"])]
+    if agent and found and not any(r["agent"] == agent for r in found):
+        actual = found[0]["agent"]
+        raise ValueError(f"Harness mismatch: this conversation uses {actual}. Use cws-agent resume --agent {actual}.")
+    return [r for r in found if not agent or r["agent"] == agent]
+
+
+
+def recovery_config(row, args):
+    saved_config = row.get("_config") or {}
+    config = dict(saved_config)
+    agent = row["agent"]
+    defaults = {"image": "python:3.11" if agent == "shell" else HARNESSES[agent].image,
+                "cpu": "2", "memory": "4Gi", "disk": "10Gi", "mode": None, "lifetime_seconds": 28800}
+    request = getattr(row.get("_snapshot"), "request_id", "") or ""
+    disk = re.search(r"\|disk=([1-9][0-9]*(?:Mi|Gi|Ti))$", request)
+    if disk:
+        defaults["disk"] = disk[1]
+    for key, value in defaults.items():
+        if config.get(key) is None:
+            config[key] = value
+    for key in ("image", "cpu", "memory", "disk", "mode"):
+        if getattr(args, key, None) is not None:
+            config[key] = getattr(args, key)
+    if getattr(args, "lifetime", None):
+        config["lifetime_seconds"] = parse_duration(args.lifetime)
+    if (not isinstance(config["image"], str) or not config["image"] or
+            type(config["lifetime_seconds"]) is not int or config["lifetime_seconds"] <= 0 or
+            config["mode"] not in (None, "serverless", "cks")):
+        raise ValueError("Invalid saved workspace configuration")
+    config["cpu"] = shell_cpu(str(config["cpu"]))
+    config["memory"] = shell_memory(str(config["memory"]))
+    if not re.fullmatch(r"[1-9][0-9]*(?:Gi|Mi|Ti)", str(config["disk"])):
+        raise ValueError("Invalid saved disk size")
+    return config, any(saved_config.get(key) is None for key in ("image", "cpu", "memory", "disk", "lifetime_seconds"))
+
+
+
+def restore_resume_row(row, args, config):
+    """Allocate once from the already-selected snapshot; never repeat discovery."""
+    if Sandbox.list(tags=[SESSION_TAG, name_tag(row["workspace"])], status="running", auth=sandbox_auth()).result():
+        raise ValueError("Workspace became active; run resume again to select live compute")
+    if row["agent"] == "shell":
+        shell_args = argparse.Namespace(name=row["workspace"], cmd=None, image=config["image"],
+            cpu=config["cpu"], memory=config["memory"], gpu=config.get("gpu"), mode=config["mode"],
+            secret=[shell_secret(s) for s in config.get("secrets", [])],
+            volume=[shell_volume(v) for v in config.get("volumes", [])],
+            snapshot=row["snapshot_id"], add_local=[], _prepare_only=True,
+            _restore_disk=config["disk"], _restore_lifetime=config["lifetime_seconds"])
+        return cmd_shell(shell_args)
+    harness = HARNESSES[row["agent"]]
+    env = build_env(harness, getattr(args, "env", []), getattr(args, "env_passthrough", []))
+    for key in config.get("env_names", []):
+        if harness.name == "codex" and key == "OPENAI_API_KEY" and key not in os.environ:
+            continue  # Codex snapshots retain their login; an ambient API key is optional.
+        if key not in env:
+            if key not in os.environ:
+                raise ValueError(f"Required environment variable is unavailable: {key}")
+            env[key] = os.environ[key]
+    return provision_session(name=row["workspace"], harness=harness, repo_url=None,
+        image=config["image"], cpu=config["cpu"], memory=config["memory"], disk=config["disk"],
+        mode=config["mode"], lifetime_seconds=config["lifetime_seconds"], env=env,
+        restore_snapshot_id=row["snapshot_id"])
+
+
+
+def resume_picker(rows, *, title="Resume a conversation", notice=""):
+    """Inline table shared by the global picker, narrowed choices and confirmations."""
+    from prompt_toolkit import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.keys import Keys
+    from prompt_toolkit.styles import Style
+    import shutil
+    cursor, query, warning = 0, "", notice
+    keys = KeyBindings()
+
+    def matches():
+        return [r for r in rows if query.lower() in " ".join(str(r.get(k) or "") for k in
+                ("workspace", "agent", "title", "session_id", "sandbox_id")).lower()]
+
+    def content():
+        visible = matches()
+        width = max(20, min(60, shutil.get_terminal_size().columns - 57))
+        result = [("class:heading", title + "\n"), ("class:muted", f"Search: {query}\n\n"),
+                  ("class:muted", f"  {'Workspace (agent)':26} {'Conversation':{width}} {'Updated':10} State\n")]
+        start = max(0, cursor - 9)
+        for i, row in enumerate(visible[start:start + 12], start):
+            agent = row.get("backend") or row.get("agent") or ""
+            workspace = display_text(row.get("workspace"), 16)
+            name = display_text(f"{workspace} ({agent})" if agent else workspace, 26)
+            label = display_text(row.get("title") or row.get("session_id") or row.get("label") or "Workspace", width)
+            style = "class:focus" if i == cursor else "class:muted" if not row.get("resumable", True) else ""
+            result.append((style, f"{'›' if i == cursor else ' '} {name:26} {label:{width}} {updated_label(row):10} {row.get('state', '')}\n"))
+        if not visible:
+            result.append(("class:muted", "  No matching conversations\n"))
+        chosen = visible[cursor % len(visible)] if visible else {}
+        detail = chosen.get("reason") or chosen.get("excerpt") or chosen.get("session_id") or ""
+        result.extend([("class:muted", "\n" + display_text(detail, 240) + "\n"),
+                       ("class:warning", display_text(warning, 240) + "\n"),
+                       ("class:muted", "↑/↓ move · Enter select · type to filter · Esc cancel")])
+        return result
+
+    @keys.add("up")
+    @keys.add("down")
+    def move(event):
+        nonlocal cursor
+        cursor = (cursor + (1 if event.key_sequence[0].key == "down" else -1)) % max(1, len(matches()))
+
+    @keys.add("enter")
+    def accept(event):
+        nonlocal warning
+        visible = matches()
+        if visible:
+            row = visible[cursor % len(visible)]
+            if row.get("resumable", True):
+                event.app.exit(result=row)
+            else:
+                warning = row.get("reason") or "This conversation cannot be resumed"
+
+    @keys.add("escape")
+    @keys.add("c-c")
+    @keys.add("c-d")
+    def cancel(event):
+        event.app.exit(result=None)
+
+    @keys.add("backspace")
+    def erase(event):
+        nonlocal query, cursor
+        query, cursor = query[:-1], 0
+
+    @keys.add(Keys.Any)
+    def search(event):
+        nonlocal query, cursor
+        if event.data.isprintable():
+            query, cursor = (query + event.data)[:120], 0
+
+    return Application(layout=Layout(HSplit([Window(FormattedTextControl(content), always_hide_cursor=True)])),
+                       key_bindings=keys, style=Style.from_dict({} if "NO_COLOR" in os.environ else {"focus": "reverse", "heading": "bold", "muted": "ansibrightblack", "warning": "ansiyellow"}), full_screen=False).run()
+
+
+
+def render_resume_table(rows):
+    print("Workspace (agent) | Conversation | Updated | State")
+    for row in rows:
+        print(" | ".join(display_text(value, 300) for value in (
+            f"{row['workspace']} ({row.get('backend') or row['agent']})",
+            row.get("title") or row.get("session_id") or "Workspace",
+            updated_label(row), row["state"])))
+
+
+
+class ResumeInputError(ValueError):
+    """Invalid local resume input, safe to report before platform operations."""
+
+
+def validate_resume_args(args):
+    try:
+        for item in getattr(args, "env", []):
+            if not isinstance(item, str) or "=" not in item or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item.split("=", 1)[0]):
+                raise ValueError("--env expects KEY=VALUE with a valid variable name")
+        if getattr(args, "legacy_restore_attach", False):
+            raise ValueError("--connect/--attach belongs to restore; use cws-agent restore NAME --connect. Resume opens the conversation automatically.")
+        session = getattr(args, "session_id", None)
+        if session:
+            native_resume_command(getattr(args, "agent", None) or "claude", session)
+        if getattr(args, "cwd", None) and not args.cwd.startswith("/"):
+            raise ValueError("--cwd must be an absolute sandbox directory")
+        for key, check in (("cpu", shell_cpu), ("memory", shell_memory)):
+            if getattr(args, key, None) is not None:
+                setattr(args, key, check(getattr(args, key)))
+        if getattr(args, "mode", None) not in (None, "serverless", "cks"):
+            raise ValueError("--mode must be serverless or cks")
+        if getattr(args, "disk", None) and not re.fullmatch(r"[1-9][0-9]*(?:Gi|Mi|Ti)", args.disk):
+            raise ValueError("--disk must be a positive size such as 10Gi")
+        if getattr(args, "lifetime", None) and parse_duration(args.lifetime) <= 0:
+            raise ValueError("--lifetime must be positive")
+    except (ValueError, argparse.ArgumentTypeError, SystemExit) as error:
+        raise ResumeInputError(str(error)) from None
+
+
+def cmd_unified_resume(args):
+    validate_resume_args(args)
+    scoped_name = getattr(args, "name", None)
+    scoped_box = getattr(args, "sandbox", None)
+    if scoped_name and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", scoped_name):
+        scoped_box, scoped_name = scoped_name, None
+    rows, errors = discover_resume(name=scoped_name, sandbox=scoped_box, opencode_cwd=getattr(args, "cwd", None))
+    for error in errors:
+        print(error.get("message", "Workspace discovery incomplete"), file=sys.stderr)
+    try:
+        found = resolve_resume_rows(rows, args)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    explicit = any(getattr(args, key, None) for key in ("target", "name", "sandbox", "session_id"))
+    if not found:
+        message = "No matching conversation or saved workspace. On another device, select the workspace name to discover its saved conversations."
+        print(message, file=sys.stderr)
+        return 2
+    if len(found) != 1 or not explicit or errors:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            render_resume_table(found)
+            print("Choose a workspace and --session ID in a terminal." + (" Discovery may be incomplete." if errors else ""), file=sys.stderr)
+            return 2
+        row = resume_picker(found, notice="Discovery incomplete; available results shown" if errors else "")
+        if row is None:
+            return 130
+    else:
+        row = found[0]
+    def fail(code, message, proposal=None):
+        print(message, file=sys.stderr)
+        return 2
+    if not row["resumable"]:
+        return fail("unresumable", row["reason"])
+    if getattr(args, "running_only", False) and row["_sb"] is None:
+        return fail("not_running", "Workspace is saved; omit --running-only to restore it")
+    try:
+        config, missing = (None, False) if row["_sb"] else recovery_config(row, args)
+    except (ValueError, argparse.ArgumentTypeError) as error:
+        return fail("invalid_configuration", str(error))
+    if missing and not getattr(args, "allow_default_config", False):
+        if not sys.stdin.isatty():
+            return fail("configuration_required", "Original configuration is unavailable; review defaults before restoring", config)
+        choice = resume_picker([
+            {"workspace": "Restore", "title": "Restore with shown defaults", "resumable": True},
+            {"workspace": "Change", "title": "Exit and supply --image, --cpu, --memory, --disk or --mode", "resumable": True},
+            {"workspace": "Cancel", "title": "Leave workspace saved", "resumable": True},
+        ], title="Original configuration unavailable", notice=display_text(json.dumps(config), 240))
+        if not choice or choice["workspace"] != "Restore":
+            return 130
+    if not getattr(args, "no_attach", False) and (not sys.stdin.isatty() or not sys.stdout.isatty()):
+        return fail("terminal_required", "Resume requires a terminal; use --no-attach to prepare the workspace")
+    sb = row["_sb"]
+    if sb is None:
+        from contextlib import redirect_stdout
+        with redirect_stdout(sys.stderr):
+            sb = restore_resume_row(row, args, config)
+        row = {**row, "_sb": sb, "sandbox_id": sb.sandbox_id, "state": "live"}
+    try:
+        document = read_workspace_document(sb)
+        if document.get("kind") or document.get("backend"):
+            return fail("unresumable", f"Saved workspace contains a managed worker. Sandbox {sb.sandbox_id} is running; stop with cws-agent stop {row['workspace']} --no-snapshot")
+        if row["agent"] != "shell":
+            history = [] if row["agent"] in ("cursor", "devin") else remote_native_history(sb, opencode_cwd=getattr(args, "cwd", None) if row["agent"] == "opencode" else None)
+            if row["session_id"]:
+                verified = [r for r in history if r["id"] == row["session_id"] and r["agent"] == row["agent"]]
+                if row["agent"] not in ("cursor", "devin") and len(verified) != 1:
+                    return fail("conversation_missing", f"Conversation is absent from this snapshot. Sandbox {sb.sandbox_id} is running; stop with cws-agent stop {row['workspace']} --no-snapshot")
+                if verified:
+                    row["cwd"] = verified[0]["cwd"]
+            elif history:
+                choices = [resume_row(row["workspace"], r["agent"], sb.sandbox_id, conversation=r, sb=sb) for r in history]
+                if not sys.stdin.isatty():
+                    render_resume_table(choices)
+                    print("Workspace restored; select a conversation in a terminal.", file=sys.stderr)
+                    return 2
+                choice = resume_picker(choices, title="Choose a saved conversation")
+                if choice is None:
+                    return 130
+                row = choice
+            elif row["agent"] not in ("cursor", "devin"):
+                return fail("conversation_missing", f"No saved conversations found. Workspace is running: {sb.sandbox_id}; use cws-agent connect {row['workspace']} to start work")
+        if row["agent"] != "shell":
+            cwd = getattr(args, "cwd", None) or row.get("cwd") or PROJECT_DIR
+            if not isinstance(cwd, str) or not cwd.startswith("/"):
+                return fail("invalid_history", "Conversation working directory is invalid")
+            check = exec_retry(sb, ["sh", "-lc", AGENT_ENV + f"test -d {shlex.quote(cwd)} && command -v {shlex.quote(HARNESSES[row['agent']].agent_bin)} >/dev/null"], attempts=1)
+            if check.returncode not in (0, None):
+                return fail("conversation_unavailable", f"Agent executable or working directory is unavailable. Sandbox {sb.sandbox_id} is running; inspect it before retrying")
+        if getattr(args, "no_attach", False):
+            print(f"Workspace ready: {row['workspace']} ({sb.sandbox_id})")
+            return 0
+        args.session_id, args.agent = row["session_id"], row["agent"]
+        args.cwd = getattr(args, "cwd", None) or row.get("cwd")
+        if row["agent"] == "shell":
+            return pty_attach(sb, "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi", image_paste=False, plain_shell=True)
+        sync_agent_config(sb, HARNESSES[row["agent"]], args)
+        return resume_conversation(sb, args)
+    except ResumeOperationError as error:
+        return fail("resume_failed", f"{display_text(error, 500)}. Sandbox {sb.sandbox_id} remains running")
+    except (Exception, SystemExit) as error:
+        return fail("resume_failed", f"Resume failed ({type(error).__name__}). Sandbox {sb.sandbox_id} remains running; inspect it before retrying, or stop with cws-agent stop {row['workspace']} --no-snapshot")
+    finally:
+        print(f"Workspace is still running. Save and stop: cws-agent stop {row['workspace']}", file=sys.stderr)
+
+
+def cmd_agent_resume(args) -> int:
+    return cmd_unified_resume(args)
 
 
 def cmd_session_resume(args) -> int:
-    return resume_conversation(require_active(args.name), args)
+    return cmd_unified_resume(args)
 
 
 def resume_conversation(sb, args) -> int:
@@ -7173,11 +7583,13 @@ def resume_conversation(sb, args) -> int:
         rows = [r for r in history if r["id"] == args.session_id
                 and (not args.agent or r["agent"] == args.agent)]
         if len(rows) != 1:
-            raise SystemExit("error: session ID not found or ambiguous; use `session history` "
+            raise ResumeOperationError("error: session ID not found or ambiguous; use `session history` "
                              "and --agent (Devin and Cursor require an explicit --agent)")
         agent, cwd = rows[0]["agent"], args.cwd or rows[0]["cwd"]
     command = native_resume_command(agent, args.session_id) + permission_flags(HARNESSES[agent], args)
     # Fail on missing cwd instead of silently resuming against unrelated files.
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        raise ValueError("Saved conversation has no absolute working directory")
     return pty_attach(sb, f"cd {shlex.quote(cwd)} && exec {command}")
 
 
@@ -7477,6 +7889,14 @@ def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) ->
                    help="copy a local env var into the sandbox (repeatable)")
 
 
+def add_resume_flags(parser):
+    parser.add_argument("--running-only", action="store_true", help="never allocate compute")
+    parser.add_argument("--no-attach", action="store_true", help="prepare workspace without opening a terminal")
+    parser.add_argument("--allow-default-config", action="store_true", help="allow recovery with proposed defaults when configuration is unavailable")
+    if "--no-config-sync" not in parser._option_string_actions:
+        parser.add_argument("--no-config-sync", action="store_true", help="skip local configuration import")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
@@ -7537,8 +7957,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--detach", action="store_true", help="do not attach after launch")
         p.add_argument("--telegram", action="store_true", help="create sandbox, guide agent sign-in, pair Telegram, and start its bridge in one command")
         if shortcut_agent not in (None, "ant", "openai"):
+            add_resume_flags(p)
             p.add_argument("--resume", dest="session_id", default=argparse.SUPPRESS, metavar="SESSION_ID",
-                           help="continue a saved agent session in a running sandbox (does not create or restore one)")
+                           help="continue a live or saved conversation; restore compute when needed")
             p.add_argument("--cwd", default=argparse.SUPPRESS,
                            help="sandbox directory for --resume (default: saved session directory)")
         p.set_defaults(func=cmd_launch)
@@ -7605,7 +8026,26 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--abort-checkpoint", action="store_true", help="abandon an uncommitted checkpoint and release its writer gate")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("restore", aliases=["resume"], help="restore the latest snapshot into a fresh sandbox (resume is a compatibility alias)")
+    p = sub.add_parser("resume", help="choose and resume a live or saved conversation")
+    p.add_argument("target", nargs="?", help="workspace name, full sandbox ID, or native session ID")
+    p.add_argument("--session", dest="session_id", help="native harness conversation ID")
+    p.add_argument("--sandbox", help="scope to a full sandbox ID")
+    p.add_argument("--agent", choices=[*sorted(HARNESSES), "shell"], help="select the original conversation harness")
+    p.add_argument("--connect", "--attach", dest="legacy_restore_attach", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--cwd", help="remote conversation directory")
+    p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="set an environment variable when restoring compute")
+    p.add_argument("--env-passthrough", action="append", default=[], metavar="KEY", help="forward a local variable when restoring compute")
+    add_permission_flags(p)
+    add_resume_flags(p)
+    for flag in ("image", "disk", "lifetime"):
+        p.add_argument("--" + flag, help="override recovery configuration")
+    p.add_argument("--cpu", type=shell_cpu, help="override recovery CPUs")
+    p.add_argument("--memory", type=shell_memory, help="override recovery memory")
+    p.add_argument("--mode", choices=("serverless", "cks"), help="override recovery placement")
+    add_verbose_flag(p)
+    p.set_defaults(func=cmd_unified_resume)
+
+    p = sub.add_parser("restore", help="restore the latest snapshot into a fresh sandbox")
     p.add_argument("name")
     add_create_flags(p)
     p.add_argument("--checkpoint-dir", metavar="PATH", help="restore the exact committed checkpoint instead of the latest ordinary snapshot")
@@ -7686,6 +8126,7 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("session_id")
     q.add_argument("--agent", choices=sorted(set(HARNESSES) - {"ant", "openai"}), help="required for Devin/Cursor, otherwise inferred")
     q.add_argument("--cwd", help="remote project directory (default: saved session directory)")
+    add_resume_flags(q)
     q.set_defaults(func=cmd_session_resume)
 
     q = ssub.add_parser("restart", help="restart a stopped worktree agent without recreating its branch")
@@ -7752,22 +8193,34 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "command", None) in set(HARNESSES) - {"ant", "openai"}:
         command_parser = sub.choices[args.command]
         if hasattr(args, "session_id"):
-            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose"}
+            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose", "running_only", "no_attach", "allow_default_config", "no_config_sync", "cpu", "memory", "disk", "image", "mode", "lifetime", "env", "env_passthrough"}
+            explicit_fields = set()
             option_tokens = argv[:argv.index("--")] if "--" in argv else argv
             supplied_options = [token.partition("=")[0] for token in option_tokens if token.startswith("--")]
             for action in command_parser._actions:
                 explicit = any(option.startswith(token) for option in action.option_strings
                                for token in supplied_options)
+                if explicit:
+                    explicit_fields.add(action.dest)
                 if (action.dest not in resume_options
                         and (explicit or getattr(args, action.dest, action.default) != action.default)):
                     command_parser.error(f"{action.option_strings[0]} cannot be combined with --resume; "
                                          "resume continues an existing agent session")
             args.cwd = getattr(args, "cwd", None)
+            args.session_id = getattr(args, "session_id", None)
+            for key in ("cpu", "memory", "lifetime"):
+                if key not in explicit_fields:
+                    setattr(args, key, None)
             args.func = cmd_agent_resume
+        elif getattr(args, "no_attach", False) or getattr(args, "running_only", False):
+            command_parser.error("--no-attach and --running-only require --resume; use --detach when launching")
         elif hasattr(args, "cwd"):
             command_parser.error("--cwd requires --resume")
     try:
         return args.func(args)
+    except ValueError as error:
+        print("error: " + display_text(error, 500), file=sys.stderr)
+        return 2
     except CWSandboxAuthenticationError as error:
         if getattr(args, "command", None) == "shell":
             # The SDK also uses this class for permission/entitlement failures.
