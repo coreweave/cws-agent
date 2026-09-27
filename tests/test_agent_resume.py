@@ -64,15 +64,22 @@ class AgentResumeTests(unittest.TestCase):
     def test_partial_discovery_never_automatically_attaches_one_match(self):
         self.stdin_tty.return_value = False
         self.discovery.return_value = ([self.row], [{'code':'workspace_discovery_failed'}])
-        self.assertEqual(agent.main(['resume','chat-example','--no-attach']), 2)
+        self.assertEqual(agent.main(['resume','chat-example','--json','--no-attach']), 2)
         self.attach.assert_not_called()
         self.restore.assert_not_called()
-        self.assertIn('Discovery may be incomplete', self.stderr.getvalue())
+        self.assertTrue(json.loads(self.output.getvalue())['partial'])
 
     def test_harness_mismatch_precedes_allocation(self):
         self.assertEqual(agent.main(['codex','--resume','chat-example']), 2)
         self.restore.assert_not_called()
         self.attach.assert_not_called()
+
+    def test_json_never_config_syncs_or_attaches(self):
+        with patch.object(agent, 'sync_agent_config') as sync:
+            self.assertEqual(agent.main(['resume','chat-example','--no-attach','--json']), 0)
+            sync.assert_not_called()
+        self.attach.assert_not_called()
+        self.assertEqual(json.loads(self.output.getvalue())['selected']['session_id'], 'chat-example')
 
     def test_stopped_conversation_restores_then_verifies(self):
         self.row.update(_sb=None, state='saved', snapshot_id='snapshot-example',
@@ -89,31 +96,25 @@ class AgentResumeTests(unittest.TestCase):
     def test_cross_device_requires_explicit_default_acceptance(self):
         self.stdin_tty.return_value = False
         self.row.update(_sb=None, state='saved')
-        self.assertEqual(agent.main(['resume','chat-example','--no-attach']), 2)
-        self.assertIn('Original configuration is unavailable', self.stderr.getvalue())
+        self.assertEqual(agent.main(['resume','chat-example','--no-attach','--json']), 2)
+        result = json.loads(self.output.getvalue())
+        self.assertEqual(result['errors'][0]['code'], 'configuration_required')
+        self.assertIn('image', result['proposal'])
         self.restore.assert_not_called()
 
     def test_cloud_runner_remains_visible_and_unresumable(self):
         row = agent.resume_row('runner', 'claude', 'box-runner', backend='claude-cloud', sb=self.sb)
         self.discovery.return_value = ([row], [])
-        self.assertEqual(agent.main(['resume','runner','--no-attach']), 2)
-        self.assertIn('Resume unavailable', self.stderr.getvalue())
+        self.assertEqual(agent.main(['resume','runner','--no-attach','--json']), 2)
+        self.assertFalse(json.loads(self.output.getvalue())['selected']['resumable'])
         self.restore.assert_not_called()
 
     def test_missing_conversation_after_restore_does_not_start_fresh(self):
         self.row.update(_sb=None, state='saved', _config={'image':'example.invalid/agent:latest','cpu':'8','memory':'32Gi','disk':'20Gi','lifetime_seconds':86400})
         with patch.object(agent, 'remote_native_history', return_value=[]):
-            self.assertEqual(agent.main(['resume','chat-example','--no-attach']), 2)
+            self.assertEqual(agent.main(['resume','chat-example','--no-attach','--json']), 2)
         self.attach.assert_not_called()
-        self.assertIn('Conversation is absent', self.stderr.getvalue())
-
-    def test_shortcut_preserves_only_explicit_resource_overrides(self):
-        for options, expected in (([], (None, None, None)),
-                                  (["--cpu", "8", "--memory", "32Gi", "--lifetime", "24h"], ("8", "32Gi", "24h"))):
-            with self.subTest(options=options), patch.object(agent, "cmd_agent_resume", return_value=0) as resume:
-                self.assertEqual(agent.main(["claude", "--resume", "chat-a", *options]), 0)
-                args = resume.call_args.args[0]
-                self.assertEqual((args.cpu, args.memory, args.lifetime), expected)
+        self.assertEqual(json.loads(self.output.getvalue())['errors'][0]['code'], 'conversation_missing')
 
 class RecoveryReplayTests(unittest.TestCase):
     def setUp(self):

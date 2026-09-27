@@ -318,7 +318,7 @@ cws-agent connect my-claude
 ```
 
 If stopped, use `restore my-claude --connect`. To continue a saved agent session,
-use `session resume`. Connections don't reconnect automatically.
+use `cws-agent resume NAME --session SESSION_ID`. Connections don't reconnect automatically.
 
 ## Claude Remote Control
 

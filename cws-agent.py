@@ -3872,7 +3872,6 @@ def import_checklist(items, *, cancel_label="cancel command"):
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import HSplit, Layout, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
-    from prompt_toolkit.styles import Style
 
     groups = [(title, [item for item in items if item["kind"] == kind])
               for kind, title in (("skill", "Skills"), ("mcp", "Tools (MCP)"))]
@@ -3990,11 +3989,8 @@ def import_checklist(items, *, cancel_label="cancel command"):
         ]),
                dont_extend_height=True, wrap_lines=True),
     ])
-    style = {} if "NO_COLOR" in os.environ else {
-        "title": "bold ansicyan", "key": "bold ansicyan", "focus": "reverse",
-        "muted": "ansibrightblack", "warning": "ansiyellow"}
     app = Application(layout=Layout(layout, focused_element=control), key_bindings=keys,
-                      style=Style.from_dict(style), full_screen=False, erase_when_done=True)
+                      style=resume_style(), full_screen=False, erase_when_done=True)
     try:
         return app.run()
     except EOFError:
@@ -6535,9 +6531,7 @@ def cmd_list(args) -> int:
         started = format_started_at(getattr(b, "started_at", None))
         rows.append((name, harness, status, started, b.sandbox_id))
     header = ("NAME", "AGENT", "STATUS", "STARTED (LOCAL)", "SANDBOX")
-    widths = [max(len(str(r[i])) for r in rows + [header]) for i in range(len(header))]
-    for r in [header] + sorted(rows):
-        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)))
+    cli_table(header, sorted(rows))
     return 0
 
 
@@ -6571,10 +6565,9 @@ def cmd_status(args) -> int:
 
 
 def cmd_snapshots(args) -> int:
-    for s in session_snapshots(args.name):
-        mib = (s.size_bytes or 0) / (1 << 20)
-        print(f"{s.file_system_snapshot_id}  {s.status}  {mib:.1f} MiB  "
-              f"{s.created_at}  (from {s.source_sandbox_id})")
+    cli_table(("SNAPSHOT", "STATE", "SIZE", "SAVED", "SOURCE SANDBOX"), [
+        (s.file_system_snapshot_id, s.status, f"{(s.size_bytes or 0) / (1 << 20):.1f} MiB",
+         s.created_at, s.source_sandbox_id) for s in session_snapshots(args.name)])
     return 0
 
 
@@ -6929,10 +6922,8 @@ def cmd_session_history(args) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
-        print("AGENT   SESSION ID                            DIRECTORY")
-        for row in rows:
-            # JSON escaping keeps terminal control sequences in paths inert.
-            print(f'{row["agent"]:7} {row["id"]:37} {json.dumps(row["cwd"])}')
+        cli_table(("AGENT", "SESSION ID", "CONVERSATION", "UPDATED", "DIRECTORY"),
+                  [(r["agent"], r["id"], r.get("title") or "—", updated_label(r), r["cwd"]) for r in rows])
         if not rows:
             print("No saved Claude/Codex/OpenCode CLI conversations found.")
     if args.agent is None:
@@ -7626,6 +7617,30 @@ def updated_label(row):
 
 
 
+def public_resume_row(row):
+    from datetime import datetime, timezone
+    result = {k: v for k, v in row.items() if not k.startswith("_")}
+    for key in ("updated_at", "saved_at"):
+        value = result.get(key)
+        try:
+            result[key] = (datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+                           if type(value) in (int, float) and value >= 0 else None)
+        except (ValueError, OverflowError, OSError):
+            result[key] = None
+    return result
+
+
+
+def resume_result(args, *, rows=(), errors=(), selected=None, action=None, proposal=None, transfer=None):
+    result = {"schema_version": 1, "rows": [public_resume_row(r) for r in rows],
+              "errors": list(errors), "partial": any(e.get("code", "").endswith("discovery_failed") for e in errors), "action": action,
+              "selected": public_resume_row(selected) if selected else None, "proposal": proposal, "transfer": transfer}
+    if getattr(args, "json", False):
+        print(json.dumps(result))
+    return result
+
+
+
 def resolve_resume_rows(rows, args):
     target = getattr(args, "target", None)
     name = getattr(args, "name", None)
@@ -7703,44 +7718,116 @@ def restore_resume_row(row, args, config):
 
 
 
+def resume_style():
+    from prompt_toolkit.styles import Style
+    return Style.from_dict({} if "NO_COLOR" in os.environ else {
+        "title": "bold #79c0ff", "key": "bold #79c0ff", "heading": "bold #79c0ff", "focus": "bg:#24364b #ffffff", "muted": "#8b949e",
+        "accent": "#79c0ff", "warning": "#e3b341"})
+
+
+
+def resume_picker_lines(rows, cursor, *, title, query, warning, columns, height, expanded=False,
+                        search_label="Search", empty_label="No matching conversations"):
+    """Render conversation-first rows within the terminal's cell and line budget."""
+    from rich.console import Console
+    from rich.text import Text
+    from prompt_toolkit.utils import get_cwidth
+
+    width = max(12, columns - 1)
+    console = Console(width=width)
+
+    def clip(value, cells):
+        text = Text(display_text(value, 4096))
+        text.truncate(max(1, cells), overflow="ellipsis")
+        return text.plain
+
+    def wrap(value, count):
+        lines = [line.plain for line in Text(display_text(value, 4096)).wrap(console, width)]
+        if len(lines) > count:
+            lines[count - 1] = clip(lines[count - 1], width - 1).rstrip("…") + "…"
+        return lines[:count]
+
+    selected = rows[cursor % len(rows)] if rows else {}
+    preview = []
+    if selected:
+        label = selected.get("title") or selected.get("label") or selected.get("workspace") or "Workspace"
+        preview = [("class:heading", "Selected conversation" if selected.get("agent") else "Selected option")]
+        preview.extend(("", line) for line in wrap(label, 3 if expanded else 2))
+        if expanded:
+            for key, name in (("workspace", "Workspace"), ("session_id", "Session"),
+                              ("sandbox_id", "Sandbox"), ("cwd", "Directory")):
+                if selected.get(key):
+                    preview.extend(("class:muted", line) for line in wrap(f"{name}: {selected[key]}", 2))
+        excerpt = selected.get("reason") or selected.get("excerpt")
+        if excerpt and excerpt != label:
+            preview.extend(("class:muted", line) for line in wrap(excerpt, 6 if expanded else 2))
+        preview = preview[:max(2, min(16 if expanded else 5, height // 2 if expanded else height // 3))]
+    header = [("class:heading", clip(title, width)),
+              ("class:muted", clip(f"{search_label}: {query}   {cursor + 1 if rows else 0}/{len(rows)}", width)), ("", "")]
+    footer = [("class:warning", line) for line in wrap(warning, 2)] if warning else []
+    footer.extend(("class:muted", line) for line in wrap("↑/↓ move · Enter select · type to filter · Ctrl-O details · Esc cancel", 3))
+    row_height = 2 if any(r.get("agent") or r.get("state") for r in rows) else 1
+    capacity = max(1, (height - len(header) - len(preview) - len(footer) - 2) // row_height)
+    start = max(0, min(cursor - capacity + 1, len(rows) - capacity))
+    result = header
+    for i, row in enumerate(rows[start:start + capacity], start):
+        agent = row.get("backend") or row.get("agent")
+        label = row.get("title") or row.get("session_id") or row.get("label") or "Workspace"
+        if not agent:
+            label = f"{row.get('workspace', '')} · {label}"
+        style = "class:focus" if i == cursor else "class:muted" if not row.get("resumable", True) else ""
+        result.append((style, ("› " if i == cursor else "  ") + clip(label, width - 2)))
+        if row_height == 2:
+            name = f"{row.get('workspace', '')} ({agent})" if agent else row.get("workspace", "")
+            activity = updated_label(row)
+            if row.get("updated_at") is None and row.get("saved_at"):
+                activity = "Saved " + updated_label({"updated_at": row["saved_at"]})
+            metadata = clip(f"{activity} · {row.get('state', '')}", max(8, width // 2))
+            name_width = max(1, width - get_cwidth(metadata) - 4)
+            name = clip(name, name_width)
+            result.append((style if i == cursor else "class:muted",
+                           "  " + name + " " * (name_width - get_cwidth(name) + 2) + metadata))
+    if not rows:
+        result.append(("class:muted", empty_label))
+    if preview:
+        result.append(("", ""))
+        result.extend(preview)
+    result.extend(footer)
+    bounded = []
+    for style, line in result:
+        text = Text(line)
+        text.truncate(width, overflow="ellipsis")
+        bounded.append((style, text.plain + "\n"))
+    return bounded
+
+
+
 def resume_picker(rows, *, title="Resume a conversation", notice="",
                   search_label="Search", empty_label="No matching conversations"):
-    """Inline table shared by the global picker, narrowed choices and confirmations."""
+    """Shared conversation list, narrowed choices and confirmation controls."""
     from prompt_toolkit import Application
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import HSplit, Layout, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.keys import Keys
-    from prompt_toolkit.styles import Style
-    import shutil
-    cursor, query, warning = 0, "", notice
+    from prompt_toolkit.application import get_app
+    cursor, query, warning, expanded = 0, "", notice, False
     keys = KeyBindings()
 
     def matches():
         return [r for r in rows if query.lower() in " ".join(str(r.get(k) or "") for k in
-                ("workspace", "agent", "title", "session_id", "sandbox_id")).lower()]
+                ("workspace", "agent", "title", "excerpt", "session_id", "sandbox_id")).lower()]
 
     def content():
-        visible = matches()
-        width = max(20, min(60, shutil.get_terminal_size().columns - 57))
-        result = [("class:heading", title + "\n"), ("class:muted", f"{search_label}: {query}\n\n"),
-                  ("class:muted", f"  {'Workspace (agent)':26} {'Conversation':{width}} {'Updated':10} State\n")]
-        start = max(0, cursor - 9)
-        for i, row in enumerate(visible[start:start + 12], start):
-            agent = row.get("backend") or row.get("agent") or ""
-            workspace = display_text(row.get("workspace"), 16)
-            name = display_text(f"{workspace} ({agent})" if agent else workspace, 26)
-            label = display_text(row.get("title") or row.get("session_id") or row.get("label") or "Workspace", width)
-            style = "class:focus" if i == cursor else "class:muted" if not row.get("resumable", True) else ""
-            result.append((style, f"{'›' if i == cursor else ' '} {name:26} {label:{width}} {updated_label(row):10} {row.get('state', '')}\n"))
-        if not visible:
-            result.append(("class:muted", "  " + empty_label + "\n"))
-        chosen = visible[cursor % len(visible)] if visible else {}
-        detail = chosen.get("reason") or chosen.get("excerpt") or chosen.get("session_id") or ""
-        result.extend([("class:muted", "\n" + display_text(detail, 240) + "\n"),
-                       ("class:warning", display_text(warning, 240) + "\n"),
-                       ("class:muted", "↑/↓ move · Enter select · type to filter · Esc cancel")])
-        return result
+        size = get_app().output.get_size()
+        return resume_picker_lines(matches(), cursor, title=title, query=query, warning=warning,
+                                   columns=size.columns, height=size.rows, expanded=expanded,
+                                   search_label=search_label, empty_label=empty_label)
+
+    @keys.add("c-o")
+    def details(event):
+        nonlocal expanded
+        expanded = not expanded
 
     @keys.add("up")
     @keys.add("down")
@@ -7777,17 +7864,29 @@ def resume_picker(rows, *, title="Resume a conversation", notice="",
             query, cursor = (query + event.data)[:120], 0
 
     return Application(layout=Layout(HSplit([Window(FormattedTextControl(content), always_hide_cursor=True)])),
-                       key_bindings=keys, style=Style.from_dict({} if "NO_COLOR" in os.environ else {"focus": "reverse", "heading": "bold", "muted": "ansibrightblack", "warning": "ansiyellow"}), full_screen=False).run()
+                       key_bindings=keys, style=resume_style(), full_screen=False).run()
+
+
+
+def cli_table(headers, rows, *, muted=()):
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+    rows = [[display_text(value, 300) for value in row] for row in rows]
+    table = Table(box=None, pad_edge=False, header_style="bold #79c0ff")
+    for title in headers:
+        table.add_column(title)
+    for index, row in enumerate(rows):
+        table.add_row(*(Text(value) for value in row), style="dim" if index in muted else None)
+    width = None if sys.stdout.isatty() else max(80, sum(max([len(str(headers[i])), *[len(row[i]) for row in rows]]) for i in range(len(headers))) + 2 * len(headers))
+    Console(no_color="NO_COLOR" in os.environ, width=width).print(table)
 
 
 
 def render_resume_table(rows):
-    print("Workspace (agent) | Conversation | Updated | State")
-    for row in rows:
-        print(" | ".join(display_text(value, 300) for value in (
-            f"{row['workspace']} ({row.get('backend') or row['agent']})",
-            row.get("title") or row.get("session_id") or "Workspace",
-            updated_label(row), row["state"])))
+    cli_table(("Workspace (agent)", "Conversation", "Updated", "State"), [
+        (f"{r['workspace']} ({r.get('backend') or r['agent']})", r.get("title") or r.get("session_id") or "Workspace",
+         updated_label(r), r["state"]) for r in rows], muted={i for i,r in enumerate(rows) if not r["resumable"]})
 
 
 
@@ -7821,8 +7920,16 @@ def validate_resume_args(args):
 
 
 def cmd_unified_resume(args):
+    machine = getattr(args, "json", False)
     validate_resume_args(args)
-    upload_plan = directory_upload_plan(args)
+    if getattr(args, "list", False) and getattr(args, "dry_run", False):
+        raise ResumeInputError("Choose --list or --dry-run")
+    try:
+        upload_plan = directory_upload_plan(args)
+    except (ValueError, OSError, SystemExit) as error:
+        raise ResumeInputError(display_text(error, 500)) from None
+    if machine:
+        args.no_config_sync = True
     scoped_name = getattr(args, "name", None)
     scoped_box = getattr(args, "sandbox", None)
     if scoped_name and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", scoped_name):
@@ -7833,17 +7940,32 @@ def cmd_unified_resume(args):
     try:
         found = resolve_resume_rows(rows, args)
     except ValueError as error:
-        print(str(error), file=sys.stderr)
+        resume_result(args, errors=[{"code": "harness_mismatch", "message": str(error)}])
+        if not machine:
+            print(str(error), file=sys.stderr)
         return 2
+    if getattr(args, "list", False):
+        if machine:
+            resume_result(args, rows=found, errors=errors)
+        else:
+            render_resume_table(found)
+        return 0 if not errors else 2
     explicit = any(getattr(args, key, None) for key in ("target", "name", "sandbox", "session_id"))
     if not found:
         message = "No matching conversation or saved workspace. On another device, select the workspace name to discover its saved conversations."
-        print(message, file=sys.stderr)
+        resume_result(args, errors=[*errors, {"code": "not_found", "message": message}])
+        if not machine:
+            print(message, file=sys.stderr)
+        return 2
+    if machine and not any(getattr(args, flag, False) for flag in ("dry_run", "no_attach")):
+        resume_result(args, rows=found, errors=[*errors, {"code":"terminal_required", "message":"Use --list, --dry-run or --no-attach with --json"}])
         return 2
     if len(found) != 1 or not explicit or errors:
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
-            render_resume_table(found)
-            print("Choose a workspace and --session ID in a terminal." + (" Discovery may be incomplete." if errors else ""), file=sys.stderr)
+        if machine or not sys.stdin.isatty() or not sys.stdout.isatty():
+            resume_result(args, rows=found, errors=[*errors, {"code": "selection_required", "message": "Select a workspace and conversation explicitly"}])
+            if not machine:
+                render_resume_table(found)
+                print("Choose a workspace and --session ID in a terminal." + (" Discovery may be incomplete." if errors else ""), file=sys.stderr)
             return 2
         row = resume_picker(found, notice="Discovery incomplete; available results shown" if errors else "")
         if row is None:
@@ -7851,7 +7973,9 @@ def cmd_unified_resume(args):
     else:
         row = found[0]
     def fail(code, message, proposal=None):
-        print(message, file=sys.stderr)
+        resume_result(args, selected=row, errors=[{"code": code, "message": message}], proposal=proposal)
+        if not machine:
+            print(message, file=sys.stderr)
         return 2
     if not row["resumable"]:
         return fail("unresumable", row["reason"])
@@ -7861,8 +7985,21 @@ def cmd_unified_resume(args):
         config, missing = (None, False) if row["_sb"] else recovery_config(row, args)
     except (ValueError, argparse.ArgumentTypeError) as error:
         return fail("invalid_configuration", str(error))
+    action = "attach" if row["_sb"] else "restore"
+    if getattr(args, "dry_run", False):
+        resume_result(args, selected=row, errors=errors, action=action, proposal=config)
+        if not machine:
+            render_resume_table([row])
+            print("Would " + ("restore saved compute and resume this conversation." if action == "restore"
+                              else "resume this conversation on its running sandbox."))
+            if config:
+                cli_table(("Recovery setting", "Value"), [(key.replace("_", " "), str(value))
+                          for key, value in config.items() if value is not None])
+            if missing:
+                print("Original configuration is incomplete; confirmation is required before restoring.")
+        return 0
     if missing and not getattr(args, "allow_default_config", False):
-        if not sys.stdin.isatty():
+        if machine or not sys.stdin.isatty():
             return fail("configuration_required", "Original configuration is unavailable; review defaults before restoring", config)
         choice = resume_picker([
             {"workspace": "Restore", "title": "Restore with shown defaults", "resumable": True},
@@ -7893,9 +8030,11 @@ def cmd_unified_resume(args):
                     row["cwd"] = verified[0]["cwd"]
             elif history:
                 choices = [resume_row(row["workspace"], r["agent"], sb.sandbox_id, conversation=r, sb=sb) for r in history]
-                if not sys.stdin.isatty():
-                    render_resume_table(choices)
-                    print("Workspace restored; select a conversation in a terminal.", file=sys.stderr)
+                if machine or not sys.stdin.isatty():
+                    resume_result(args, rows=choices, selected=row, errors=[{"code":"selection_required", "message":"Workspace restored; select a conversation"}])
+                    if not machine:
+                        render_resume_table(choices)
+                        print("Workspace restored; select a conversation in a terminal.", file=sys.stderr)
                     return 2
                 choice = resume_picker(choices, title="Choose a saved conversation")
                 if choice is None:
@@ -7911,10 +8050,14 @@ def cmd_unified_resume(args):
             if check.returncode not in (0, None):
                 return fail("conversation_unavailable", f"Agent executable or working directory is unavailable. Sandbox {sb.sandbox_id} is running; inspect it before retrying")
         args.name = row["workspace"]
-        apply_directory_upload(sb, args, upload_plan)
+        transfer = apply_directory_upload(sb, args, upload_plan)
         if getattr(args, "no_attach", False):
-            print(f"Workspace ready: {row['workspace']} ({sb.sandbox_id})")
+            resume_result(args, selected=row, action=action, transfer=transfer)
+            if not machine:
+                print(f"Workspace ready: {row['workspace']} ({sb.sandbox_id})")
             return 0
+        if machine:
+            return fail("terminal_required", "Use --no-attach with --json to prepare a workspace")
         args.session_id, args.agent = row["session_id"], row["agent"]
         args.cwd = getattr(args, "cwd", None) or row.get("cwd")
         if row["agent"] == "shell":
@@ -7928,7 +8071,8 @@ def cmd_unified_resume(args):
     except (Exception, SystemExit) as error:
         return fail("resume_failed", f"Resume failed ({type(error).__name__}). Sandbox {sb.sandbox_id} remains running; inspect it before retrying, or stop with cws-agent stop {row['workspace']} --no-snapshot")
     finally:
-        print(f"Workspace is still running. Save and stop: cws-agent stop {row['workspace']}", file=sys.stderr)
+        if not machine:
+            print(f"Workspace is still running. Save and stop: cws-agent stop {row['workspace']}", file=sys.stderr)
 
 
 def cmd_agent_resume(args) -> int:
@@ -8143,9 +8287,7 @@ def cmd_session_ls(args) -> int:
     header = ("SESSION", "BRANCH", "AGENT", "CHANGES")
     table = [(r["name"], r["branch"], "running" if r["alive"] else "stopped",
               f'{r["changed"]} files') for r in rows]
-    widths = [max(len(str(x[i])) for x in table + [header]) for i in range(4)]
-    for row in [header] + table:
-        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(row)))
+    cli_table(header, table)
     return 0
 
 
@@ -8255,9 +8397,115 @@ def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) ->
                    help="copy a local env var into the sandbox (repeatable)")
 
 
+def resume_input_schema():
+    strings = ("target", "session_id", "sandbox", "agent", "cwd", "image", "cpu", "memory", "disk", "mode", "lifetime", "remote_path")
+    booleans = ("list", "dry_run", "no_attach", "running_only", "allow_default_config", "overwrite")
+    return {"$schema":"https://json-schema.org/draft/2020-12/schema", "title":"cws-agent resume input v1",
+            "type":"object", "additionalProperties":False,
+            "properties": {**{k:{"type":"string", "minLength":1} for k in strings},
+                           **{k:{"type":"boolean"} for k in booleans},
+                           "agent":{"type":"string", "enum":[*sorted(HARNESSES), "shell"]},
+                           "mode":{"type":"string", "enum":["serverless", "cks"]},
+                           "add_dir":{"type":"array", "items":{"type":"string", "minLength":1}},
+                           "schema_version":{"const":1}}}
+
+
+
+def cmd_resume_schema(args):
+    schema = {"schema_version":1, "input":resume_input_schema(),
+        "output":{"$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object",
+            "required":["schema_version", "rows", "errors", "partial", "action", "selected", "proposal", "transfer"],
+            "properties":{"schema_version":{"const":1}, "rows":{"type":"array", "items":{"$ref":"#/$defs/row"}},
+                "selected":{"anyOf":[{"$ref":"#/$defs/row"},{"type":"null"}]},
+                "partial":{"type":"boolean"}, "action":{"enum":[None,"attach","restore"]},
+                "proposal":{"type":["object","null"]}, "transfer":{"type":["object","null"]},
+                "errors":{"type":"array","items":{"type":"object","required":["code","message"],
+                    "properties":{"code":{"type":"string"},"message":{"type":"string"}}}}},
+            "$defs":{"row":{"type":"object","required":["workspace","agent","sandbox_id","session_id","resumable","state"],
+                "properties": {**{k:{"type":["string","null"]} for k in
+                    ("workspace","workspace_id","agent","sandbox_id","session_id","title","excerpt","cwd","updated_at","updated_source","saved_at","reason","snapshot_id","backend")},
+                    "state":{"enum":["live","saved","unavailable"]},"resumable":{"type":"boolean"}}}}}}
+    result = schema if args.topic else {"schema_version": 1, "commands": {"resume": schema}}
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+
+def read_resume_input(args, argv, parser):
+    from pathlib import Path
+    source = getattr(args, "input_json", None)
+    if not source:
+        return
+    if source == "-":
+        raw = sys.stdin.read((1 << 20) + 1)
+    elif source.startswith("@"):
+        with Path(source[1:]).expanduser().open() as stream:
+            raw = stream.read((1 << 20) + 1)
+    else:
+        raise ValueError("--input-json accepts @file or - for stdin")
+    if len(raw) > 1 << 20:
+        raise ValueError("JSON input exceeds 1 MiB")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON input key: " + key)
+            result[key] = value
+        return result
+    try:
+        data = json.loads(raw, object_pairs_hook=unique)
+    except RecursionError:
+        raise ValueError("JSON input nesting exceeds the parser limit") from None
+    schema = resume_input_schema()["properties"]
+    if not isinstance(data, dict) or set(data) - set(schema):
+        raise ValueError("JSON input must be an object with known resume fields")
+    command_parser = next(action.choices[args.command] for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+    if args.command == "session":
+        command_parser = next(action.choices[args.session_command] for action in command_parser._actions if isinstance(action, argparse._SubParsersAction))
+    option_tokens = [token.partition("=")[0] for token in argv if token.startswith("--")]
+    for key, value in data.items():
+        definition = schema[key]
+        if key == "schema_version":
+            valid = type(value) is int and value == 1
+        elif definition["type"] == "boolean":
+            valid = type(value) is bool
+        elif definition["type"] == "array":
+            valid = isinstance(value, list) and all(isinstance(v, str) and v for v in value)
+        else:
+            valid = isinstance(value, str) and bool(value)
+        if not valid or ("enum" in definition and value not in definition["enum"]):
+            raise ValueError("Invalid JSON input field: " + key)
+        if key == "agent" and args.command in HARNESSES and value != args.command:
+            raise ValueError("JSON agent conflicts with the harness shortcut; use cws-agent resume --agent AGENT")
+        if key != "schema_version":
+            previous = getattr(args, key, None)
+            action = next((a for a in command_parser._actions if a.dest == key), None)
+            if action is not None and action.type is not None:
+                try:
+                    value = ([action.type(item) for item in value] if definition["type"] == "array"
+                             else action.type(value))
+                except (ValueError, argparse.ArgumentTypeError, SystemExit):
+                    raise ValueError("Invalid JSON input field: " + key) from None
+            explicit = bool(action and any(option.startswith(token) for option in action.option_strings for token in option_tokens))
+            default = action.default if action else None
+            if previous not in (None, False, [], "") and previous != value and (explicit or previous != default):
+                raise ValueError("Conflicting CLI and JSON field: " + key)
+            setattr(args, key, value)
+    if getattr(args, "agent", None) not in (None, *HARNESSES, "shell"):
+        raise ValueError("Unknown agent")
+    args._resume_input_fields = list(data)
+    args.json = True
+
+
+
 def add_resume_flags(parser):
+    parser.add_argument("--input-json", metavar="@FILE|-", help="read versioned resume input; implies --json")
     parser.add_argument("--running-only", action="store_true", help="never allocate compute")
     parser.add_argument("--no-attach", action="store_true", help="prepare workspace without opening a terminal")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--list", action="store_true", help="list conversations without resuming")
+    modes.add_argument("--dry-run", action="store_true", help="show the proposed action without allocating")
+    parser.add_argument("--json", action="store_true", help="machine-readable results; never prompt or sync configuration")
     parser.add_argument("--allow-default-config", action="store_true", help="allow recovery with proposed defaults when configuration is unavailable")
     if "--no-config-sync" not in parser._option_string_actions:
         parser.add_argument("--no-config-sync", action="store_true", help="skip local configuration import")
@@ -8265,7 +8513,36 @@ def add_resume_flags(parser):
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
+    options = argv[:argv.index("--")] if "--" in argv else argv
+    machine = any(token == "--json" or token.split("=", 1)[0] == "--input-json" for token in options)
+    try:
+        return _main(argv, machine=machine)
+    except ResumeInputError as error:
+        if machine:
+            resume_result(argparse.Namespace(json=True), errors=[{"code":"invalid_input", "message":display_text(error, 500)}])
+        else:
+            print("error: " + display_text(error, 500), file=sys.stderr)
+        return 2
+
+
+def _main(argv, *, machine=False):
+    class CommandParser(argparse.ArgumentParser):
+        def _get_value(self, action, value):
+            try:
+                return super()._get_value(action, value)
+            except SystemExit as error:
+                if machine:
+                    raise ResumeInputError(str(error)) from None
+                raise
+
+        def error(self, message):
+            if machine:
+                if message.startswith("unrecognized arguments:"):
+                    message = "Unrecognized command arguments; see cws-agent resume --help"
+                raise ResumeInputError(message)
+            super().error(message)
+
+    parser = CommandParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
     add_verbose_flag(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -8407,8 +8684,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cpu", type=shell_cpu, help="override recovery CPUs")
     p.add_argument("--memory", type=shell_memory, help="override recovery memory")
     p.add_argument("--mode", choices=("serverless", "cks"), help="override recovery placement")
-    add_verbose_flag(p)
     add_directory_flags(p)
+    add_verbose_flag(p)
     p.set_defaults(func=cmd_unified_resume)
 
     p = sub.add_parser("restore", help="restore the latest snapshot into a fresh sandbox")
@@ -8558,12 +8835,22 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--yes", action="store_true", help="confirm explicitly selected imports without a prompt")
         p.set_defaults(func=cmd_config, preview=command == "preview")
 
+    p = sub.add_parser("schema", help="print a machine interface schema")
+    p.add_argument("topic", nargs="?", choices=["resume"], help="omit to describe all versioned machine interfaces")
+    p.set_defaults(func=cmd_resume_schema)
+
     args = parser.parse_args(argv)
+    try:
+        read_resume_input(args, argv, parser)
+    except (ValueError, OSError) as error:
+        args.json = True
+        resume_result(args, errors=[{"code":"invalid_input", "message":str(error)}])
+        return 2
     if getattr(args, "command", None) in set(HARNESSES) - {"ant", "openai"}:
         command_parser = sub.choices[args.command]
-        if hasattr(args, "session_id"):
-            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose", "running_only", "no_attach", "allow_default_config", "no_config_sync", "add_dir", "remote_path", "overwrite", "no_git", "exclude", "transfer_timeout", "cpu", "memory", "disk", "image", "mode", "lifetime", "env", "env_passthrough"}
-            explicit_fields = set()
+        if hasattr(args, "session_id") or any(getattr(args, k, False) for k in ("list", "dry_run", "json", "input_json")):
+            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose", "running_only", "no_attach", "list", "dry_run", "json", "allow_default_config", "no_config_sync", "add_dir", "remote_path", "overwrite", "no_git", "exclude", "transfer_timeout", "input_json", "cpu", "memory", "disk", "image", "mode", "lifetime", "env", "env_passthrough"}
+            explicit_fields = set(getattr(args, "_resume_input_fields", []))
             option_tokens = argv[:argv.index("--")] if "--" in argv else argv
             supplied_options = [token.partition("=")[0] for token in option_tokens if token.startswith("--")]
             for action in command_parser._actions:
@@ -8586,6 +8873,18 @@ def main(argv: list[str] | None = None) -> int:
         elif hasattr(args, "cwd"):
             command_parser.error("--cwd requires --resume")
     try:
+        if getattr(args, "json", False) and args.func in (cmd_unified_resume, cmd_agent_resume, cmd_session_resume):
+            try:
+                return args.func(args)
+            except ResumeInputError as error:
+                resume_result(args, errors=[{"code":"invalid_input", "message":display_text(error, 500)}])
+                return 2
+            except ResumeOperationError as error:
+                resume_result(args, errors=[{"code":"resume_failed", "message":display_text(error, 500)}])
+                return 2
+            except (Exception, SystemExit):
+                resume_result(args, errors=[{"code":"resume_failed", "message": "Resume failed; inspect workspace status before retrying"}])
+                return 2
         return args.func(args)
     except ValueError as error:
         print("error: " + display_text(error, 500), file=sys.stderr)

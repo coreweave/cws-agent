@@ -44,9 +44,11 @@ cws-agent claude project1 --resume SESSION_ID
 ```
 
 Use **↑** or **↓** to move, **Enter** to choose, and **Esc** to cancel. Type to filter.
-The picker shows the workspace, agent, conversation preview, activity, and state.
-Selecting a workspace with several saved conversations opens the same picker
-scoped to that workspace.
+Each conversation gets the available row width, with workspace, agent, activity,
+and state underneath. The selected preview wraps across multiple lines; press
+**Ctrl-O** for more detail. The list adjusts to your terminal size. Selecting a
+workspace with several saved conversations opens the same picker scoped to that
+workspace.
 
 The positional argument accepts a workspace name, sandbox ID, or the agent's own session
 ID. UUID-shaped IDs are checked in both namespaces. Ambiguous matches require a
@@ -120,6 +122,35 @@ migration is required.
 
 `stop NAME` saves a snapshot and stops compute. `down` remains a compatibility
 alias with the same flags and behavior. `stop --no-snapshot` skips saving.
+
+## Use resume from automation
+
+Use JSON input and output to integrate resume into scripts:
+
+```bash
+cws-agent resume --list --json
+cws-agent resume project1 --dry-run --json
+cws-agent resume --sandbox SANDBOX_ID --session SESSION_ID --no-attach --json
+cws-agent resume --input-json @resume.json
+cws-agent schema
+cws-agent schema resume
+```
+
+`--json` produces one versioned JSON result on stdout, sends progress to stderr,
+and disables prompts and configuration sync. It requires `--list`, `--dry-run`,
+or `--no-attach`. Results include nullable fields, UTC timestamps, timestamp
+provenance, resumability, and structured errors. Ambiguity or incomplete discovery
+returns available rows and a nonzero exit status. Missing recovery configuration
+returns a proposal. Review it before using `--allow-default-config`.
+
+JSON input uses `snake_case` field names, such as `session_id`, `no_attach`, and
+`add_dir`. Use `--input-json -` to read stdin. Unknown fields, duplicate keys, and
+conflicting CLI values are rejected. A harness shortcut also fixes the agent: JSON input
+cannot select Codex when using `cws-agent claude`. Invalid arguments return
+`invalid_input`; platform failures return `resume_failed` without exposing SDK
+error contents. `--dry-run` without `--json` shows a readable recovery preview.
+`schema` lists all versioned machine interfaces
+(currently resume); `schema resume` describes its accepted input and output.
 
 ## Several agents in one sandbox
 

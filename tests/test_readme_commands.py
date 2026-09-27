@@ -105,6 +105,7 @@ class ReadmeCommands(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_all_documented_cli_examples_parse_without_dispatch(self):
+        self.enterContext(patch.object(APP, "read_resume_input"))
         commands = list(documented_commands())
         self.assertTrue(commands, "README has no CLI examples to check")
         # Stub handlers before main builds its parser, so argparse resolves the
