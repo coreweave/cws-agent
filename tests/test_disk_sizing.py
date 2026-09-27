@@ -45,19 +45,22 @@ class DiskSizingTests(unittest.TestCase):
         with patch.object(cli, "cmd_launch", side_effect=lambda args: args):
             args = cli.main(["launch", "--name", "test", "--detach", *flags])
 
-        def scan(*args, **kwargs):
+        def scan(args):
+            if not args.add_dir:
+                return []
             events.append("scan")
             if scan_error:
                 raise scan_error
-            return inventory
+            self.last_plan = [{"size": inventory.total}] + [{"size": 0}] * max(0, len(inventory.entries) - 1)
+            return self.last_plan
 
         self.provision = None
         with contextlib.redirect_stdout(io.StringIO()) as output, \
-                patch.object(cli, "find_active", return_value=None), \
+                patch.object(cli.os.path, "isdir", return_value=True), patch.object(cli, "find_active", return_value=None), \
                 patch.object(cli, "build_env", return_value={}), \
-                patch.object(cli, "scan_local_dir", side_effect=scan) as scanning, \
+                patch.object(cli, "directory_upload_plan", side_effect=scan) as scanning, \
                 patch.object(cli, "provision_session", side_effect=lambda **kw: events.append("provision") or types.SimpleNamespace(sandbox_id="sb-example")) as provision, \
-                patch.object(cli, "sync_local_dir", side_effect=lambda *a, **kw: events.append("package/upload")) as sync:
+                patch.object(cli, "apply_directory_upload", side_effect=lambda *a, **kw: events.append("package/upload")) as sync:
             self.provision = provision
             self.assertEqual(cli.cmd_launch(args), 0)
         return events, scanning, provision, sync, output.getvalue()
@@ -70,9 +73,34 @@ class DiskSizingTests(unittest.TestCase):
                 events, scan, provision, sync, output = self.launch(flags + (["--verbose"] if verbose else []), inventory)
                 self.assertEqual(events, ["scan", "provision", "package/upload"])
                 self.assertEqual(provision.call_args.kwargs["disk"], "65Gi")
-                scan.assert_called_once_with("/project", include_git=False, extra_excludes=["data"])
-                self.assertIs(sync.call_args.kwargs["inventory"], inventory)
+                scan.assert_called_once()
+                self.assertTrue(scan.call_args.args[0].no_git)
+                self.assertEqual(scan.call_args.args[0].exclude, ["data"])
+                self.assertIs(sync.call_args.args[2], self.last_plan)
                 self.assertEqual("Automatic disk: 65Gi" in output, verbose)
+
+    def test_new_upload_forms_size_disk_before_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "large-file"
+            # Sparse file: exercise real stat/scan sizes without storing 12 GiB.
+            with source.open("wb") as stream:
+                stream.truncate(12 << 30)
+            other = root / "small-file"
+            other.write_text("small")
+            cases = (["--add-dir", str(source)],
+                     ["--add-dir", str(root), "--remote-path", "/workspace/project/custom/"],
+                     ["--add-dir", str(source), "--add-dir", str(other)])
+            for flags in cases:
+                with self.subTest(flags=flags), contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()), \
+                        patch.object(cli, "find_active", return_value=None), \
+                        patch.object(cli, "build_env", return_value={}), \
+                        patch.object(cli, "provision_session", return_value=types.SimpleNamespace(sandbox_id="sb-example")) as provision, \
+                        patch.object(cli, "apply_directory_upload"), \
+                        patch.object(cli, "automatic_snapshot"):
+                    self.assertEqual(cli.main(["claude", "example", "--detach", *flags]), 0)
+                self.assertEqual(provision.call_args.kwargs["disk"], "40Gi")
 
     def test_explicit_disk_is_not_overridden(self):
         _, _, provision, _, output = self.launch(["--local-dir", "/project", "--disk", "15Gi"], self.inventory(30 << 30))
@@ -80,8 +108,8 @@ class DiskSizingTests(unittest.TestCase):
         self.assertNotIn("Automatic disk:", output)
 
     def test_without_local_directory_keeps_10gi_and_does_not_scan(self):
-        _, scan, provision, sync, _ = self.launch([])
-        scan.assert_not_called()
+        events, scan, provision, sync, _ = self.launch([])
+        self.assertEqual(events, ["provision"])
         sync.assert_not_called()
         self.assertEqual(provision.call_args.kwargs["disk"], "10Gi")
 

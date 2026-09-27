@@ -126,7 +126,7 @@ alias with the same flags and behavior. `stop --no-snapshot` skips saving.
 Start an agent for each task in its own Git worktree and branch:
 
 ```bash
-cws-agent launch work --local-dir . --detach
+cws-agent launch work --add-dir . --detach
 cws-agent login work
 # Sign in, then exit the agent.
 cws-agent session start work fix-auth --prompt "Fix the login bug"
