@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end smoke test for cws-agent against the live platform.
-# Validates: launch+bootstrap (Claude Code install), snapshot, down,
+# Validates: launch+bootstrap (Claude Code install), snapshot, stop,
 # restore-from-snapshot (bootstrap restores the ephemeral binary), prune, cleanup.
 # Never prints credentials.
 set -euo pipefail
@@ -26,7 +26,7 @@ cleanup() {
   local code=$?
   trap - EXIT INT TERM
   if [ "$SMOKE_OWNS_SANDBOX" -eq 1 ]; then
-    "$DIR/cws-agent.py" down "$NAME" --no-snapshot >&2 || true
+    "$DIR/cws-agent.py" stop "$NAME" --no-snapshot >&2 || true
     "$DIR/cws-agent.py" prune "$NAME" --keep 0 >&2 || true
   fi
   exit "$code"
@@ -58,8 +58,8 @@ step "list"
 step "snapshot (while RUNNING)"
 "$DIR/cws-agent.py" snapshot "$NAME"
 
-step "down (snapshot + stop)"
-"$DIR/cws-agent.py" down "$NAME"
+step "stop (snapshot + stop)"
+"$DIR/cws-agent.py" stop "$NAME"
 
 step "restore (restore latest snapshot into a fresh sandbox)"
 "$DIR/cws-agent.py" restore "$NAME" --lifetime 30m
@@ -76,8 +76,8 @@ fi
 step "status after restore"
 "$DIR/cws-agent.py" status "$NAME"
 
-step "cleanup: down --no-snapshot + prune --keep 0"
-"$DIR/cws-agent.py" down "$NAME" --no-snapshot
+step "cleanup: stop --no-snapshot + prune --keep 0"
+"$DIR/cws-agent.py" stop "$NAME" --no-snapshot
 "$DIR/cws-agent.py" prune "$NAME" --keep 0
 SMOKE_OWNS_SANDBOX=0
 

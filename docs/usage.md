@@ -19,7 +19,7 @@ Names are optional for shortcuts and `launch`. When omitted, the CLI generates
 `HARNESS-` followed by 8 random lowercase hexadecimal characters, such as
 `claude-fa97da5d`. Claude Managed Agents uses the `anthropic-` prefix;
 `--claude-env` and `--outpost` select the worker's prefix. The generated name is
-printed during launch; use it with `connect`, `status`, or `down` afterward.
+printed during launch; use it with `connect`, `status`, or `stop` afterward.
 Pass `NAME` or `--name NAME` to choose your own name.
 
 Each `cws-agent AGENT [NAME]` shortcut is equivalent to
@@ -231,7 +231,7 @@ retry recovery, and restore from an exact committed snapshot.
 
 ```bash
 cws-agent snapshot my-claude          # save without stopping
-cws-agent down my-claude              # save and stop compute
+cws-agent stop my-claude              # save and stop compute
 cws-agent restore my-claude --connect  # restore and open the agent
 cws-agent snapshots my-claude          # list saved snapshots
 cws-agent prune my-claude --keep 3     # delete older READY snapshots

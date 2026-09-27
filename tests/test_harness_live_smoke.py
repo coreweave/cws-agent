@@ -33,7 +33,7 @@ class HarnessSmokeTests(unittest.TestCase):
         cli.take_snapshot.assert_not_called()
         cli.cmd_launch.assert_not_called()
         cli.cmd_restore.assert_not_called()
-        cli.cmd_down.assert_not_called()
+        cli.cmd_stop.assert_not_called()
         self.assertIn("does not prove model access", output.getvalue())
         self.assertIn("NOT TESTED", output.getvalue())
 

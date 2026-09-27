@@ -16,7 +16,7 @@ Use `cws-agent login cursor1` and open its browser link locally, or export
 cws-agent run cursor1 "Review the README"
 cws-agent session history cursor1 --agent cursor
 cws-agent session resume cursor1 CHAT_ID --agent cursor
-cws-agent down cursor1
+cws-agent stop cursor1
 cws-agent restore cursor1 --connect
 ```
 

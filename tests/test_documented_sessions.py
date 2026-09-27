@@ -396,23 +396,25 @@ class DocumentedSnapshotCommands(unittest.TestCase):
                 self.assertEqual(self.call([command, "dev1"]), 0)
         sb.stop.assert_not_called()
 
-    def test_down_snapshots_before_stopping_and_no_snapshot_skips_it(self):
-        for skip in (False, True):
-            calls = []
-            sb = types.SimpleNamespace(sandbox_id="box", stop=lambda: (calls.append("stop") or operation(None)))
-            with patch.object(app, "require_active", return_value=sb), \
-                    patch.object(app, "probe_session_meta", return_value=("dev1", "claude")), \
-                    patch.object(app, "take_snapshot", side_effect=lambda *args: (calls.append("snapshot") or "snap")):
-                self.assertEqual(self.call(["down", "dev1"] + (["--no-snapshot"] if skip else [])), 0)
-            self.assertEqual(calls, ["stop"] if skip else ["snapshot", "stop"])
+    def test_stop_and_down_save_before_stopping_and_can_skip_saving(self):
+        for command in ("stop", "down"):
+            for skip in (False, True):
+                with self.subTest(command=command, skip=skip):
+                    calls = []
+                    sb = types.SimpleNamespace(sandbox_id="box", stop=lambda: (calls.append("stop") or operation(None)))
+                    with patch.object(app, "require_active", return_value=sb), \
+                            patch.object(app, "probe_session_meta", return_value=("dev1", "claude")), \
+                            patch.object(app, "take_snapshot", side_effect=lambda *args: (calls.append("snapshot") or "snap")):
+                        self.assertEqual(self.call([command, "dev1"] + (["--no-snapshot"] if skip else [])), 0)
+                    self.assertEqual(calls, ["stop"] if skip else ["snapshot", "stop"])
 
-    def test_snapshot_failure_prevents_down_from_stopping(self):
+    def test_snapshot_failure_prevents_stop_from_stopping(self):
         sb = types.SimpleNamespace(sandbox_id="box", stop=Mock())
         with patch.object(app, "require_active", return_value=sb), \
                 patch.object(app, "probe_session_meta", return_value=("dev1", "claude")), \
                 patch.object(app, "take_snapshot", side_effect=RuntimeError("snapshot failed")), \
                 self.assertRaises(RuntimeError):
-            self.call(["down", "dev1"])
+            self.call(["stop", "dev1"])
         sb.stop.assert_not_called()
 
     def test_prune_deletes_only_old_ready_snapshots(self):
@@ -498,7 +500,7 @@ if args[0] == "exec":
     def test_failure_after_launch_cleans_up_owned_resources_and_preserves_exit(self):
         completed = self.run_smoke(SMOKE_FAKE_FAIL="snapshot")
         self.assertEqual(completed.returncode, 7, completed.stderr)
-        self.assertEqual([call[0] for call in self.calls()][-2:], ["down", "prune"])
+        self.assertEqual([call[0] for call in self.calls()][-2:], ["stop", "prune"])
         self.assertIn("--no-snapshot", self.calls()[-2])
         self.assertEqual(self.calls()[-1][-2:], ["--keep", "0"])
 

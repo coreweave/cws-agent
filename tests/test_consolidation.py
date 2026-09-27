@@ -41,7 +41,7 @@ class ConsolidationTests(unittest.TestCase):
     def test_cli_command_families_and_subcommands_are_retained_once(self):
         top = subcommands(cli_parser())  # argparse rejects duplicate registrations
         self.assertEqual(set(top), {"shell", "launch", "anthropic", "claude", "codex", "cursor", "devin", "openai", "opencode", "connect", "attach", "run", "login", "exec", "sync", "uploads",
-                                    "snapshot", "checkpoint", "down", "restore", "resume", "list", "status", "snapshots",
+                                    "snapshot", "checkpoint", "stop", "down", "restore", "resume", "list", "status", "snapshots",
                                     "prune", "rc", "session", "bridge", "discord", "config"})
         self.assertEqual(set(subcommands(top["session"])),
                          {"start", "attach", "ls", "history", "transfer", "resume", "restart", "diff", "stop"})

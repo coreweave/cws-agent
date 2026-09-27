@@ -46,7 +46,7 @@ through the Agents API.
 ```bash
 cws-agent status api1
 cws-agent connect api1                  # open a project shell
-cws-agent down api1                     # snapshot files and stop compute
+cws-agent stop api1                     # snapshot files and stop compute
 cws-agent restore api1                  # reconnect the same API session
 cws-agent run api1 "Continue the previous task"
 ```

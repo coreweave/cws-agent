@@ -38,11 +38,11 @@ do not drive Managed Agents conversations.
 
 ```bash
 cws-agent connect claudebox --cmd 'tmux attach -t claude-0'
-cws-agent down claudebox
+cws-agent stop claudebox
 cws-agent restore claudebox
 ```
 
-Detach from logs with **Ctrl-b, d** before running `down`. Restore starts workers
+Detach from logs with **Ctrl-b, d** before running `stop`. Restore starts workers
 with the saved environment and count; re-export `ANTHROPIC_ENVIRONMENT_KEY` first.
 Override them with `--claude-env` and `--workers`.
 
@@ -61,7 +61,7 @@ Select the outpost in Devin Cloud when starting a session, or use its
 [Slack integration](https://docs.devin.ai/integrations/slack).
 This is separate from the interactive `--agent devin` CLI.
 
-Detach from logs with **Ctrl-b, d**. Use `down devinbox` to snapshot and stop;
+Detach from logs with **Ctrl-b, d**. Use `stop devinbox` to snapshot and stop;
 `restore devinbox` starts workers with the saved outpost and count. Re-export
 `DEVIN_OUTPOSTS_TOKEN` first; use `--outpost` or `--workers` to override.
 Snapshots preserve files, not running processes or provider conversations.

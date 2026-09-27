@@ -53,7 +53,7 @@ def main(argv=None):
             raise RuntimeError("follow-up failed")
         verify_file(cli, name, nonce + "-continued")
         report["checks"].append("follow-up changed the file in the same API session")
-        if cli.main(["down", name]) != 0:
+        if cli.main(["stop", name]) != 0:
             raise RuntimeError("snapshot and stop failed")
         if cli.main(["restore", name, "--lifetime", "15m"]) != 0:
             raise RuntimeError("restore failed")

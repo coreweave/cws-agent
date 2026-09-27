@@ -137,3 +137,17 @@ with different limits. Cursor transfer is unsupported. Devin offers
 [ATIF export](https://docs.devin.ai/cli/reference/commands), but no supported native
 import; its history and [Outpost sessions](https://docs.devin.ai/cloud/outposts/overview)
 cannot be transferred here.
+
+## Saved workspace metadata
+
+`stop` saves a snapshot before stopping compute; `down` remains an alias.
+New launches record workspace identity and creation settings automatically.
+Snapshots keep a best-effort local index of native conversation IDs, previews,
+and activity under `~/.local/state/cws-agent/workspaces/`. Environment variable
+names are recorded; their values are not. No manual metadata migration is needed.
+
+Native history includes bounded previews from Claude and Codex transcripts and
+OpenCode metadata. Activity comes from message or harness timestamps when
+available; file modification time is identified as an approximation. There are
+no background listeners. Conversation previews may contain private text, so treat
+the local catalog like your agent history.
