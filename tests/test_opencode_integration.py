@@ -80,7 +80,7 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         flags = agent.permission_flags(harness, bypass)
         invocation, env = self.invoke_launcher(["run", *shlex.split(flags), "--", "hello"],
                                                 {"OPENCODE_PERMISSION": '{"bash":"deny"}'})
-        self.assertIn("--auto", invocation[1])
+        self.assertEqual(invocation[1][1:], ["run", "--auto", "--", "hello"])
         self.assertEqual(env["OPENCODE_PERMISSION"], '{"bash":"deny"}')
         self.assertFalse(any(arg.startswith("--cws-") for arg in invocation[1]))
 

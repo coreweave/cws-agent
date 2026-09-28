@@ -245,3 +245,17 @@ class LifecycleNameTests(unittest.TestCase):
         self.assertEqual(result.exception.code, 0)
         self.assertIn("connect (attach)", output.getvalue())
         self.assertIn("restore (resume)", output.getvalue())
+
+    def test_stop_and_down_share_all_lifecycle_and_checkpoint_options(self):
+        parser = cli_parser()
+        commands = subcommands(parser)
+        self.assertIs(commands["stop"], commands["down"])
+        for options in ([], ["--no-snapshot"],
+                        ["--checkpoint-dir", "/tmp/example-checkpoint", "--writer-gate", "/workspace/gate", "--checkpoint-timeout", "120"],
+                        ["--abort-checkpoint"]):
+            canonical = vars(parser.parse_args(["stop", "example", *options])).copy()
+            legacy = vars(parser.parse_args(["down", "example", *options])).copy()
+            canonical.pop("command")
+            legacy.pop("command")
+            self.assertEqual(canonical, legacy)
+            self.assertEqual(canonical["func"], agent.cmd_stop)

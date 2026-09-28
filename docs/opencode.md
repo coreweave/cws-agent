@@ -33,7 +33,7 @@ Select another [W&B catalog model](https://docs.wandb.ai/inference/models) with
 ```sh
 cws-agent session history open-wandb --agent opencode
 cws-agent session resume open-wandb ses_EXAMPLE --agent opencode
-cws-agent down open-wandb
+cws-agent stop open-wandb
 cws-agent restore open-wandb --wandb --connect
 ```
 

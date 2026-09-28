@@ -80,13 +80,15 @@ class NewAgentWorkflowTests(unittest.TestCase):
         self.assertIn("cd '/workspace/project with spaces' && exec cursor-agent --resume chat-test", command)
         self.assertNotIn("--force", command)
 
-    def test_opencode_history_uses_native_metadata_api_and_omits_titles(self):
+    def test_opencode_history_uses_native_metadata_api_with_titles(self):
         output = json.dumps([{"id": "ses_test", "directory": "/work", "updated": 1000,
                               "title": "private conversation title"}])
         with patch("shutil.which", return_value="/bin/opencode"), \
                 patch("subprocess.run", return_value=result(output)) as run:
             rows = cli.scan_opencode_history()
-        self.assertEqual(rows, [{"agent": "opencode", "id": "ses_test", "cwd": "/work", "modified": 1.0}])
+        self.assertEqual(rows[0]["id"], "ses_test")
+        self.assertEqual(rows[0]["title"], "private conversation title")
+        self.assertEqual(rows[0]["updated_source"], "harness")
         self.assertEqual(run.call_args.args[0], ["/bin/opencode", "session", "list", "--format", "json", "--max-count", "1000"])
 
     def test_opencode_history_missing_binary_and_invalid_response(self):

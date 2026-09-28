@@ -30,6 +30,7 @@ def arguments(command, *extra):
 
 class OpenAIAgentsTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(agent, "read_workspace_document", return_value={}))
         self.client = MagicMock()
         self.client.__enter__.return_value = self.client
         self.client.beta.agents.sessions.create.return_value = session()

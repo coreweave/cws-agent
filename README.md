@@ -54,7 +54,7 @@ cws-agent shell dev1
 cws-agent shell gpu1 --gpu any:1
 ```
 
-Exiting leaves the sandbox running. Stop it with `cws-agent down dev1 --no-snapshot`.
+Exiting leaves the sandbox running. Stop it with `cws-agent stop dev1 --no-snapshot`.
 See the [shell guide](docs/shell.md) for images, files, secrets, snapshots, and CKS volumes.
 
 ## Bring your skills and tools
@@ -102,11 +102,11 @@ select an agent session. [Sessions guide](docs/sessions.md).
 ## Save your work and stop compute
 
 ```bash
-cws-agent down SANDBOX
+cws-agent stop SANDBOX
 cws-agent restore SANDBOX --connect
 ```
 
-`down` snapshots your workspace and stops the sandbox; `restore` brings the files
+`stop` snapshots your workspace and stops the sandbox; `restore` brings the files
 back. Exiting the agent alone leaves compute running. [Snapshot details](docs/usage.md#snapshots).
 
 ## Self-hosted sandboxes

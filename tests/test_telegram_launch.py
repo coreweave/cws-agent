@@ -72,7 +72,7 @@ class TelegramLaunchTests(unittest.TestCase):
             self.assertEqual(app.start_launched_telegram(object(), app.HARNESSES["claude"], self.args(), {}), 130)
         bridge.assert_not_called()
         stop.assert_not_called()
-        self.assertIn("cws-agent down tg-new", output.getvalue())
+        self.assertIn("cws-agent stop tg-new", output.getvalue())
 
     def test_incompatible_flags_fail_before_cloud_calls(self):
         for flags in [("--detach",), ("--claude-env", "env_test"), ("--outpost", "outpost")]:

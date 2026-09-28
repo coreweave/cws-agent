@@ -27,7 +27,7 @@ Run `cws-agent shell dev1` again to open a new shell in the same sandbox.
 To stop it without saving a new snapshot, run locally:
 
 ```bash
-cws-agent down dev1 --no-snapshot
+cws-agent stop dev1 --no-snapshot
 ```
 
 New sandboxes have an 8-hour maximum lifetime. Reconnecting doesn't extend it or
@@ -156,10 +156,10 @@ options except W&B secrets.
 
 ## Save work and stop compute
 
-`down` snapshots `/workspace` and stops the sandbox. In your local terminal, run:
+`stop` snapshots `/workspace` and stops the sandbox. In your local terminal, run:
 
 ```bash
-cws-agent down dev1
+cws-agent stop dev1
 cws-agent shell restored1 --snapshot dev1
 ```
 

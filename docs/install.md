@@ -53,5 +53,5 @@ so normal use only needs `cws-agent shell test-shell`.
 After exiting the remote shell, stop the test sandbox from the same checkout:
 
 ```bash
-uv run --script cws-agent.py down test-shell --no-snapshot
+uv run --script cws-agent.py stop test-shell --no-snapshot
 ```

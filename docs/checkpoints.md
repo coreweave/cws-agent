@@ -2,7 +2,7 @@
 
 [Back to everyday usage](usage.md#snapshots).
 
-`down --checkpoint-dir` is an opt-in integration for applications that control
+`stop --checkpoint-dir` is an opt-in integration for applications that control
 every writer to a sandbox. It records a snapshot request, waits for its READY
 receipt, commits a local manifest, and then stops the source. Retrying the same
 directory recovers that operation instead of creating a different checkpoint.
@@ -64,7 +64,7 @@ each checkpoint generation. The example assumes your gate is installed at
 `/opt/example/writer-gate` and the parent directory exists:
 
 ```bash
-cws-agent down project1 --checkpoint-dir ./project1-checkpoint \
+cws-agent stop project1 --checkpoint-dir ./project1-checkpoint \
   --writer-gate /opt/example/writer-gate --checkpoint-timeout 180
 ```
 
@@ -79,7 +79,7 @@ Before commit, failures leave the source unstopped by this command and the gate
 held. To abandon that generation and reopen writers:
 
 ```bash
-cws-agent down project1 --checkpoint-dir ./project1-checkpoint \
+cws-agent stop project1 --checkpoint-dir ./project1-checkpoint \
   --writer-gate /opt/example/writer-gate --abort-checkpoint
 ```
 

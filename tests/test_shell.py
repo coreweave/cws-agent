@@ -100,7 +100,7 @@ class ShellTests(unittest.TestCase):
     def test_new_sandbox_explains_lifecycle_before_command(self):
         def attach(*args, **kwargs):
             self.assertIn("will keep running after this command exits", self.stderr.getvalue())
-            self.assertIn("cws-agent down dev1 --no-snapshot", self.stderr.getvalue())
+            self.assertIn("cws-agent stop dev1 --no-snapshot", self.stderr.getvalue())
             return 0
         self.pty.side_effect = attach
         self.assertEqual(self.invoke("dev1"), 0)

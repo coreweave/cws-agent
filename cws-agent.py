@@ -40,7 +40,7 @@ Usage:
     cws-agent shell   dev1 [--gpu any:1] [--cmd nvidia-smi]
     cws-agent run     dev1 "fix the failing test" [--yolo]
     cws-agent snapshot dev1
-    cws-agent down    dev1 [--no-snapshot]
+    cws-agent stop    dev1 [--no-snapshot]
     cws-agent restore  dev1 [--connect]
     cws-agent list / status dev1 / snapshots dev1
     cws-agent session start|attach|ls|diff|stop   # parallel agents, one worktree each
@@ -440,7 +440,8 @@ if mode == "accept-edits":
         sys.exit("error: could not safely read OpenCode permissions; run with --permission-mode native or repair its config")
 elif mode == "bypass":
     # Auto mode still honors explicit deny rules from OpenCode configuration.
-    args.insert(0, "--auto")
+    # The native parser needs the subcommand before its boolean flags.
+    args.insert(1 if args and args[0] == "run" else 0, "--auto")
 os.execv(binary, [binary, *args])
 ''')
 launcher.chmod(0o755)
@@ -720,6 +721,17 @@ def harness_from_request_id(request_id: str | None) -> str | None:
 
 
 def take_snapshot(sb: Sandbox, name: str, harness_name: str) -> str:
+    # Capture the catalog at the save boundary, without monitoring agent output.
+    record = snapshot_catalog_record(sb, name, harness_name)
+    snapshot_id = capture_workspace_snapshot(sb, name, harness_name)
+    if record is not None:
+        record["snapshot_id"] = snapshot_id
+        record["saved_at"] = time.time()
+        update_workspace_catalog(record)
+    return snapshot_id
+
+
+def capture_workspace_snapshot(sb: Sandbox, name: str, harness_name: str) -> str:
     """Make FSS-compatible placeholders, then restore live links and permissions."""
     if harness_name == "shell":
         # Plain shell images need not contain Python or the agent metadata helper.
@@ -1227,7 +1239,7 @@ def checkpoint_restore(directory, name):
         coordinator = CheckpointCoordinator(journal, 60)
         manifest, _ = coordinator.manifest(state)
         if manifest is None or state["phase"] != "SUSPENDED" or not state.get("gate_released"):
-            raise CheckpointError("finish checkpoint down recovery before restoring")
+            raise CheckpointError("finish checkpoint stop recovery before restoring")
         snapshot = coordinator.receipt(plan, state["snapshot_id"])
         if checkpoint_status(snapshot.status) != "ready":
             raise CheckpointError("committed snapshot is no longer READY")
@@ -1554,6 +1566,11 @@ def provision_session(*, name: str, harness: Harness, repo_url: str | None,
             if create_kwargs.get("restore_snapshot_id"):
                 snapshot_metadata(sb, "restore-snapshot")
             run_bootstrap(sb, harness, repo_url)
+            save_workspace_metadata(sb, name, harness.name, {
+                "env_names": sorted(create_kwargs.get("env", {})),
+                **{key: create_kwargs.get(key) for key in
+                ("image", "cpu", "memory", "disk", "mode", "lifetime_seconds")}
+            }, restore_snapshot_id=create_kwargs.get("restore_snapshot_id"))
             return sb
         except (Exception, SystemExit, KeyboardInterrupt) as e:
             stop_failed_sandbox(sb)
@@ -1596,6 +1613,140 @@ def stop_failed_sandbox(sb: Sandbox) -> None:
 BACKEND_STATE = f"{MOUNT_PATH}/.cws-agent-backend.json"
 
 
+def read_workspace_document(sb) -> dict:
+    result = exec_retry(sb, ["sh", "-c",
+        f"test ! -L {BACKEND_STATE} || exit 1; "
+        f"if [ -f {BACKEND_STATE} ]; then head -c 262145 {BACKEND_STATE}; fi"],
+        timeout_seconds=15, attempts=1)
+    if result.returncode not in (0, None):
+        raise ValueError("workspace metadata is unreadable")
+    raw = result.stdout or ""
+    if len(raw) > 262144:
+        raise ValueError("workspace metadata is too large")
+    document = json.loads(raw) if raw.strip() else {}
+    if not isinstance(document, dict) or type(document.get("version", 1)) is not int or document.get("version", 1) not in (1, 2):
+        raise ValueError("unsupported workspace metadata")
+    return document
+
+
+def workspace_metadata(document: dict) -> dict | None:
+    data = document.get("workspace")
+    if data is None:
+        return None
+    if (not isinstance(data, dict) or not isinstance(data.get("id"), str)
+            or not re.fullmatch(r"[a-f0-9]{32}", data["id"])
+            or not NAME_RE.fullmatch(str(data.get("name", "")))
+            or data.get("agent") not in (*HARNESSES, "shell")
+            or not isinstance(data.get("config"), dict)
+            or not isinstance(data.get("sandbox_ids", []), list)
+            or len(data.get("sandbox_ids", [])) > 1000
+            or any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", value)
+                   for value in data.get("sandbox_ids", []))):
+        raise ValueError("invalid workspace metadata")
+    return {key: data[key] for key in ("id", "name", "agent", "config", "sandbox_ids") if key in data}
+
+
+def write_workspace_document(sb, document):
+    import uuid
+    temporary = f"{BACKEND_STATE}.{uuid.uuid4().hex}.tmp"
+    try:
+        sb.write_file(temporary, json.dumps(document).encode()).result(timeout=30)
+        result = exec_retry(sb, ["sh", "-c",
+            f"test ! -L {BACKEND_STATE} && chmod 600 {shlex.quote(temporary)} "
+            f"&& mv -f {shlex.quote(temporary)} {BACKEND_STATE}"], attempts=1, timeout_seconds=15)
+        if result.returncode not in (0, None):
+            raise ValueError("could not save workspace metadata")
+    finally:
+        try:
+            exec_retry(sb, ["rm", "-f", temporary], attempts=1, timeout_seconds=15)
+        except Exception:
+            pass
+
+
+def save_workspace_metadata(sb, name, agent, config, *, restore_snapshot_id=None):
+    import uuid
+    document = read_workspace_document(sb)
+    # Identity and lineage are client-authorized, just like recovery configuration.
+    previous = next((record for record in read_workspace_catalog()
+                     if (restore_snapshot_id and record.get("snapshot_id") == restore_snapshot_id)
+                     or (not record.get("snapshot_id") and record["sandbox_id"] == sb.sandbox_id)), {})
+    ids = list(previous.get("sandbox_ids", []))
+    if sb.sandbox_id not in ids:
+        ids.append(sb.sandbox_id)
+    data = {"id": previous.get("id") or uuid.uuid4().hex,
+            "name": name, "agent": agent, "config": config, "sandbox_ids": ids[-1000:]}
+    # Preserve v1 worker fields; CLI/shell-only documents use a v2 envelope.
+    document.update(version=document.get("version", 2), workspace=data)
+    write_workspace_document(sb, document)
+    update_workspace_catalog({**data, "sandbox_id": sb.sandbox_id, "observed_at": time.time()})
+    return data
+
+
+def catalog_directory():
+    from pathlib import Path
+    import hashlib
+    # Cached records are used only after joining current authorized platform IDs.
+    # Credentials never become filenames, metadata, or catalog values.
+    scope = os.environ.get("CWSANDBOX_BASE_URL", "default") + "|" + str(sandbox_auth())
+    return (Path.home() / ".local/state/cws-agent/workspaces" /
+            hashlib.sha256(scope.encode()).hexdigest()[:24])
+
+
+def read_workspace_catalog():
+    directory = catalog_directory()
+    records = []
+    if directory.is_symlink() or not directory.is_dir():
+        return records
+    for path in directory.glob("*.json"):
+        try:
+            if path.is_symlink() or path.stat().st_size > 2 << 20:
+                continue
+            record = json.loads(path.read_text())
+            if isinstance(record, dict) and isinstance(record.get("sandbox_id"), str):
+                records.append(record)
+        except (OSError, ValueError):
+            continue
+    return records
+
+
+def update_workspace_catalog(record):
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    temporary = None
+    try:
+        directory = catalog_directory()
+        if directory.is_symlink():
+            raise OSError("unsafe catalog directory")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        identity = record.get("snapshot_id") or record["sandbox_id"]
+        target = directory / (hashlib.sha256(identity.encode()).hexdigest() + ".json")
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix=".record-")
+        with os.fdopen(fd, "w") as output:
+            json.dump(record, output)
+        os.replace(temporary, target)
+    except (OSError, ValueError, KeyError):
+        print("warning: workspace catalog could not be saved; recovery discovery may be limited", file=sys.stderr)
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def snapshot_catalog_record(sb, name, harness_name):
+    try:
+        document = read_workspace_document(sb)
+        worker = document.get("kind") or (document.get("backend") or {}).get("kind")
+        history = [] if worker or harness_name == "shell" else remote_native_history(sb)
+        trusted = next((r for r in read_workspace_catalog() if r["sandbox_id"] == sb.sandbox_id and not r.get("snapshot_id")), {})
+        return {"id": trusted.get("id"), "name": name, "agent": harness_name,
+                "sandbox_ids": trusted.get("sandbox_ids", [sb.sandbox_id]),
+                "config": trusted.get("config"), "sandbox_id": sb.sandbox_id, "conversations": history,
+                "coverage": "observed", "observed_at": time.time(), "backend": worker}
+    except (Exception, SystemExit):
+        # A best-effort index must not prevent the explicit backup itself.
+        return None
+
+
 def backend_config(kind: str, target: str, workers: int) -> dict:
     if kind not in ("claude", "outpost", "openai"):
         raise SystemExit("error: unrecognized saved worker backend")
@@ -1619,6 +1770,13 @@ def read_backend_config(sb: Sandbox) -> dict | None:
         return None
     try:
         state = json.loads(result.stdout)
+        if state.get("version") == 2:
+            if "kind" in state or workspace_metadata(state) is None:
+                raise ValueError("invalid workspace envelope")
+            workspace_metadata(state)
+            state = state.get("backend")
+            if state is None:
+                return None
         if type(state.get("version")) is not int or state["version"] != 1:
             raise ValueError("unsupported version")
         return backend_config(state["kind"], state["target"], state["workers"])
@@ -1634,6 +1792,9 @@ def start_backend(sb: Sandbox, state: dict, name: str, env: dict) -> None:
     if not env.get(key):
         raise SystemExit(f"error: export {key} again before resuming this worker backend; "
                          "container environment credentials are not included in snapshots")
+    document = read_workspace_document(sb)
+    if document.get("workspace"):
+        state = {**state, "workspace": document["workspace"]}
     sb.write_file(BACKEND_STATE, json.dumps(state).encode()).result(timeout=30)
     if state["kind"] == "openai":
         start_openai_executor(sb, state["target"])
@@ -2557,7 +2718,7 @@ def sync_local_dir(sb: Sandbox, local_dir: str, *, include_git: bool,
             raise UploadPaused(f"error: upload paused ({detail}). Cached archive and remote chunks retained.\n"
                                f"Resume: {recovery}\n"
                                "The sandbox remains billable until stopped or its original lifetime expires.\n"
-                               f"Stop: cws-agent down {name} --no-snapshot\n"
+                               f"Stop: cws-agent stop {name} --no-snapshot\n"
                                f"Local cache: {folder} (discard: cws-agent uploads --discard {folder.name})") from None
         try:
             discard_upload(folder)
@@ -4088,7 +4249,8 @@ def launch_session(args) -> int:
         configure_wandb_opencode(sb, wandb_config)
         if state and state["kind"] == "openai":
             # An interrupted, resumable upload must retain its API mapping.
-            sb.write_file(BACKEND_STATE, json.dumps(state).encode()).result(timeout=30)
+            saved_workspace = read_workspace_document(sb).get("workspace")
+            sb.write_file(BACKEND_STATE, json.dumps({**state, **({"workspace": saved_workspace} if saved_workspace else {})}).encode()).result(timeout=30)
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
         raise
@@ -4134,7 +4296,7 @@ def launch_session(args) -> int:
     if harness.name == "openai":
         print(f"Send work: cws-agent run {args.name} 'your task'")
         print(f"Open a shell: cws-agent connect {args.name}")
-        print(f"Stop compute: cws-agent down {args.name}")
+        print(f"Stop compute: cws-agent stop {args.name}")
         return 0
 
     if args.claude_env:
@@ -4145,7 +4307,7 @@ def launch_session(args) -> int:
         print("    client.beta.agents.update(id, tools=[{\"type\": \"agent_toolset_20260401\"}])")
         print(f"  • watch a worker: cws-agent connect {args.name} "
               f"--cmd 'tmux attach -t claude-0'")
-        print(f"  • stop: cws-agent down {args.name}")
+        print(f"  • stop: cws-agent stop {args.name}")
         return 0
 
     if args.outpost:
@@ -4155,7 +4317,7 @@ def launch_session(args) -> int:
         print(f"  • Slack: @Devin !outpost {args.outpost} <task>")
         print(f"  • watch a worker: cws-agent connect {args.name} "
               f"--cmd 'tmux attach -t outpost-0'")
-        print(f"  • stop: cws-agent down {args.name}")
+        print(f"  • stop: cws-agent stop {args.name}")
         return 0
 
     if args.detach:
@@ -4425,11 +4587,18 @@ def cmd_shell(args) -> int:
                 if snapshot and harness_from_request_id(snapshot.request_id) not in (None, "shell"):
                     snapshot_metadata(sb, "restore-snapshot")
                 shell_copy_files(sb, entries)
+                save_workspace_metadata(sb, args.name, "shell", {
+                    "image": args.image or "python:3.11", "cpu": args.cpu or "2",
+                    "memory": args.memory or "4Gi", "disk": disk, "mode": mode,
+                    "gpu": args.gpu, "secrets": [s.name for s in args.secret],
+                    "volumes": [v.volume_id + ":" + v.mount_path for v in args.volume],
+                    "lifetime_seconds": 8 * 3600,
+                }, restore_snapshot_id=snapshot.file_system_snapshot_id if snapshot else None)
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
             raise
         print(f"Sandbox {args.name!r} will keep running after this command exits. "
-              f"Stop: cws-agent down {args.name} --no-snapshot", file=sys.stderr)
+              f"Stop: cws-agent stop {args.name} --no-snapshot", file=sys.stderr)
         session_summary("Shell ready", [
             ("Name", args.name), ("Sandbox", sb.sandbox_id),
             ("Connect", f"cws-agent shell {args.name}"),
@@ -4860,7 +5029,7 @@ def start_launched_telegram(sb, harness, args, env):
         permission = " --dangerously-skip-permissions" if args.yolo else (
             " --permission-mode " + shlex.quote(args.permission_mode) if args.permission_mode is not None else "")
         print(f"Sandbox {args.name!r} was not stopped by the bridge. Reconnect: cws-agent bridge telegram {args.name}{permission}")
-        print(f"To snapshot and stop compute: cws-agent down {args.name}")
+        print(f"To snapshot and stop compute: cws-agent stop {args.name}")
 
 
 def telegram_token_prompt():
@@ -5848,7 +6017,7 @@ def cmd_snapshot(args) -> int:
     return 0
 
 
-def cmd_down(args) -> int:
+def cmd_stop(args) -> int:
     if (args.checkpoint_dir or args.writer_gate or args.abort_checkpoint
             or args.checkpoint_timeout is not None):
         return checkpoint_down(args)
@@ -6146,7 +6315,7 @@ def worktree_path(name: str) -> str:
 
 def scan_native_history(home: str, claude_dir: str | None = None,
                         codex_dir: str | None = None) -> list[dict]:
-    """Read metadata only from recognized CLI transcripts; never return prompts.
+    """Read bounded, display-safe metadata from recognized CLI transcripts.
 
     Self-contained so the same reader can run remotely without installing a
     companion package. Malformed/partially written JSONL lines are skipped.
@@ -6155,12 +6324,87 @@ def scan_native_history(home: str, claude_dir: str | None = None,
     from pathlib import Path
     import re
 
+    from datetime import datetime
+    import math
+
+    def message(item, agent):
+        if not isinstance(item, dict) or item.get("isSidechain") or item.get("isMeta"):
+            return None
+        body = item.get("message") if agent == "claude" else item.get("payload")
+        if not isinstance(body, dict):
+            return None
+        role = body.get("role")
+        content = body.get("content")
+        if agent == "codex" and item.get("type") == "event_msg":
+            role = {"user_message": "user", "agent_message": "assistant"}.get(body.get("type"))
+            content = body.get("message")
+        if role not in ("user", "assistant"):
+            return None
+        if isinstance(content, list):
+            content = " ".join(part.get("text", "") for part in content
+                               if isinstance(part, dict) and part.get("type") in
+                               ("text", "input_text", "output_text") and isinstance(part.get("text"), str))
+        if not isinstance(content, str):
+            return None
+        content = re.sub(r"<system-reminder>.*?</system-reminder>", "", content, flags=re.S)
+        if content.lstrip().startswith(("<environment_context>", "# AGENTS.md instructions", "<local-command")):
+            return None
+        content = " ".join("".join(c if c.isprintable() else " " for c in content).split())[:1200]
+        if not content:
+            return None
+        timestamp = item.get("timestamp")
+        try:
+            stamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+            if not math.isfinite(stamp) or stamp < 0:
+                stamp = None
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            stamp = None
+        return role, content, stamp
+
+    def preview(path, row):
+        nonlocal preview_bytes
+        if preview_bytes >= 64 << 20:
+            row.update(title=None, excerpt=None, updated_at=row["modified"], updated_source="file_mtime")
+            return
+        # Fixed head/tail reads: no scan proportional to a conversation's length.
+        with path.open("rb") as stream:
+            head = stream.read(131072)
+            stream.seek(0, 2)
+            size = stream.tell()
+            offset = max(len(head), size - 131072)
+            stream.seek(offset)
+            tail = stream.read(131072)
+        preview_bytes += len(head) + len(tail)
+        chunks = [head.split(b"\n")[:-1]]
+        if tail:
+            chunks.append(tail.split(b"\n")[1:-1])
+        title, excerpt, newest = None, None, None
+        for chunk in chunks:
+            for line in chunk:
+                try:
+                    item = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                found = message(item, row["agent"])
+                if not found:
+                    continue
+                role, text, timestamp = found
+                if role == "user" and title is None:
+                    title = text[:400]
+                excerpt = text
+                if timestamp is not None:
+                    newest = max(newest or timestamp, timestamp)
+        row.update(title=title, excerpt=excerpt,
+                   updated_at=newest if newest is not None else row["modified"],
+                   updated_source="message" if newest is not None else "file_mtime")
+
     roots = {
         "claude": Path(claude_dir or str(Path(home) / ".claude")) / "projects",
         "codex": Path(codex_dir or str(Path(home) / ".codex")) / "sessions",
     }
     rows = []
     inspected = 0
+    preview_bytes = 0
     for agent, root in roots.items():
         root = root.resolve()
         pattern = "*/*.jsonl" if agent == "claude" else "**/rollout-*.jsonl"
@@ -6206,6 +6450,10 @@ def scan_native_history(home: str, claude_dir: str | None = None,
             except (OSError, UnicodeError):
                 continue
             if row:
+                try:
+                    preview(path, row)
+                except OSError:
+                    row.update(title=None, excerpt=None, updated_at=None, updated_source="unknown")
                 rows.append(row)
     return sorted(rows, key=lambda r: r["modified"], reverse=True)
 
@@ -6244,7 +6492,11 @@ def scan_opencode_history(executable: str = "opencode", cwd: str | None = None) 
             if not isinstance(updated, (int, float)):
                 raise ValueError()
             rows.append({"agent": "opencode", "id": sid, "cwd": directory,
-                         "modified": updated / 1000})
+                         "modified": updated / 1000,
+                         "title": " ".join("".join(c if c.isprintable() else " " for c in
+                                    str(entry.get("title") or "")).split())[:400] or None,
+                         "excerpt": None, "updated_at": updated / 1000 if updated else None,
+                         "updated_source": "harness" if updated else "unknown"})
         return rows
     except (ValueError, TypeError):
         raise RuntimeError("OpenCode returned invalid history metadata") from None
@@ -7344,14 +7596,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.set_defaults(func=cmd_snapshot)
 
-    p = sub.add_parser("down", help="snapshot (unless --no-snapshot) and stop the sandbox")
+    p = sub.add_parser("stop", aliases=["down"], help="save a snapshot and stop compute (--no-snapshot skips saving)")
     p.add_argument("name")
     p.add_argument("--no-snapshot", action="store_true")
     p.add_argument("--checkpoint-dir", metavar="PATH", help="opt in to durable checkpoint/stop recovery (requires --writer-gate)")
     p.add_argument("--writer-gate", metavar="EXECUTABLE", help="external durable quiesce/release hook; see docs/checkpoints.md")
     p.add_argument("--checkpoint-timeout", type=int, metavar="SECONDS", help="checkpoint attempt deadline (default: 180, max: 600)")
     p.add_argument("--abort-checkpoint", action="store_true", help="abandon an uncommitted checkpoint and release its writer gate")
-    p.set_defaults(func=cmd_down)
+    p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("restore", aliases=["resume"], help="restore the latest snapshot into a fresh sandbox (resume is a compatibility alias)")
     p.add_argument("name")

@@ -18,6 +18,7 @@ def result(code=0, stdout="", stderr=""):
 
 class BackendConfigurationTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(agent, "read_workspace_document", return_value={}))
         self.sandbox = Mock(spec=Sandbox)
         self.sandbox.write_file.return_value = completed()
 
@@ -133,6 +134,7 @@ class WorkerStartupTests(unittest.TestCase):
 
 class BackendRestoreTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(agent, "read_workspace_document", return_value={}))
         self.sandbox = Mock(spec=Sandbox)
         self.sandbox.sandbox_id = "sandbox-test"
         self.sandbox.write_file.return_value = completed()
