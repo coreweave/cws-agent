@@ -46,16 +46,16 @@ class LifecycleNameTests(unittest.TestCase):
             with self.subTest(command=command), contextlib.redirect_stdout(output), \
                     patch.object(agent.os.path, "isdir", return_value=True), patch.object(agent, "find_active", return_value=None), \
                     patch.object(agent, "build_env", return_value={}), \
-                    patch.object(agent, "scan_local_dir", return_value=inventory), \
+                    patch.object(agent, "directory_upload_plan", return_value=[{"size": 0}]), \
                     patch.object(agent, "provision_session", return_value=sandbox) as provision, \
-                    patch.object(agent, "sync_local_dir") as upload, \
+                    patch.object(agent, "apply_directory_upload") as upload, \
                     patch.object(agent, "automatic_snapshot") as snapshot:
                 self.assertEqual(agent.main([command, "--local-dir", "/project", "--detach"]), 0)
             name = provision.call_args.kwargs["name"]
             self.assertRegex(name, rf"^{command}-[a-f0-9]{{8}}$")
             self.assertNotIn(name, names)
             names.add(name)
-            self.assertEqual(upload.call_args.kwargs["session_name"], name)
+            self.assertEqual(upload.call_args.args[1].name, name)
             snapshot.assert_called_once_with(sandbox, name, command)
             self.assertIn(f"Name: {name}", output.getvalue())
             self.assertIn(f"cws-agent connect {name}", output.getvalue())
@@ -139,7 +139,7 @@ class LifecycleNameTests(unittest.TestCase):
                 agent.main([command, "--help"])
             self.assertEqual(result.exception.code, 0)
             self.assertIn(f"usage: cws-agent {command} ", output.getvalue())
-            for flag in ("--local-dir", "--detach", "--telegram", "--import-codex-auth"):
+            for flag in ("--add-dir", "--detach", "--telegram", "--import-codex-auth"):
                 self.assertIn(flag, output.getvalue())
         help_text = " ".join(cli_parser().format_help().split())
         for harness in SHORTCUTS.values():

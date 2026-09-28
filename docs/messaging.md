@@ -11,7 +11,7 @@ Managed Agents and Outposts are not supported.
 ## Telegram setup
 
 ```sh
-cws-agent launch telegram2 --local-dir . --telegram
+cws-agent launch telegram2 --add-dir . --telegram
 ```
 
 If prompted, sign into Claude with `/login`, then press Ctrl-D. The command

@@ -1,5 +1,7 @@
 # Everyday usage
 
+Launch agents, move project files, and save sandbox work so you can return to it later.
+
 [Back to README](../README.md). Run these commands from your local shell.
 
 ## Launch an agent
@@ -9,17 +11,19 @@ Choose an agent directly:
 ```bash
 cws-agent claude
 cws-agent codex --import-codex-auth
-cws-agent claude --local-dir . --detach
+cws-agent claude --add-dir . --detach
 cws-agent devin my-devin
 cws-agent opencode my-opencode --wandb
 cws-agent cursor my-cursor
 ```
 
 Names are optional for shortcuts and `launch`. When omitted, the CLI generates
-`HARNESS-` followed by 8 random lowercase hexadecimal characters, such as
-`claude-fa97da5d`. Claude Managed Agents uses the `anthropic-` prefix;
-`--claude-env` and `--outpost` select the worker's prefix. The generated name is
-printed during launch; use it with `connect`, `status`, or `stop` afterward.
+`HARNESS-` followed by eight random lowercase hexadecimal characters, such as
+`claude-fa97da5d`. Claude Managed Agents uses the `anthropic-` prefix.
+`--claude-env` and `--outpost` select the worker's prefix.
+
+The generated name is
+printed during launch. Use it with `connect`, `status`, or `stop` afterward.
 Pass `NAME` or `--name NAME` to choose your own name.
 
 Each `cws-agent AGENT [NAME]` shortcut is equivalent to
@@ -30,10 +34,10 @@ Each `cws-agent AGENT [NAME]` shortcut is equivalent to
 | --- | --- |
 | `claude` | Claude Code |
 | `codex` | Codex CLI |
-| `devin` | Devin CLI; add `--outpost NAME` for a Devin outpost worker |
-| `opencode` | OpenCode; add `--wandb` for W&B inference |
+| `devin` | Devin CLI. Add `--outpost NAME` for a Devin outpost worker |
+| `opencode` | OpenCode. Add `--wandb` for W&B inference |
 | `cursor` | Cursor CLI |
-| `anthropic` | Claude Managed Agents worker; requires `--claude-env ENV_ID` |
+| `anthropic` | Claude Managed Agents worker. Requires `--claude-env ENV_ID` |
 | `openai` | OpenAI Agents API executor |
 
 Worker backends keep the agent in the provider's service while tools execute in
@@ -48,6 +52,7 @@ cws-agent devin devin-worker --outpost my-outpost
 For creation, shortcuts accept the same options as `launch` except `--agent`, including the
 `--name NAME` compatibility form. Existing backend requirements still apply.
 Use `cws-agent AGENT --help` to see the options for an agent.
+
 To continue a saved agent session, use `cws-agent claude --resume SESSION_ID` (or
 `codex` or `opencode`). This reconnects to live compute or restores the latest
 saved workspace. Add `--running-only` to prevent allocation.
@@ -59,6 +64,8 @@ agent and other `--agent` choices. To reconnect to a running sandbox, use
 `cws-agent connect NAME`.
 
 ## Authentication
+
+Sandbox credentials create compute. Sign in to your agent separately.
 
 ### W&B accounts
 
@@ -75,7 +82,7 @@ for inference, giving the agent its sandbox-access permissions too. For access a
 
 ### CoreWeave accounts
 
-Use a **CoreWeave API access token**. In [Cloud Console → Tokens](https://console.coreweave.com/tokens),
+Use a CoreWeave API access token. In [Cloud Console → Tokens](https://console.coreweave.com/tokens),
 choose **Create Token** and copy the **Token Secret**:
 
 ```bash
@@ -90,8 +97,6 @@ Your organization must have sandbox access enabled.
 
 ### Agent sign-in
 
-Sandbox credentials create compute; sign in to your agent separately.
-
 | Agent | Sign in | Optional environment variable |
 | --- | --- | --- |
 | Claude Code | `/login` inside Claude | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` |
@@ -102,7 +107,7 @@ Sandbox credentials create compute; sign in to your agent separately.
 
 For a Claude subscription token, run `claude setup-token` locally and copy only
 the printed token into `CLAUDE_CODE_OAUTH_TOKEN`. API keys use API billing.
-Saved logins survive snapshots; re-export environment-only credentials before restore.
+Saved logins survive snapshots. Re-export environment-only credentials before restore.
 To pass another variable, add `--env-passthrough VARIABLE_NAME` to launch or restore.
 
 ### Reuse a local Codex login
@@ -118,15 +123,14 @@ cws-agent launch my-codex --agent codex --import-codex-auth
 The CLI reads `auth.json` from your local `CODEX_HOME` (default `~/.codex`), sends
 it over the sandbox connection, and stores it at `/workspace/home/.codex/auth.json`
 with mode `0600` in a `0700` directory. It checks `codex login status` before opening
-Codex. This checks that Codex recognizes the cache; it does not make a model request
+Codex. This checks that Codex recognizes the cache. It doesn't make a model request
 or prove that a saved token can still access the service.
 
-The import is explicit. Normal launch/connect never reads your local login.
-With the option, launch/restore omit `OPENAI_API_KEY` from the sandbox environment
+The import is explicit. Normal `launch` or `connect` never reads your local login.
+With the option, `launch` and `restore` omit `OPENAI_API_KEY` from the sandbox environment
 so the imported ChatGPT login is selected. API-key launch still works without it.
-Local OS-keyring credentials are not exported. If your login is stored in a keyring,
-create a file-based cache with `codex -c cli_auth_credentials_store='"file"' login`,
-if your workspace policy allows file storage.
+Local OS-keyring credentials aren't exported. If your login is stored in a keyring and your workspace policy allows file storage,
+create a file-based cache with `codex -c cli_auth_credentials_store='"file"' login`.
 
 For an existing Codex sandbox, import and open its terminal in one command, or
 import without opening a terminal:
@@ -138,7 +142,7 @@ cws-agent login my-codex --import-codex-auth
 
 Stop already-open Codex processes before importing, then reconnect. Existing
 sandboxes with an `OPENAI_API_KEY` environment variable or a custom `CODEX_HOME`
-cannot use this import; launch a fresh sandbox with `--import-codex-auth` instead.
+can't use this import. Launch a fresh sandbox with `--import-codex-auth` instead.
 The flag is only available for the Codex CLI harness, not the `openai` executor backend.
 
 Snapshots retain the imported login. To replace a restored cache with your current
@@ -149,37 +153,83 @@ cws-agent restore my-codex --import-codex-auth --connect
 ```
 
 Treat the cache and snapshots containing it as credentials: the sandbox can read
-the tokens. Import replaces an existing remote cache; a failed login-status check
+the tokens. Import replaces an existing remote cache. A failed login-status check
 restores the previous file. Concurrent imports are rejected while one is in progress.
 The local cache is never modified or copied back from the sandbox.
+
 If remote authentication later expires or is revoked, sign in
 locally again and explicitly re-import it. See the
 [official headless authentication guidance](https://learn.chatgpt.com/docs/auth#fallback-authenticate-locally-and-copy-your-auth-cache).
 
 ## Upload your project
 
+`--add-dir PATH` copies a file or directory into `/workspace/project`. For a
+directory, it copies the contents, not the enclosing directory. Paths may be
+relative, absolute, or start with `~`. Quote paths containing spaces. Repeat the
+flag to merge several sources. `--remote-path` applies to every source in the
+invocation, regardless of flag order:
+
 ```bash
-cws-agent launch project1 --local-dir . --exclude .env --exclude data
+cws-agent claude project1 --add-dir ./src --remote-path /workspace/project/src/
+cws-agent resume project1 --add-dir ./changes
+cws-agent shell dev1 --add-dir ./settings.json --remote-path /workspace/project/config.json
+```
+
+For one file, a trailing `/` or an existing remote directory appends the source
+basename. Otherwise the destination is the exact filename. Multiple sources need
+a directory destination. Use a trailing `/` when it doesn't exist yet.
+
+Launch, shell, connect, restore, and resume accept these upload flags. Resume
+resolves and verifies the conversation before copying files, then attaches. Uploads
+don't change the conversation's working directory.
+
+Existing remote files are
+preserved by default. Interactive conflicts offer a review, and `--overwrite`
+replaces incoming file collisions. File/directory collisions preserve the remote
+subtree; overwrite rejects them before copying. Existing Git metadata, harness
+home directories, remote symbolic links, and mounted volumes are protected.
+Project `.claude`, `.codex`, and `.opencode` directories are valid content.
+The command never cleans the workspace.
+
+A source path can itself be a symbolic link. Within a selected directory, relative
+links that stay inside that directory are copied as links; links outside it are
+rejected with their path. Upload destinations outside `/workspace` are allowed
+with a warning: snapshots won't retain those files.
+
+A failed merge can leave already-copied files. It doesn't launch the agent.
+Resume uploads don't create automatic snapshots.
+
+The former `--local-dir` and `--add-local` spellings remain hidden aliases.
+Shell uploads default to `/workspace/project`, replacing the old
+`/mnt/BASENAME` destination. `--add-dir` here copies files. Similarly named options
+in the agent's own CLI may instead grant directory access. Configuration import uses
+`--project-dir` for its read-only local project source.
+
+```bash
+cws-agent launch project1 --add-dir . --exclude .env --exclude data
 cws-agent sync project1 . --exclude .env --exclude data
 ```
 
-Files go to `/workspace/project`. `.git` is included; common dependency and build
-directories are excluded. **`.gitignore` is not applied.** Exclude secrets explicitly;
-`--no-git` skips Git history. Private Git clones need credentials inside the sandbox.
+Files go to `/workspace/project`. `.git` is included. Common dependency and build
+directories are excluded. `.gitignore` isn't applied. Exclude secrets explicitly.
+`--no-git` skips Git history.
+
+Private Git clones need credentials inside the sandbox.
 
 CLI launches and `sync` save a snapshot after upload unless you pass `--no-snapshot`.
-If snapshot creation fails, the files remain uploaded; retry with `cws-agent snapshot project1`.
-Worker launch modes do not take this automatic snapshot.
+If snapshot creation fails, the files remain uploaded. Retry with `cws-agent snapshot project1`.
+Worker launch modes don't take this automatic snapshot.
 
-Launch sizes the disk to fit your files with headroom; `--disk` overrides it.
+Launch sizes the disk to fit your files with headroom. `--disk` overrides it.
 Use `--verbose` to see the automatic disk-sizing explanation.
-Without local files, the default is 10 GiB. `sync` cannot resize an existing disk.
-Large transfers get a size-based timeout; use `--transfer-timeout 4h` to override it.
-This does not extend the sandbox's lifetime.
+Without local files, the default is 10 GiB. `sync` can't resize an existing disk.
+
+All `--add-dir` uploads use verified, resumable chunks. Large transfers get a size-based timeout. Use `--transfer-timeout 4h` to override it.
+This doesn't extend the sandbox's lifetime.
 
 Uploads normally block. With `launch --telegram`, upload runs in a separate local
-process after sign-in; keep the laptop awake and online. Background uploads preserve
-existing remote files so they do not overwrite the agent's edits.
+process after sign-in. Keep the laptop awake and online. Background uploads preserve
+existing remote files so they don't overwrite the agent's edits.
 
 Sync merges files and overwrites matching paths. `--clean` deletes the remote
 project before extraction. Avoid concurrent edits: packaging and extraction are
@@ -195,15 +245,16 @@ cws-agent sync project1 --resume-upload ID
 cws-agent uploads --discard ID
 ```
 
-Resume reuses the original cached archive and verified chunks. Send newer changes
-with a separate `sync`. An extraction failure may leave partial files; resume it
+Resume reuses the original cached archive, destination, collision policy, and
+verified chunks, including uploads started with `--add-dir`. Send newer changes
+with a separate upload. An extraction failure may leave partial files. Resume it
 before using the project. A clean upload requires `--clean` again on resume.
 
 A paused upload leaves compute running until you stop it or its lifetime expires.
 Resume before expiration, or target a replacement sandbox and resend missing chunks.
 
-Archives live in `~/.local/state/cws-agent/uploads`; they need local disk space and
-are not encrypted. Successful upload removes the archive and remote chunks.
+Archives live in `~/.local/state/cws-agent/uploads`. They need local disk space and
+aren't encrypted. Successful upload removes the archive and remote chunks.
 `--discard` removes only the local archive.
 
 ## Get changes back
@@ -216,15 +267,20 @@ cws-agent session diff project1 fix-auth > fix-auth.patch
 cws-agent exec project1 "git push origin HEAD:agent/fix-auth"
 ```
 
-Review patches before `git apply`. Diffs omit untracked files; use `git add -N`
+Review patches before `git apply`. Diffs omit untracked files. Use `git add -N`
 before exporting new files, or commit before pushing. There is no `pull` command.
 
-Git credentials are not copied from your laptop. For GitHub HTTPS remotes,
+Git credentials aren't copied from your laptop. For GitHub HTTPS remotes,
 [configure `gh auth setup-git`](https://cli.github.com/manual/gh_auth_setup-git)
-inside the sandbox; `GH_TOKEN` alone does not authenticate plain Git.
+inside the sandbox. `GH_TOKEN` alone doesn't authenticate plain Git.
 SSH remotes need SSH credentials there.
 
 ## Snapshots
+
+Snapshots preserve `/workspace`: project files, worktrees, and saved logins.
+They don't preserve running processes. Use [session restart](sessions.md) for
+saved worktrees, and take another snapshot after later edits.
+Only `READY` snapshots can be restored.
 
 For applications that control all workspace writers, see
 [recoverable checkpoint and stop](checkpoints.md) for an opt-in durable journal,
@@ -238,23 +294,18 @@ cws-agent snapshots my-claude          # list saved snapshots
 cws-agent prune my-claude --keep 3     # delete older READY snapshots
 ```
 
-Snapshots preserve `/workspace`: project files, worktrees, and saved logins.
-They do not preserve running processes. Use [session restart](sessions.md) for
-saved worktrees, and take another snapshot after later edits.
-Only READY snapshots can be restored.
-
-**During agent workspace capture, file read permissions are temporarily broadened, including on
-saved credentials, and symlinks become placeholders.** The CLI restores their
+During agent workspace capture, file read permissions are temporarily broadened, including on
+saved credentials, and symlinks become placeholders. The CLI restores their
 original permissions and targets afterward. Use trusted processes in the sandbox
-and pause unrelated writers during capture; only this host's Telegram requests
+and pause unrelated writers during capture. Only this host's Telegram requests
 coordinate automatically.
 
-[Shell sandboxes](shell.md#save-work-and-stop-compute) use native filesystem
+[Shell sandboxes](shell.md#save-work-and-stop-compute) use the platform's filesystem
 snapshots without this metadata helper. Restore them with `shell --snapshot`.
 
-`cws-agent restore` reuses the saved disk size; override it with `--disk`. For this
-command, snapshots without disk metadata default to 10 GiB. `down --no-snapshot`
-stops compute without saving current changes; snapshots remain until pruned.
+`cws-agent restore` reuses the saved disk size. Override it with `--disk`. For this
+command, snapshots without disk metadata default to 10 GiB. `stop --no-snapshot`
+stops compute without saving current changes. Snapshots remain until pruned.
 
 ## Reconnect from another machine
 
@@ -267,7 +318,7 @@ cws-agent connect my-claude
 ```
 
 If stopped, use `restore my-claude --connect`. To continue a saved agent session,
-use [session resume](sessions.md). Connections do not reconnect automatically.
+use `session resume`. Connections don't reconnect automatically.
 
 ## Claude Remote Control
 
@@ -279,7 +330,7 @@ cws-agent rc my-claude
 ```
 
 Complete `/login` and exit Claude before running `rc`. API keys and setup tokens
-alone do not support this workflow. [Provider requirements](https://code.claude.com/docs/en/remote-control).
+alone don't support this workflow. [Provider requirements](https://code.claude.com/docs/en/remote-control).
 
 ## Options
 
@@ -290,14 +341,13 @@ Run `cws-agent --help` or `cws-agent launch --help` for all commands and flags.
 | Set resources | `--cpu 4 --memory 8Gi --disk 20Gi --lifetime 7d` |
 | Choose an image or placement | `--image IMAGE`, `--mode serverless\|cks` |
 | Pass environment variables | `--env KEY=VALUE`, `--env-passthrough KEY` |
-| Clone or upload a project | `--repo-url URL`, `--local-dir PATH` |
+| Clone or upload a project | `--repo-url URL`, `--add-dir PATH` |
 | Create without opening an agent | `launch NAME --detach` |
 | Run a shell command | `exec NAME "command"` |
 | Send a one-shot agent task | `run NAME "prompt"` |
 
 Defaults: 2 CPUs, 4 GiB memory, 8-hour lifetime. Disk is automatic for local uploads,
-otherwise 10 GiB. `--detach` prepares the sandbox; use `login`, `connect`, or
+otherwise 10 GiB. `--detach` prepares the sandbox. Use `login`, `connect`, or
 `session start` afterward.
 
-Compatibility aliases: `attach` → `connect`, `down` → `stop`,
-`checkpoint` → `snapshot`, and `restore --attach` → `restore --connect`.
+Compatibility aliases: `attach` → `connect`, `checkpoint` → `snapshot`, and `restore --attach` → `restore --connect`.

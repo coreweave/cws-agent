@@ -28,7 +28,7 @@ The application key stays on your machine; the CLI rejects forwarding it with
 ## Launch and send work
 
 ```bash
-cws-agent launch api1 --agent openai --local-dir .
+cws-agent launch api1 --agent openai --add-dir .
 cws-agent run api1 "Inspect the project and summarize its test setup"
 cws-agent run api1 "Add a test for the issue you identified"
 ```

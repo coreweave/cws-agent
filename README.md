@@ -76,7 +76,7 @@ You choose what gets copied. [Supported configuration](docs/config-import.md).
 Upload your local project when creating a sandbox:
 
 ```bash
-cws-agent claude project1 --local-dir .
+cws-agent claude project1 --add-dir .
 ```
 
 The command uploads the current directory to `/workspace/project` and saves a snapshot when
@@ -146,7 +146,7 @@ Use [Telegram](docs/messaging.md) to chat with your agent while your project upl
 in the background:
 
 ```bash
-cws-agent claude telegram1 --local-dir . --telegram
+cws-agent claude telegram1 --add-dir . --telegram
 ```
 
 The upload survives closing its terminal.

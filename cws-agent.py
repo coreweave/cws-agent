@@ -27,14 +27,14 @@ instead of hosting a CLI you drive: `launch --outpost NAME` runs Devin outpost
 workers that claim sessions from Devin Cloud.
 
 Usage:
-    cws-agent claude  [NAME] [--local-dir .]
+    cws-agent claude  [NAME] [--add-dir .]
     cws-agent codex   [NAME] [--import-codex-auth]
     cws-agent devin   [NAME]
     cws-agent opencode [NAME] [--wandb]
     cws-agent cursor  [NAME]
     cws-agent anthropic [NAME] --claude-env ENV_ID
     cws-agent openai  [NAME]
-    cws-agent launch  [NAME] [--agent claude|codex|devin|opencode|cursor] [--local-dir .]
+    cws-agent launch  [NAME] [--agent claude|codex|devin|opencode|cursor] [--add-dir .]
     cws-agent launch  box1 --outpost my-outpost --workers 2
     cws-agent connect  dev1 [--cmd bash]
     cws-agent shell   dev1 [--gpu any:1] [--cmd nvidia-smi]
@@ -700,11 +700,13 @@ def probe_session_meta(sb: Sandbox) -> tuple[str, str]:
     return "?", "?"
 
 
-def active_harness(sb: Sandbox, override: str | None = None) -> Harness:
+def active_harness(sb: Sandbox, override: str | None = None, *, allow_shell=False) -> Harness | None:
     if override:
         return HARNESSES[override]
     _, h = probe_session_meta(sb)
     if h == "shell":
+        if allow_shell:
+            return None
         raise SystemExit("error: this is a shell sandbox; use `cws-agent shell NAME` or `cws-agent exec NAME COMMAND`")
     return HARNESSES.get(h, HARNESSES["claude"])
 
@@ -2252,6 +2254,14 @@ UPLOAD_REMOTE_ROOT = "/workspace/.cws-uploads"
 class UploadPaused(SystemExit):
     """A cached upload can be resumed; launch must not destroy its sandbox."""
 
+    def __init__(self, message, *, upload_id=None, recovery_command=None):
+        super().__init__(message)
+        self.upload_id = upload_id
+        self.recovery_command = recovery_command
+        self.safe_message = "Upload paused; cached files and the running sandbox were retained."
+        if recovery_command:
+            self.safe_message += " Resume: " + recovery_command
+
 
 # This helper uses only the sandbox's Python standard library and tar. Every
 # operation takes the staging lock; filenames are derived only from validated IDs
@@ -2345,11 +2355,12 @@ def main():
         complete = False
         if marker.exists() or marker.is_symlink():
             with regular(marker) as stream:
-                complete = stream.read() == b"complete"
+                saved = stream.read()
+                complete = saved == b"complete" or bool(json.loads(saved).get("complete"))
         action = request["action"]
         if complete:
             cleanup()
-            print(json.dumps({"complete": True, "verified": []}))
+            print(saved.decode() if saved != b"complete" else json.dumps({"complete": True, "verified": []}))
             return
         if action == "status":
             verified = [i for i in range(len(manifest["chunks"])) if valid(i)]
@@ -2390,9 +2401,11 @@ def main():
         elif action == "extract":
             if not all(valid(i) for i in range(len(manifest["chunks"]))):
                 raise ValueError("missing or damaged chunks; resume upload before extraction")
-            directory(project)
+            safe_merge = manifest.get("safe_merge", False)
+            if not safe_merge:
+                directory(project)
             target = project
-            if manifest.get("preserve_existing", False):
+            if safe_merge or manifest.get("preserve_existing", False):
                 target = folder / "unpacked"
                 if target.is_symlink():
                     raise ValueError("unsafe unpacked staging directory")
@@ -2426,7 +2439,9 @@ def main():
                     if proc.poll() is None:
                         proc.kill()
                         proc.wait()
-                if target != project:
+                if safe_merge:
+                    merged = install_directory_upload(str(target), "apply", manifest["overwrite"])
+                elif target != project:
                     # Never replace files created by the live agent. Link each
                     # staged file into place atomically; a race preserves remote work.
                     def merge(source, destination):
@@ -2452,9 +2467,12 @@ def main():
                 # sync is Linux-specific; the sandbox images run Linux.
                 if hasattr(os, "sync"):
                     os.sync()
-            durable(marker, b"complete")
+            receipt = {"complete": True, "verified": []}
+            if safe_merge:
+                receipt["transfer"] = merged
+            durable(marker, json.dumps(receipt).encode())
             cleanup()
-            print(json.dumps({"complete": True, "verified": []}))
+            print(json.dumps(receipt))
         else:
             raise ValueError("invalid upload operation")
 
@@ -2507,6 +2525,9 @@ def upload_manifest(folder):
         chunks = manifest["chunks"]
         if (manifest["version"] != 1 or manifest["id"] != folder.name
                 or type(manifest["clean"]) is not bool or not isinstance(chunks, list) or not chunks
+                or type(manifest.get("safe_merge", False)) is not bool
+                or type(manifest.get("overwrite", False)) is not bool
+                or (manifest.get("safe_merge") and manifest["clean"])
                 or not isinstance(manifest["source"], str)
                 or type(manifest["count"]) is not int or manifest["count"] < 0
                 or type(manifest["unpacked_size"]) is not int or manifest["unpacked_size"] < 0
@@ -2553,17 +2574,23 @@ def discard_upload(folder):
     folder.rmdir()
 
 
-def cache_upload(local_dir, *, include_git, extra_excludes, clean, inventory, preserve_existing=False):
+def cache_upload(local_dir, *, include_git, extra_excludes, clean, inventory, preserve_existing=False,
+                 upload_plan=None, overwrite=False):
     import hashlib
     import secrets
     folder = upload_cache_root() / secrets.token_hex(16)
     folder.mkdir(mode=0o700)
     with upload_lock(folder):
         try:
-            inventory = inventory or scan_local_dir(local_dir, include_git=include_git, extra_excludes=extra_excludes)
-            tar_path, count = build_local_tar(local_dir, include_git=include_git,
-                                             extra_excludes=extra_excludes, inventory=inventory,
-                                             archive_dir=str(folder))
+            if upload_plan is None:
+                inventory = inventory or scan_local_dir(local_dir, include_git=include_git, extra_excludes=extra_excludes)
+                tar_path, count = build_local_tar(local_dir, include_git=include_git,
+                                                 extra_excludes=extra_excludes, inventory=inventory,
+                                                 archive_dir=str(folder))
+            else:
+                inventory = LocalDirectoryInventory("", upload_plan, sum(item["size"] for item in upload_plan),
+                                                    len(upload_plan), set())
+                tar_path, count = build_directory_upload(folder, upload_plan)
             os.replace(tar_path, folder / "archive.tar.gz")
             chunks = []
             size = (folder / "archive.tar.gz").stat().st_size
@@ -2576,6 +2603,8 @@ def cache_upload(local_dir, *, include_git, extra_excludes, clean, inventory, pr
                         "size": size, "count": count, "clean": clean, "chunks": chunks,
                         "unpacked_size": inventory.total + 4096 * len(inventory.entries),
                         "preserve_existing": preserve_existing}
+            if upload_plan is not None:
+                manifest.update(safe_merge=True, overwrite=overwrite)
             # Same atomic, mode-600 JSON writer used for other private local state.
             telegram_save_json(folder / "manifest.json", manifest)
             fd = os.open(folder, os.O_RDONLY)
@@ -2594,7 +2623,10 @@ def upload_command(manifest, action, **kwargs):
     remote_manifest = {key: value for key, value in manifest.items() if key != "source"}
     kwargs.setdefault("timeout", 300)
     request = dict(manifest=remote_manifest, action=action, root=UPLOAD_REMOTE_ROOT, project=PROJECT_DIR, **kwargs)
-    return ["python3", "-c", UPLOAD_REMOTE, json.dumps(request)]
+    helper = UPLOAD_REMOTE
+    if manifest.get("safe_merge"):
+        helper = inspect.getsource(install_directory_upload) + "\n" + helper
+    return ["python3", "-c", helper, json.dumps(request)]
 
 
 def upload_result(result):
@@ -2633,7 +2665,7 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
             state = status()
         if state["complete"]:
             print("Remote extraction already completed; no upload needed.")
-            return
+            return state.get("transfer")
         verified = set(state["verified"])
         saved = sum(manifest["chunks"][i]["size"] for i in verified)
         with TransferProgress("Uploading (verified)", manifest["size"], initial=saved) as progress:
@@ -2679,7 +2711,7 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
                         time.sleep(attempt + 1)
                         current = status()
                         if current["complete"]:
-                            return
+                            return current.get("transfer")
                         if index in current["verified"]:
                             break
                 progress.advance(part["size"])
@@ -2691,41 +2723,48 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
         with startup_step("Extracting uploaded files"):
             with workspace_access(session_name) if session_name else contextlib.nullcontext():
                 result = sb.exec(upload_command(manifest, "extract", timeout=timeout), timeout_seconds=timeout).result()
-            if json.loads(upload_result(result).stdout).get("complete") is not True:
+            receipt = json.loads(upload_result(result).stdout)
+            if receipt.get("complete") is not True:
                 raise ProjectUploadError("missing extraction completion receipt")
+            return receipt.get("transfer")
 
 
 def sync_local_dir(sb: Sandbox, local_dir: str, *, include_git: bool,
                    extra_excludes, clean: bool, inventory: LocalDirectoryInventory | None = None,
                    transfer_timeout: int | None = None, resume_upload: str | None = None,
-                   session_name: str | None = None, preserve_existing=False) -> None:
+                   session_name: str | None = None, preserve_existing=False,
+                   upload_plan=None, overwrite=False):
     folder = upload_folder(resume_upload) if resume_upload else cache_upload(
         local_dir, include_git=include_git, extra_excludes=extra_excludes, clean=clean, inventory=inventory,
-        preserve_existing=preserve_existing)
+        preserve_existing=preserve_existing, upload_plan=upload_plan, overwrite=overwrite)
     with upload_lock(folder):
         manifest = upload_manifest(folder)
         if manifest["clean"] != clean:
             raise SystemExit("error: cached upload clean mode differs; resume a clean upload with --clean")
         name = shlex.quote(session_name or "NAME")
         recovery = f"cws-agent sync {name} --resume-upload {folder.name}" + (" --clean" if clean else "")
+        if manifest.get("safe_merge"):
+            recovery += " --no-snapshot"
         timeout = transfer_timeout or project_upload_timeout(manifest["size"], manifest["count"])
         print(f"Upload {folder.name}: {manifest['count']} files, {transfer_size(manifest['size'])} compressed.")
         print(f"Resume if interrupted: {recovery}", flush=True)
         print(f"Upload/extraction time budget: {(timeout + 59) // 60} minutes (override with --transfer-timeout).", flush=True)
         try:
-            transfer_cached_upload(sb, folder, manifest, timeout, session_name=session_name)
+            result = transfer_cached_upload(sb, folder, manifest, timeout, session_name=session_name)
         except (Exception, KeyboardInterrupt) as error:
             detail = str(error) if isinstance(error, ProjectUploadError) else type(error).__name__
             raise UploadPaused(f"error: upload paused ({detail}). Cached archive and remote chunks retained.\n"
                                f"Resume: {recovery}\n"
                                "The sandbox remains billable until stopped or its original lifetime expires.\n"
                                f"Stop: cws-agent stop {name} --no-snapshot\n"
-                               f"Local cache: {folder} (discard: cws-agent uploads --discard {folder.name})") from None
+                               f"Local cache: {folder} (discard: cws-agent uploads --discard {folder.name})",
+                               upload_id=folder.name, recovery_command=recovery) from None
         try:
             discard_upload(folder)
         except (OSError, SystemExit):
             print(f"warning: upload succeeded; remove leftover local cache with `cws-agent uploads --discard {folder.name}`",
                   file=sys.stderr)
+        return result
 
 
 def cmd_uploads(args):
@@ -2778,7 +2817,15 @@ def start_background_upload(sb, args):
         command.extend(["--transfer-timeout", str(args.transfer_timeout)])
     if getattr(args, "no_snapshot", False):
         command.append("--no-snapshot")
-    command.append(os.path.abspath(args.local_dir))
+    if getattr(args, "add_dir", None):
+        for source in args.add_dir:
+            command.extend(["--_add-dir", os.path.realpath(os.path.expanduser(source))])
+        if getattr(args, "remote_path", None):
+            command.extend(["--_remote-path", args.remote_path])
+        if getattr(args, "overwrite", False):
+            command.append("--_overwrite")
+    else:
+        command.append(os.path.abspath(args.local_dir))
     fd = os.open(folder / "upload.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as log:
         try:
@@ -4132,6 +4179,10 @@ def cmd_launch(args) -> int:
 
 
 def launch_session(args) -> int:
+    upload_plan = directory_upload_plan(args)
+    sources = getattr(args, "add_dir", []) or []
+    args.local_dir = (os.path.realpath(os.path.expanduser(sources[0]))
+                      if len(sources) == 1 and os.path.isdir(os.path.expanduser(sources[0])) else None)
     if getattr(args, "name", None) is None:
         import secrets
         harness = "ant" if args.claude_env else "devin" if args.outpost else args.agent
@@ -4211,18 +4262,18 @@ def launch_session(args) -> int:
                 "       export DEVIN_OUTPOSTS_TOKEN=<token shown once at creation>")
         env["DEVIN_OUTPOSTS_TOKEN"] = tok  # the exact name the worker reads
     # A local working copy wins over a git clone: sync your actual files in.
-    repo_url = None if args.local_dir else args.repo_url
+    repo_url = None if args.local_dir or upload_plan else args.repo_url
 
     if telegram:
         print("Telegram launch: size disk → install agent → review skills/MCPs → sign in → Telegram ready. "
               "Workspace packaging, upload, and snapshot run in the background.", flush=True)
-    local_inventory = None
-    if args.local_dir:
-        local_inventory = scan_local_dir(args.local_dir, include_git=not args.no_git, extra_excludes=args.exclude)
+    disk_inventory = None
+    if upload_plan:
+        disk_inventory = LocalDirectoryInventory("", upload_plan, sum(item["size"] for item in upload_plan), len(upload_plan), set())
     if args.disk is None:
-        args.disk = local_directory_disk(local_inventory) if local_inventory is not None else "10Gi"
-        if local_inventory is not None and getattr(args, "verbose", False):
-            print(f"Automatic disk: {args.disk} for {transfer_size(local_inventory.total)} of selected files "
+        args.disk = local_directory_disk(disk_inventory) if disk_inventory is not None else "10Gi"
+        if disk_inventory is not None and getattr(args, "verbose", False):
+            print(f"Automatic disk: {args.disk} for {transfer_size(disk_inventory.total)} of selected files "
                   "plus filesystem overhead and working space. Override with --disk.", flush=True)
     if harness.name == "openai":
         with openai_client() as client:
@@ -4259,11 +4310,9 @@ def launch_session(args) -> int:
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
         raise
-    if args.local_dir and not telegram:
+    if upload_plan and not telegram:
         try:
-            sync_local_dir(sb, args.local_dir, include_git=not args.no_git,
-                           extra_excludes=args.exclude, clean=False, inventory=local_inventory,
-                           transfer_timeout=getattr(args, "transfer_timeout", None), session_name=args.name)
+            apply_directory_upload(sb, args, upload_plan)
         except UploadPaused:
             if harness.name == "openai":
                 try:
@@ -4345,7 +4394,7 @@ def launch_session(args) -> int:
             ("Next", "Finish agent sign-in and Telegram pairing"),
         ])
         return start_launched_telegram(sb, harness, args, env)
-    if args.local_dir and not getattr(args, "no_snapshot", False):
+    if (args.local_dir or upload_plan) and not getattr(args, "no_snapshot", False):
         automatic_snapshot(sb, args.name, harness.name)
     if harness.name == "claude":
         if "CLAUDE_CODE_OAUTH_TOKEN" in env:
@@ -4425,44 +4474,6 @@ def shell_volume(value: str):
     return RegisteredVolumeOptions(name=volume_id, volume_id=volume_id, mount_path=path)
 
 
-def shell_local_files(paths, volumes):
-    """Inventory explicit copies before creating compute; do not follow links."""
-    from pathlib import Path, PurePosixPath
-    import stat
-    destinations = [PurePosixPath(v.mount_path) for v in volumes]
-    if len({v.volume_id for v in volumes}) != len(volumes):
-        raise SystemExit("error: each --volume ID may only be specified once")
-    roots = []
-    for value in paths:
-        path = Path(os.path.abspath(os.path.expanduser(value)))
-        if not path.name or path.name in {".", ".."}:
-            raise SystemExit("error: --add-local must name a file or directory, not the filesystem root")
-        destination = PurePosixPath("/mnt") / path.name
-        destinations.append(destination)
-        roots.append((path, destination))
-    for index, destination in enumerate(destinations):
-        for previous in destinations[:index]:
-            if destination == previous or destination in previous.parents or previous in destination.parents:
-                raise SystemExit(f"error: overlapping --add-local/--volume destinations: {previous} and {destination}")
-    entries = []
-    for root, destination in roots:
-        def visit(path, remote):
-            mode = path.lstat().st_mode
-            if stat.S_ISDIR(mode):
-                entries.append((path, str(remote), mode))
-                for child in sorted(path.iterdir()):
-                    visit(child, remote / child.name)
-            elif stat.S_ISREG(mode):
-                entries.append((path, str(remote), mode))
-            else:
-                raise SystemExit(f"error: --add-local supports regular files and directories only: {path}")
-        try:
-            visit(root, destination)
-        except OSError as error:
-            raise SystemExit(f"error: cannot read --add-local path {root}: {error.strerror}") from None
-    return entries
-
-
 def shell_snapshot(reference: str):
     snapshots = Sandbox.list_snapshots(auth=sandbox_auth()).result()
     matches = [s for s in snapshots if s.file_system_snapshot_id == reference]
@@ -4482,35 +4493,355 @@ def shell_command(command: str) -> str:
     return f"export HOME={HOME_DIR}; cd {PROJECT_DIR} || exit; " + command
 
 
-def shell_copy_files(sb, entries):
+def add_directory_flags(parser):
+    parser.add_argument("--add-dir", type=shell_text, action="append", default=[], metavar="PATH",
+                        help="copy file or directory contents to /workspace/project (repeatable)")
+    parser.add_argument("--local-dir", "--add-local", dest="add_dir", type=shell_text, action="append", help=argparse.SUPPRESS)
+    parser.add_argument("--remote-path", metavar="PATH", help="absolute destination; trailing / means directory")
+    parser.add_argument("--overwrite", action="store_true", help="replace incoming file collisions, preserving Git metadata")
+    parser.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
+                        help="upload/extraction deadline, e.g. 4h (default: size-based)")
+    parser.add_argument("--no-git", action="store_true", help="exclude .git from uploads")
+    parser.add_argument("--exclude", action="append", default=[], metavar="NAME",
+                        help="extra directory/file name to exclude from uploads (repeatable)")
+
+
+def directory_upload_plan(args):
+    """Validate selected sources before allocating compute; never follow nested links."""
+    from pathlib import Path, PurePosixPath
     import stat
-    # Uploads are creation-only and never target a registered volume or /workspace.
-    roots = []
-    for _, remote, _ in entries:
-        root = "/".join(remote.split("/")[:3])
-        if root not in roots:
-            roots.append(root)
+    sources = getattr(args, "add_dir", []) or []
+    roots = [Path(value).expanduser().resolve() for value in sources]
+    if len(set(roots)) != len(roots):
+        raise ValueError("Each --add-dir source may be specified only once (including equivalent paths)")
+    remote = getattr(args, "remote_path", None)
+    if remote and not sources:
+        raise ValueError("--remote-path requires --add-dir")
+    if not sources:
+        return []
+    destination = remote or PROJECT_DIR + "/"
+    parts = PurePosixPath(destination).parts
+    if (not destination.startswith("/") or destination.startswith("//") or ".." in parts or
+            any(not c.isprintable() for c in destination) or destination == "/"):
+        raise ValueError("--remote-path must be an absolute sandbox path without .. or control characters")
+    normalized = str(PurePosixPath(destination))
+    for volume in getattr(args, "volume", []):
+        mount = volume.mount_path
+        if normalized == mount or normalized.startswith(mount + "/") or mount.startswith(normalized + "/"):
+            raise ValueError("Upload overlaps a registered volume")
+    protected = (HOME_DIR, SESSIONS_DIR, META_DIR, "/opt", "/proc", "/sys", "/dev", "/etc", "/root")
+    if any(normalized == p or normalized.startswith(p + "/") for p in protected) or any(
+            part.startswith(".cws") or part == ".git" for part in parts):
+        raise ValueError("--remote-path overlaps protected workspace or harness state")
+    if normalized != "/workspace" and not normalized.startswith("/workspace/"):
+        print("warning: uploads outside /workspace are not retained in snapshots.", file=sys.stderr)
+    entries = []
     for root in roots:
-        quoted = shlex.quote(root)
-        result = exec_retry(sb, ["sh", "-c", f"test ! -L /mnt && test ! -e {quoted} && test ! -L {quoted}"], attempts=1)
-        if result.returncode:
-            raise SystemExit(f"error: --add-local destination already exists or /mnt is a symlink: {root}")
-    for path, remote, mode in entries:
-        if stat.S_ISDIR(mode):
-            result = exec_retry(sb, ["mkdir", "-p", "--", remote], attempts=1)
-        else:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            with os.fdopen(fd, "rb") as source:
-                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                    raise SystemExit("error: --add-local source changed to a non-regular file")
-                sb.write_file_streaming(remote, iter(lambda: source.read(1024 * 1024), b"")).result()
-            result = exec_retry(sb, ["chmod", format(mode & 0o777, "o"), "--", remote], attempts=1)
-        if result.returncode:
-            raise SystemExit("error: could not copy --add-local files")
-    for _, remote, mode in reversed(entries):
-        if stat.S_ISDIR(mode):
-            if exec_retry(sb, ["chmod", format(mode & 0o777, "o"), "--", remote], attempts=1).returncode:
-                raise SystemExit("error: could not preserve --add-local directory permissions")
+        if root == Path(root.anchor):
+            raise ValueError("--add-dir cannot copy the filesystem root")
+        if not root.is_file() and not root.is_dir():
+            raise ValueError(f"--add-dir source is not a regular file or directory: {root}")
+        directory = root.is_dir()
+        inventory = (scan_local_dir(str(root), include_git=not getattr(args, "no_git", False),
+                                   extra_excludes=getattr(args, "exclude", [])) if directory else
+                     LocalDirectoryInventory(str(root), [(root, ".", root.stat())], root.stat().st_size, 1, set()))
+        for path, relative, info in inventory.entries:
+            link = None
+            if stat.S_ISLNK(info.st_mode):
+                link = os.readlink(path)
+                # Preserve a link itself, never read its target or leave the selected tree.
+                if os.path.isabs(link) or not Path(path).resolve().is_relative_to(root):
+                    raise ValueError(f"--add-dir symbolic link points outside its source directory: {path}")
+            elif not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"--add-dir unsupported file type: {path}")
+            entries.append({"local": str(path), "relative": relative, "mode": info.st_mode,
+                            "size": info.st_size if stat.S_ISREG(info.st_mode) else 0,
+                            "base": normalized, "directory_source": directory, "source_name": root.name,
+                            "directory_target": destination.endswith("/"), "multiple": len(roots) > 1,
+                            **({"link": link} if link is not None else {})})
+    return entries
+
+
+def open_upload_source(path):
+    """Pin every directory component, refusing symlink substitutions during packaging."""
+    from pathlib import Path
+    import stat
+    parts = Path(path).parts
+    parent = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ValueError(f"Upload source changed type: {path}")
+        return os.fdopen(fd, "rb")
+    finally:
+        os.close(parent)
+
+
+def build_directory_upload(folder, plan):
+    """Retain an immutable archive; target metadata stays out of command-line arguments."""
+    import io
+    import stat
+    import tarfile
+    path = folder / "archive.tar.gz"
+    count = sum(not stat.S_ISDIR(item["mode"]) for item in plan)
+    manifest = json.dumps([{k: v for k, v in item.items() if k != "local"} for item in plan]).encode()
+    with TransferProgress("Packaging", sum(item["size"] for item in plan)) as progress:
+        with tarfile.open(path, "w:gz") as archive:
+            member = tarfile.TarInfo("manifest.json")
+            member.size = len(manifest)
+            archive.addfile(member, io.BytesIO(manifest))
+            for index, item in enumerate(plan):
+                if not stat.S_ISREG(item["mode"]):
+                    continue  # Links are inert metadata until the descriptor-based merge.
+                with open_upload_source(item["local"]) as source:
+                    member = tarfile.TarInfo(str(index))
+                    member.size = os.fstat(source.fileno()).st_size
+                    archive.addfile(member, source)
+                    progress.advance(member.size)
+    os.chmod(path, 0o600)
+    return str(path), count
+
+
+def install_directory_upload(stage, mode="plan", overwrite=False):
+    """Merge through directory descriptors without following destination symlinks."""
+    import contextlib
+    import errno
+    import json
+    import os
+    from pathlib import PurePosixPath
+    import posixpath
+    import stat
+    import tarfile
+    import uuid
+    import re
+
+    with open(stage + "/manifest.json") as source:
+        manifest = json.load(source)
+    volumes = []
+    try:
+        with open("/proc/self/mountinfo") as source:
+            for line in source:
+                fields = line.split()
+                if len(fields) > 4 and fields[4] not in ("/", "/workspace"):
+                    volumes.append(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]))
+    except FileNotFoundError:
+        pass
+
+    def directory(path, create=False):
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in PurePosixPath(path).parts[1:]:
+                if create:
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def exists(path):
+        try:
+            fd = directory(str(PurePosixPath(path).parent))
+        except FileNotFoundError:
+            return None
+        try:
+            try:
+                result = os.stat(PurePosixPath(path).name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            return result
+        finally:
+            os.close(fd)
+
+    targets, collisions, protected_git, blocked, seen = [], [], set(), set(), {}
+    for index, item in enumerate(manifest):
+        base = item["base"]
+        info = exists(base)
+        is_directory = info is not None and stat.S_ISDIR(info.st_mode)
+        if item["multiple"] and not (item["directory_target"] or is_directory):
+            raise ValueError("Repeated --add-dir needs a destination directory; use a trailing /")
+        target = str(PurePosixPath(base) / item["relative"]) if item["directory_source"] else (
+            str(PurePosixPath(base) / item["source_name"]) if item["directory_target"] or is_directory else base)
+        if any(target == v or target.startswith(v + "/") or v.startswith(target + "/") for v in volumes):
+            raise ValueError("Upload destination overlaps a mounted volume: " + target)
+        path = PurePosixPath(target)
+        if ".." in path.parts or not path.is_absolute():
+            raise ValueError("Invalid upload destination: " + target)
+        if any(target == p or target.startswith(p + "/") for p in ("/workspace/home", "/workspace/sessions", "/workspace/.cws-meta", "/etc", "/root", "/opt", "/proc", "/sys", "/dev")):
+            raise ValueError("Upload overlaps protected workspace or harness state: " + target)
+        if any(part.startswith(".cws") for part in path.parts):
+            raise ValueError("Upload contains protected workspace metadata: " + target)
+        incoming_dir = stat.S_ISDIR(item["mode"])
+        if target in seen and not (incoming_dir and seen[target]):
+            raise ValueError("Multiple upload sources target the same file: " + target)
+        seen[target] = incoming_dir
+        skip = target in blocked or any(str(parent) in blocked for parent in path.parents)
+        git = None
+        if not skip and ".git" in path.parts:
+            git = str(PurePosixPath(*path.parts[:path.parts.index(".git") + 1]))
+            if git not in protected_git and exists(git):
+                protected_git.add(git)
+        skip = skip or git in protected_git
+        if not skip:
+            info = exists(target)
+            if info and overwrite and stat.S_ISLNK(info.st_mode):
+                raise ValueError("Upload destination is a symbolic link: " + target)
+            if info and (not incoming_dir or not stat.S_ISDIR(info.st_mode)):
+                collisions.append(target)
+                if incoming_dir != stat.S_ISDIR(info.st_mode):
+                    if overwrite:
+                        raise ValueError("Upload file/directory collision; choose Keep remote or change --remote-path: " + target)
+                    blocked.add(target)
+                    skip = True
+        if stat.S_ISLNK(item["mode"]):
+            link = item.get("link", "")
+            resolved = posixpath.normpath(posixpath.join(str(path.parent), link))
+            if not link or posixpath.isabs(link) or not (resolved == base or resolved.startswith(base + "/")):
+                raise ValueError("Upload symbolic link leaves its destination: " + target)
+        targets.append((index, item, path, skip))
+    if mode == "plan":
+        return {"conflicts": collisions, "copied": 0, "preserved": 0}
+    def staged_source(path):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ValueError("Invalid staged upload")
+        return os.fdopen(fd, "rb")
+
+    copied, preserved = 0, 0
+    legacy_archive = stage + "/files.tar"
+    with contextlib.ExitStack() as stack:
+        archive = stack.enter_context(tarfile.open(legacy_archive, "r:")) if os.path.isfile(legacy_archive) else None
+        members = {m.name: m for m in archive.getmembers()} if archive else {}
+        for index, item, path, skip in targets:
+            incoming_dir = stat.S_ISDIR(item["mode"])
+            if skip:
+                preserved += int(not incoming_dir)
+                continue
+            if incoming_dir:
+                os.close(directory(str(path), create=True))
+                continue
+            parent = directory(str(path.parent), create=True)
+            temporary = ".cws-upload-" + uuid.uuid4().hex
+            try:
+                try:
+                    previous = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    previous = None
+                if previous and not overwrite:
+                    preserved += 1
+                    continue
+                if previous and not stat.S_ISREG(previous.st_mode):
+                    raise ValueError("Upload destination changed type: " + str(path))
+                if stat.S_ISLNK(item["mode"]):
+                    os.symlink(item["link"], temporary, dir_fd=parent)
+                else:
+                    staged = stage + "/" + str(index)
+                    linked = False
+                    if archive is None:
+                        if not stat.S_ISREG(os.stat(staged, follow_symlinks=False).st_mode):
+                            raise ValueError("Invalid staged upload")
+                        try:
+                            os.link(staged, temporary, dst_dir_fd=parent, follow_symlinks=False)
+                            linked = True
+                            staged_fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                            try:
+                                if not stat.S_ISREG(os.fstat(staged_fd).st_mode):
+                                    raise ValueError("Invalid staged upload")
+                                os.fchmod(staged_fd, item["mode"] & 0o777)
+                            finally:
+                                os.close(staged_fd)
+                        except OSError as error:
+                            if error.errno != errno.EXDEV:
+                                raise
+                    if not linked:
+                        member = members.get(str(index)) if archive else None
+                        if archive and (member is None or not member.isfile()):
+                            raise ValueError("Invalid staged upload")
+                        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+                        with os.fdopen(fd, "wb") as output, (archive.extractfile(member) if archive else staged_source(staged)) as source:
+                            while chunk := source.read(1 << 20):
+                                output.write(chunk)
+                            os.fchmod(output.fileno(), item["mode"] & 0o777)
+                if overwrite:
+                    os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+                else:
+                    try:
+                        os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                    except FileExistsError:
+                        preserved += 1
+                        continue
+                copied += 1
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+                os.close(parent)
+    return {"conflicts": collisions, "copied": copied, "preserved": preserved}
+
+
+def apply_directory_upload(sb, args, plan=None):
+    """Preflight a safe merge, then use the shared resumable chunk transport."""
+    plan = directory_upload_plan(args) if plan is None else plan
+    if not plan:
+        return {"copied": 0, "preserved": 0}
+    result = exec_retry(sb, ["sh", "-c", "command -v python3 >/dev/null && python3 -c " +
+        shlex.quote("import tempfile; print(tempfile.mkdtemp(prefix='.cws-upload-', dir='/workspace'))")], attempts=1)
+    stage = (result.stdout or "").strip()
+    if result.returncode not in (0, None) or not re.fullmatch(r"/workspace/\.cws-upload-[A-Za-z0-9_-]+", stage):
+        raise ValueError("--add-dir requires python3 in the sandbox image for safe file merging")
+    overwrite = getattr(args, "overwrite", False)
+    try:
+        manifest = [{k:v for k,v in item.items() if k != "local"} for item in plan]
+        sb.write_file(stage + "/manifest.json", json.dumps(manifest).encode()).result()
+        def review_merge(overwrite):
+            script = inspect.getsource(install_directory_upload) + "\nimport json\ntry:\n    print(json.dumps(install_directory_upload(" + repr(stage) + ", 'plan', " + repr(overwrite) + ")))\nexcept ValueError as error:\n    print(json.dumps({'error': str(error)}))\nexcept OSError as error:\n    print(json.dumps({'error': 'Upload destination is not accessible (errno ' + str(error.errno) + ')'}))"
+            result = exec_retry(sb, ["python3", "-c", script], attempts=1, timeout_seconds=600)
+            if result.returncode not in (0, None):
+                raise ValueError("Upload validation failed; check that the sandbox has Python 3 and writable upload destinations")
+            response = json.loads(result.stdout)
+            if response.get("error"):
+                detail = json.dumps(str(response["error"])[:1600])[1:-1]
+                raise ValueError("Upload validation failed: " + detail)
+            return response
+        review = review_merge(overwrite)
+        if review["conflicts"] and not overwrite:
+            if not getattr(args, "json", False) and sys.stdin.isatty() and sys.stdout.isatty():
+                choice = resume_picker([
+                    {"workspace":"Keep remote", "title":f"Preserve {len(review['conflicts'])} conflicting paths", "resumable":True},
+                    {"workspace":"Overwrite", "title":"Replace incoming files; preserve Git metadata", "resumable":True},
+                    {"workspace":"Cancel", "title":"Leave remote files unchanged", "resumable":True},
+                ], title="Review upload conflicts", notice=", ".join(review["conflicts"][:3]),
+                   search_label="Filter", empty_label="No matching choices")
+                if choice is None or choice["workspace"] == "Cancel":
+                    raise ValueError("Upload cancelled")
+                overwrite = choice["workspace"] == "Overwrite"
+                if overwrite:
+                    review_merge(True)
+            else:
+                print(f"Preserving {len(review['conflicts'])} conflicting paths; use --overwrite to replace files.", file=sys.stderr)
+    finally:
+        exec_retry(sb, ["rm", "-rf", "--", stage], attempts=1)
+    # The temporary preflight never holds file contents. Retained cached chunks and
+    # their manifest own recovery from this point onward, including merge failures.
+    import contextlib
+    with contextlib.redirect_stdout(sys.stderr):
+        result = sync_local_dir(sb, plan[0]["local"], include_git=True, extra_excludes=[], clean=False,
+                                transfer_timeout=getattr(args, "transfer_timeout", None),
+                                session_name=getattr(args, "name", None), upload_plan=plan, overwrite=overwrite)
+    print(f"Uploaded {result['copied']} files; preserved {result['preserved']} remote files.", file=sys.stderr)
+    return result
 
 
 def cmd_shell(args) -> int:
@@ -4548,7 +4879,13 @@ def cmd_shell(args) -> int:
         if stat.S_ISFIFO(stdin_mode) or stat.S_ISREG(stdin_mode):
             print("warning: shell --cmd does not forward piped or redirected stdin; input will be ignored.",
                   file=sys.stderr)
-    entries = shell_local_files(args.add_local, args.volume)
+    upload_plan = directory_upload_plan(args)
+    if len({v.volume_id for v in args.volume}) != len(args.volume):
+        raise SystemExit("error: each --volume ID may only be specified once")
+    mounts = [v.mount_path for v in args.volume]
+    if any(a == b or a.startswith(b + "/") or b.startswith(a + "/")
+           for i, a in enumerate(mounts) for b in mounts[:i]):
+        raise SystemExit("error: overlapping --volume destinations")
     boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(args.name)], auth=sandbox_auth()).result()
     if len(boxes) > 1:
         raise SystemExit("error: multiple running sandboxes have this name; use a unique session name")
@@ -4561,7 +4898,8 @@ def cmd_shell(args) -> int:
         sb = boxes[0]
     else:
         snapshot = shell_snapshot(args.snapshot) if args.snapshot else None
-        disk = "10Gi"
+        disk = local_directory_disk(LocalDirectoryInventory("", upload_plan,
+                    sum(item["size"] for item in upload_plan), len(upload_plan), set())) if upload_plan else "10Gi"
         if snapshot:
             saved_disk = re.search(r"\|disk=([1-9][0-9]*(?:Gi|Mi|Ti))$", snapshot.request_id or "")
             disk = saved_disk[1] if saved_disk else f"{max(10, ((snapshot.size_bytes or 0) + 2**30 - 1) // 2**30)}Gi"
@@ -4592,7 +4930,6 @@ def cmd_shell(args) -> int:
                     raise SystemExit("error: image must allow creating /workspace/home, /workspace/project, and /mnt")
                 if snapshot and harness_from_request_id(snapshot.request_id) not in (None, "shell"):
                     snapshot_metadata(sb, "restore-snapshot")
-                shell_copy_files(sb, entries)
                 save_workspace_metadata(sb, args.name, "shell", {
                     "image": args.image or "python:3.11", "cpu": args.cpu or "2",
                     "memory": args.memory or "4Gi", "disk": disk, "mode": mode,
@@ -4609,6 +4946,14 @@ def cmd_shell(args) -> int:
             ("Name", args.name), ("Sandbox", sb.sandbox_id),
             ("Connect", f"cws-agent shell {args.name}"),
         ], file=sys.stderr)
+    try:
+        apply_directory_upload(sb, args, upload_plan)
+    except UploadPaused:
+        raise
+    except (Exception, SystemExit, KeyboardInterrupt):
+        if not boxes:
+            stop_failed_sandbox(sb)
+        raise
     if getattr(args, "_prepare_only", False):
         return sb
     command = ("exec sh -c " + shlex.quote(args.cmd) if args.cmd is not None else
@@ -4627,8 +4972,13 @@ def cmd_shell(args) -> int:
 def cmd_attach(args) -> int:
     if args.cmd and (args.yolo or args.permission_mode not in (None, "accept-edits")):
         raise SystemExit("error: permission flags cannot be combined with --cmd")
+    upload_plan = directory_upload_plan(args)
     sb = require_active(args.name)
-    harness = active_harness(sb, args.agent)
+    harness = active_harness(sb, args.agent, allow_shell=True)
+    apply_directory_upload(sb, args, upload_plan)
+    if harness is None:
+        command = "exec sh -c " + shlex.quote(args.cmd) if args.cmd else "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+        return pty_attach(sb, command, image_paste=False, plain_shell=True)
     if args.cmd and getattr(args, "import_codex_auth", False):
         raise SystemExit("error: --import-codex-auth cannot be combined with --cmd")
     codex_auth = local_codex_auth(harness, args)
@@ -5025,7 +5375,7 @@ def start_launched_telegram(sb, harness, args, env):
             result = pty_attach(sb, harness.login_cmd)
             if result:
                 return result
-        if getattr(args, "local_dir", None):
+        if getattr(args, "add_dir", None) or getattr(args, "local_dir", None):
             start_background_upload(sb, args)
         bridge_args = argparse.Namespace(
             name=args.name, timeout=300, setup=False, allow_chat=None, allow_user=None,
@@ -5945,7 +6295,7 @@ def cmd_login(args) -> int:
 
 
 def cmd_sync(args) -> int:
-    if args.resume_upload and (args.local_dir is not None or args.no_git or args.exclude):
+    if args.resume_upload and (args.local_dir is not None or args.no_git or args.exclude or getattr(args, "add_dir", None)):
         raise SystemExit("error: --resume-upload reuses a cached archive; do not pass a directory or new filters")
     if args.clean and getattr(args, "preserve_existing", False):
         raise SystemExit("error: --clean cannot be combined with --preserve-existing")
@@ -5964,11 +6314,14 @@ def cmd_sync(args) -> int:
         if folder and (job.get("name") != args.name or job.get("sandbox_id") != sb.sandbox_id):
             raise SystemExit("error: background upload target no longer matches the original sandbox")
         report("uploading", "Workspace packaging/upload is running. You can use the agent; local files will arrive later. Remote edits are preserved.")
-        sync_local_dir(sb, args.local_dir or ".", include_git=not args.no_git,
-                       extra_excludes=args.exclude, clean=args.clean,
-                       transfer_timeout=getattr(args, "transfer_timeout", None),
-                       resume_upload=args.resume_upload, session_name=args.name,
-                       preserve_existing=getattr(args, "preserve_existing", False))
+        if getattr(args, "add_dir", None):
+            apply_directory_upload(sb, args)
+        else:
+            sync_local_dir(sb, args.local_dir or ".", include_git=not args.no_git,
+                           extra_excludes=args.exclude, clean=args.clean,
+                           transfer_timeout=getattr(args, "transfer_timeout", None),
+                           resume_upload=args.resume_upload, session_name=args.name,
+                           preserve_existing=getattr(args, "preserve_existing", False))
         print("synced.")
         if not getattr(args, "no_snapshot", False):
             report("snapshotting", "Workspace uploaded. Saving a reusable snapshot; agent requests may briefly wait while it is captured.")
@@ -6046,6 +6399,7 @@ def cmd_stop(args) -> int:
 
 
 def cmd_resume(args) -> int:
+    upload_plan = directory_upload_plan(args)
     if getattr(args, "telegram", False) and args.attach:
         raise SystemExit("error: choose --telegram or --connect, not both")
     if args.workers is not None and args.workers < 1:
@@ -6134,6 +6488,12 @@ def cmd_resume(args) -> int:
                 import_codex_auth(sb, codex_auth)
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
+        raise
+    try:
+        apply_directory_upload(sb, args, upload_plan)
+    except (Exception, SystemExit, KeyboardInterrupt):
+        print(f"Upload did not complete. Sandbox {sb.sandbox_id} remains running. "
+              f"Reconnect: cws-agent connect {args.name}", file=sys.stderr)
         raise
     session_summary("Session restored", [
         ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
@@ -7343,7 +7703,8 @@ def restore_resume_row(row, args, config):
 
 
 
-def resume_picker(rows, *, title="Resume a conversation", notice=""):
+def resume_picker(rows, *, title="Resume a conversation", notice="",
+                  search_label="Search", empty_label="No matching conversations"):
     """Inline table shared by the global picker, narrowed choices and confirmations."""
     from prompt_toolkit import Application
     from prompt_toolkit.key_binding import KeyBindings
@@ -7362,7 +7723,7 @@ def resume_picker(rows, *, title="Resume a conversation", notice=""):
     def content():
         visible = matches()
         width = max(20, min(60, shutil.get_terminal_size().columns - 57))
-        result = [("class:heading", title + "\n"), ("class:muted", f"Search: {query}\n\n"),
+        result = [("class:heading", title + "\n"), ("class:muted", f"{search_label}: {query}\n\n"),
                   ("class:muted", f"  {'Workspace (agent)':26} {'Conversation':{width}} {'Updated':10} State\n")]
         start = max(0, cursor - 9)
         for i, row in enumerate(visible[start:start + 12], start):
@@ -7373,7 +7734,7 @@ def resume_picker(rows, *, title="Resume a conversation", notice=""):
             style = "class:focus" if i == cursor else "class:muted" if not row.get("resumable", True) else ""
             result.append((style, f"{'›' if i == cursor else ' '} {name:26} {label:{width}} {updated_label(row):10} {row.get('state', '')}\n"))
         if not visible:
-            result.append(("class:muted", "  No matching conversations\n"))
+            result.append(("class:muted", "  " + empty_label + "\n"))
         chosen = visible[cursor % len(visible)] if visible else {}
         detail = chosen.get("reason") or chosen.get("excerpt") or chosen.get("session_id") or ""
         result.extend([("class:muted", "\n" + display_text(detail, 240) + "\n"),
@@ -7461,6 +7822,7 @@ def validate_resume_args(args):
 
 def cmd_unified_resume(args):
     validate_resume_args(args)
+    upload_plan = directory_upload_plan(args)
     scoped_name = getattr(args, "name", None)
     scoped_box = getattr(args, "sandbox", None)
     if scoped_name and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", scoped_name):
@@ -7548,6 +7910,8 @@ def cmd_unified_resume(args):
             check = exec_retry(sb, ["sh", "-lc", AGENT_ENV + f"test -d {shlex.quote(cwd)} && command -v {shlex.quote(HARNESSES[row['agent']].agent_bin)} >/dev/null"], attempts=1)
             if check.returncode not in (0, None):
                 return fail("conversation_unavailable", f"Agent executable or working directory is unavailable. Sandbox {sb.sandbox_id} is running; inspect it before retrying")
+        args.name = row["workspace"]
+        apply_directory_upload(sb, args, upload_plan)
         if getattr(args, "no_attach", False):
             print(f"Workspace ready: {row['workspace']} ({sb.sandbox_id})")
             return 0
@@ -7557,6 +7921,8 @@ def cmd_unified_resume(args):
             return pty_attach(sb, "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi", image_paste=False, plain_shell=True)
         sync_agent_config(sb, HARNESSES[row["agent"]], args)
         return resume_conversation(sb, args)
+    except UploadPaused as error:
+        return fail("upload_paused", error.safe_message + f" Sandbox: {sb.sandbox_id}")
     except ResumeOperationError as error:
         return fail("resume_failed", f"{display_text(error, 500)}. Sandbox {sb.sandbox_id} remains running")
     except (Exception, SystemExit) as error:
@@ -7880,7 +8246,7 @@ def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) ->
                    help="max sandbox lifetime, e.g. 90m / 8h / 7d (default: 8h)")
     p.add_argument("--cpu", default="2", help="CPU request/limit (default: 2)")
     p.add_argument("--memory", default="4Gi", help="memory request/limit (default: 4Gi)")
-    p.add_argument("--disk", help="/workspace volume size (launch --local-dir: automatic with headroom; otherwise 10Gi)")
+    p.add_argument("--disk", help="/workspace volume size (launch --add-dir: automatic with headroom; otherwise 10Gi)")
     p.add_argument("--mode", choices=["serverless", "cks"], default=None,
                    help="placement mode (default: backend default)")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
@@ -7905,8 +8271,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("shell", help="create or reconnect to a sandbox terminal", allow_abbrev=False)
     p.add_argument("name", nargs="?", help="session name (default: generate a new shell name)")
-    p.add_argument("--add-local", type=shell_text, action="append", default=[], metavar="PATH",
-                   help="copy a file or directory to /mnt/BASENAME on creation (repeatable)")
+    add_directory_flags(p)
+    p.set_defaults(add_local=[])
     p.add_argument("--image", type=shell_text, help="container image (default: python:3.11)")
     p.add_argument("--cpu", type=shell_cpu, help="CPUs, e.g. 2 or 500m (default: 2)")
     p.add_argument("--gpu", type=shell_gpu, metavar="any[:COUNT]", help="request 1 to 8 GPUs (default: none; any means any:1)")
@@ -7934,14 +8300,9 @@ def main(argv: list[str] | None = None) -> int:
                           help="compatibility alias for the positional session name")
         add_create_flags(p, agent=shortcut_agent)
         p.add_argument("--repo-url", help="git URL to clone into /workspace/project")
-        p.add_argument("--local-dir", metavar="PATH",
-                       help="sync a local directory into /workspace/project (wins over --repo-url)")
+        add_directory_flags(p)
+        p.set_defaults(local_dir=None)
         p.add_argument("--no-snapshot", action="store_true", help="skip the automatic snapshot after project upload")
-        p.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
-                       help="upload/extraction deadline, e.g. 4h (default: size-based)")
-        p.add_argument("--no-git", action="store_true", help="exclude .git when syncing --local-dir")
-        p.add_argument("--exclude", action="append", default=[], metavar="NAME",
-                       help="extra dir/file name to exclude from --local-dir sync (repeatable)")
         p.add_argument("--claude-env", metavar="ENV_ID",
                        help="serve this Claude Managed Agents self-hosted environment "
                             "(env_...); implies --agent ant. Needs ANTHROPIC_ENVIRONMENT_KEY.")
@@ -7972,6 +8333,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-snapshot", action="store_true", help="skip the automatic snapshot after upload")
     p.add_argument("--preserve-existing", action="store_true", help="keep remote files on collisions (used by background Telegram launches)")
     p.add_argument("--_upload-job", help=argparse.SUPPRESS)
+    p.add_argument("--_add-dir", dest="add_dir", action="append", default=[], help=argparse.SUPPRESS)
+    p.add_argument("--_remote-path", dest="remote_path", help=argparse.SUPPRESS)
+    p.add_argument("--_overwrite", dest="overwrite", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
                    help="upload/extraction deadline, e.g. 4h (default: size-based)")
     p.add_argument("--no-git", action="store_true", help="exclude .git")
@@ -7993,6 +8357,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.add_argument("--cmd", help="command to run instead of the agent (e.g. bash)")
     p.add_argument("--agent", choices=sorted(HARNESSES), default=None, help=argparse.SUPPRESS)
+    add_directory_flags(p)
     p.set_defaults(func=cmd_attach)
 
     p = sub.add_parser("run", help="headless one-shot prompt (`claude -p` / `devin -p`)")
@@ -8043,6 +8408,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--memory", type=shell_memory, help="override recovery memory")
     p.add_argument("--mode", choices=("serverless", "cks"), help="override recovery placement")
     add_verbose_flag(p)
+    add_directory_flags(p)
     p.set_defaults(func=cmd_unified_resume)
 
     p = sub.add_parser("restore", help="restore the latest snapshot into a fresh sandbox")
@@ -8054,6 +8420,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workers", type=int, default=None, help="override saved worker count")
     p.add_argument("--connect", "--attach", dest="attach", action="store_true", help="open a terminal after restoring (--attach is a compatibility alias)")
     p.add_argument("--telegram", action="store_true", help="restore workspace and reconnect its saved Telegram bot")
+    add_directory_flags(p)
     p.set_defaults(func=cmd_resume, cpu=None, memory=None)
 
     p = sub.add_parser("list", help="list active agent sessions")
@@ -8127,6 +8494,7 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--agent", choices=sorted(set(HARNESSES) - {"ant", "openai"}), help="required for Devin/Cursor, otherwise inferred")
     q.add_argument("--cwd", help="remote project directory (default: saved session directory)")
     add_resume_flags(q)
+    add_directory_flags(q)
     q.set_defaults(func=cmd_session_resume)
 
     q = ssub.add_parser("restart", help="restart a stopped worktree agent without recreating its branch")
@@ -8182,7 +8550,8 @@ def main(argv: list[str] | None = None) -> int:
         p = config_sub.add_parser(command)
         add_verbose_flag(p)
         p.add_argument("name", help="active sandbox name")
-        p.add_argument("--local-dir", help="project configuration source (default: current directory)")
+        p.add_argument("--project-dir", dest="local_dir", help="project configuration source (default: current directory)")
+        p.add_argument("--local-dir", dest="local_dir", help=argparse.SUPPRESS)
         p.add_argument("--select", action="append", help="name or exact skill:NAME/mcp:NAME to import (repeatable), or a for all")
         p.add_argument("--env-var", action="append", help="also copy this local environment variable for selected items (repeatable; values stay hidden)")
         p.add_argument("--env-file", action="append", help="read referenced values from this dotenv file (repeatable; overrides other local sources)")
@@ -8193,7 +8562,7 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "command", None) in set(HARNESSES) - {"ant", "openai"}:
         command_parser = sub.choices[args.command]
         if hasattr(args, "session_id"):
-            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose", "running_only", "no_attach", "allow_default_config", "no_config_sync", "cpu", "memory", "disk", "image", "mode", "lifetime", "env", "env_passthrough"}
+            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose", "running_only", "no_attach", "allow_default_config", "no_config_sync", "add_dir", "remote_path", "overwrite", "no_git", "exclude", "transfer_timeout", "cpu", "memory", "disk", "image", "mode", "lifetime", "env", "env_passthrough"}
             explicit_fields = set()
             option_tokens = argv[:argv.index("--")] if "--" in argv else argv
             supplied_options = [token.partition("=")[0] for token in option_tokens if token.startswith("--")]

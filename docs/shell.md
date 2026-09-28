@@ -1,14 +1,14 @@
 # Open a sandbox shell
 
-Exiting a shell leaves the sandbox running and consuming compute until you stop
-it or its maximum lifetime expires. This also applies to `--cmd`.
-
 `cws-agent shell NAME` creates a sandbox or opens a new shell in a running one.
 It starts Bash, or `sh` if Bash isn't available. The command doesn't install or
 start a coding agent.
 
-Before starting, [install cws-agent](install.md) and configure
-[sandbox credentials](usage.md#authentication). No agent login is needed.
+Exiting a shell leaves the sandbox running and consuming compute until you stop
+it or its maximum lifetime expires. This also applies to `--cmd`.
+
+Before you start, [install cws-agent](install.md) and configure
+[sandbox credentials](usage.md#authentication). You don't need an agent login.
 
 ## Open and reconnect
 
@@ -20,7 +20,7 @@ cws-agent shell dev1
 
 The prompt opens in `/workspace/project`, with `HOME` set to `/workspace/home`.
 The connection uses a pseudo-terminal (PTY) automatically, with terminal resizing
-and Ctrl-C handling.
+and **Ctrl-C** handling.
 
 Type `exit` to return to your local terminal. The sandbox keeps running.
 Run `cws-agent shell dev1` again to open a new shell in the same sandbox.
@@ -73,17 +73,19 @@ redirection and non-interactive use, see [automation and limitations](#automatio
 
 ## Choose creation options
 
-Use these options with a new name. An existing sandbox accepts `--cmd`, but
-rejects creation options. Use its name without those options to reconnect.
+Use creation options with a new name. An existing sandbox accepts `--cmd` and
+file upload options, but rejects creation-only options such as `--image`, `--cpu`,
+and `--memory`. Use its name without creation options to reconnect.
 
-| Creation flag | Value and default |
+| Flag | Value and default |
 | --- | --- |
-| `--mode` | `serverless` or `cks`. Default: serverless, or CKS when `--volume` is present. |
+| `--mode` | `serverless` or `cks`. Default: `serverless`, or CoreWeave Kubernetes Service (CKS) when `--volume` is present. |
 | `--image` | Container image. Default: `python:3.11`. |
 | `--cpu` | Cores or millicores, such as `2`, `0.5`, or `500m`. Default: `2`. |
 | `--memory` | MiB as a number (`4096`) or a quantity (`4Gi`). Default: `4Gi`. |
 | `--gpu` | `any` requests one GPU. `any:1` through `any:8` set the count. Default: no GPU. |
-| `--add-local` | File or directory to copy to `/mnt/BASENAME`. Repeatable. |
+| `--add-dir` | File or directory contents to copy to `/workspace/project`. Repeatable. Also works when reconnecting. |
+| `--remote-path` | Absolute upload destination. See [upload paths](usage.md#upload-your-project). |
 | `--secret` | Existing W&B secret name. Repeatable. W&B serverless only. |
 | `--snapshot` | Snapshot ID, exact `request_id`, or session name. Restores `/workspace`. |
 | `--volume` | Registered volume `ID` or `ID:/mnt/PATH`. Repeatable. Selects CKS. |
@@ -100,27 +102,24 @@ cws-agent shell cluster1 --mode cks
 ```
 
 CKS placement requires a CoreWeave API access token and an available runner on
-your CoreWeave Kubernetes Service (CKS) cluster. It works without volume mounts.
+your CKS cluster. It works without volume mounts.
 See [placement setup](https://docs.coreweave.com/products/sandboxes/get-started#choose-a-placement-mode).
 The CLI doesn't fall back to another mode if placement fails.
 
 ### Copy local files
 
+Copy local files into the sandbox to use them from your shell:
+
 ```bash
-cws-agent shell files1 --add-local ./src --add-local ./requirements.txt
+cws-agent shell files1 --add-dir ./src --add-dir ./requirements.txt
 ```
 
-These become `/mnt/src` and `/mnt/requirements.txt`. This is a one-time copy.
-Remote edits don't change local files. Hidden files are included and `.gitignore`
-isn't applied.
+Directory contents and the file are merged into `/workspace/project`. Use
+`--remote-path` to choose another destination.
 
-Regular files and directories, including empty ones, are supported.
-Symbolic links and special files are rejected. Permissions are copied without
-set-user-ID or set-group-ID bits.
-
-Destinations must be unique, must not overlap each other or volume mounts, and
-must not already exist in the image. `/mnt` copies aren't in workspace snapshots.
-Move files you want to snapshot into `/workspace`.
+Safe file merging and resumable transfer require `python3` and `tar` in the image. The default shell image includes
+both. A custom image can run a plain shell and save metadata without Python, but
+`--add-dir` fails if Python is unavailable. `cws-agent` doesn't install it.
 
 ### Inject W&B secrets
 
@@ -164,7 +163,7 @@ cws-agent shell restored1 --snapshot dev1
 ```
 
 The second command opens a new sandbox from the latest ready snapshot of `dev1`.
-Use `cws-agent snapshot dev1` to save without stopping, or `down --no-snapshot`
+Use `cws-agent snapshot dev1` to save without stopping, or `stop --no-snapshot`
 to stop without requesting a new snapshot.
 
 `--snapshot` also accepts an ID or exact snapshot `request_id`. Lookup order is
@@ -191,7 +190,8 @@ without the agent metadata helper.
 | Either stream isn't a terminal | Requires `--cmd`. Runs without a PTY and closes remote stdin. |
 | Non-interactive output | Separate stdout and stderr, returned after completion. Exit status matches the command. Timeout: 5 minutes. |
 | Pipe or file input | Not forwarded to the remote command. The CLI warns that input is ignored. `/dev/null` is quiet. |
-| Failed setup or local-file upload | The CLI attempts to stop the newly allocated sandbox. |
+| Failed setup or upload validation | The CLI attempts to stop the newly allocated sandbox. |
+| Interrupted upload | The sandbox stays running; use the printed `sync --resume-upload` command. |
 | Command failure or disconnected terminal | The sandbox remains running. Reconnect or stop it explicitly. |
 
 Names use 1 to 40 lowercase letters, digits, or hyphens and start with a letter or
