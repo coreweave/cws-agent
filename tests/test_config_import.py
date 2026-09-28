@@ -505,7 +505,7 @@ class ImportPromptTests(unittest.TestCase):
             (["launch", "--name", "dev1", "--verbose"], "cmd_launch"),
             (["-v", "launch", "--name", "dev1"], "cmd_launch"),
             (["attach", "dev1", "-v"], "cmd_attach"),
-            (["resume", "dev1", "--verbose"], "cmd_resume"),
+            (["restore", "dev1", "--verbose"], "cmd_resume"),
             (["config", "preview", "dev1", "-v"], "cmd_config"),
             (["config", "-v", "sync", "dev1"], "cmd_config"),
         ]:

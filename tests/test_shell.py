@@ -441,6 +441,20 @@ class ShellTests(unittest.TestCase):
                     self.assertNotIn("wandb login", self.stderr.getvalue())
                 failing_call.side_effect = None
 
+    def test_resume_prepares_shell_with_saved_disk_lifetime_and_no_terminal(self):
+        self.stdin_tty.return_value = self.stdout_tty.return_value = False
+        args = self.parser.parse_args(['shell', 'dev1', '--snapshot', 'fss-example',
+                                      '--image', 'example.invalid/shell:latest', '--cpu', '4', '--memory', '8Gi'])
+        args._prepare_only, args._restore_disk, args._restore_lifetime = True, '50Gi', 7200
+        self.assertIs(args.func(args), self.sb)
+        options = self.run.call_args.kwargs
+        self.assertEqual(options['container_image'], 'example.invalid/shell:latest')
+        self.assertEqual(options['resources'].requests, {'cpu':'4','memory':'8Gi'})
+        self.assertEqual(options['file_system_snapshot'].file_system_snapshot_id, 'fss-example')
+        self.assertEqual(options['environment_variables']['CWS_AGENT_DISK'], '50Gi')
+        self.assertEqual(options['max_lifetime_seconds'], 7200)
+        self.pty.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

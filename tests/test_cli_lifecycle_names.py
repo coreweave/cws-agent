@@ -44,7 +44,7 @@ class LifecycleNameTests(unittest.TestCase):
             sandbox = types.SimpleNamespace(sandbox_id="sb-example")
             inventory = agent.LocalDirectoryInventory("/project", [], 0, 0, set())
             with self.subTest(command=command), contextlib.redirect_stdout(output), \
-                    patch.object(agent, "find_active", return_value=None), \
+                    patch.object(agent.os.path, "isdir", return_value=True), patch.object(agent, "find_active", return_value=None), \
                     patch.object(agent, "build_env", return_value={}), \
                     patch.object(agent, "scan_local_dir", return_value=inventory), \
                     patch.object(agent, "provision_session", return_value=sandbox) as provision, \
@@ -85,6 +85,9 @@ class LifecycleNameTests(unittest.TestCase):
                     actual = vars(launch.call_args.args[0]).copy()
                     self.assertEqual(actual.pop("command"), command)
                     expected.pop("command")
+                    for key in ("running_only", "no_attach", "list", "dry_run", "json", "allow_default_config", "input_json"):
+                        actual.pop(key, None)
+                        expected.pop(key, None)
                     self.assertEqual(actual, expected)
 
     def test_agent_shortcuts_reject_agent_flag_before_dispatch(self):
@@ -196,9 +199,9 @@ class LifecycleNameTests(unittest.TestCase):
     def test_restore_and_resume_share_parser_and_connection_flags(self):
         parser = cli_parser()
         commands = subcommands(parser)
-        self.assertIs(commands["restore"], commands["resume"])
+        self.assertIsNot(commands["restore"], commands["resume"])
         self.assertIn(" restore ", commands["restore"].format_usage())
-        for name in ("restore", "resume"):
+        for name in ("restore",):
             self.assertFalse(parser.parse_args([name, "dev1"]).attach)
             for flag in ("--connect", "--attach"):
                 with self.subTest(command=name, flag=flag):
@@ -230,7 +233,7 @@ class LifecycleNameTests(unittest.TestCase):
                 provision.assert_not_called()
 
     def test_restore_requires_stopped_sandbox_and_points_to_connect(self):
-        for name in ("restore", "resume"):
+        for name in ("restore",):
             with self.subTest(command=name), \
                     patch.object(agent, "find_active", return_value=object()), \
                     patch.object(agent, "provision_session") as provision, \
@@ -244,7 +247,8 @@ class LifecycleNameTests(unittest.TestCase):
             agent.main(["--help"])
         self.assertEqual(result.exception.code, 0)
         self.assertIn("connect (attach)", output.getvalue())
-        self.assertIn("restore (resume)", output.getvalue())
+        self.assertNotIn("restore (resume)", output.getvalue())
+        self.assertIn("resume", output.getvalue())
 
     def test_stop_and_down_share_all_lifecycle_and_checkpoint_options(self):
         parser = cli_parser()

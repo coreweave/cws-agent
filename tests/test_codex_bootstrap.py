@@ -40,7 +40,10 @@ class CodexBootstrap(unittest.TestCase):
     def package(self, *, missing=None):
         # Layout verified against the official rust-v0.153.4 package archive.
         files = {
-            "bin/codex": b'#!/bin/sh\nprintf "codex fixture-version\\n"\n',
+            "bin/codex": (b'#!/bin/sh\n'
+                          b'printf "%s\\n" "$*" >> "$CODEX_TEST_CALLS"\n'
+                          b'if [ "$1" = login ]; then cat >/dev/null; fi\n'
+                          b'printf "codex fixture-version\\n"\n'),
             "bin/codex-code-mode-host": b"#!/bin/sh\nexit 0\n",
             "codex-path/rg": b"#!/bin/sh\nexit 0\n",
             "codex-resources/bwrap": b"#!/bin/sh\nexit 0\n",
@@ -58,12 +61,13 @@ class CodexBootstrap(unittest.TestCase):
                 entry.size = len(content)
                 archive.addfile(entry, io.BytesIO(content))
 
-    def run_bootstrap(self, architecture="x86_64"):
+    def run_bootstrap(self, architecture="x86_64", api_key=""):
         script = BOOTSTRAP.replace("/opt/agent", str(self.agent)).replace(
             "/workspace", str(self.root / "workspace"))
         return subprocess.run(["sh", "-c", script], text=True, capture_output=True,
                               env={"PATH": str(self.commands) + ":/usr/bin:/bin",
-                                   "OPENAI_API_KEY": "", "CODEX_TEST_ARCH": architecture,
+                                   "OPENAI_API_KEY": api_key, "CODEX_TEST_ARCH": architecture,
+                                   "CODEX_TEST_CALLS": str(self.root / "calls"),
                                    "CODEX_TEST_PACKAGE": str(self.archive),
                                    "CODEX_TEST_URL_LOG": str(self.url_log)})
 
@@ -98,6 +102,23 @@ class CodexBootstrap(unittest.TestCase):
         result = self.run_bootstrap()
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("codex fixture-version", result.stdout)
+
+    def test_restored_login_is_not_replaced_by_ambient_api_key(self):
+        self.package()
+        auth=self.root / "workspace/home/.codex/auth.json"
+        auth.parent.mkdir(parents=True)
+        auth.write_text('{"auth_mode":"chatgpt","tokens":{"id_token":"synthetic"}}')
+        before=auth.read_bytes()
+        result=self.run_bootstrap(api_key="synthetic-not-a-key")
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(auth.read_bytes(),before)
+        self.assertNotIn("login",(self.root / "calls").read_text())
+
+    def test_fresh_bootstrap_still_seeds_api_login(self):
+        self.package()
+        result=self.run_bootstrap(api_key="synthetic-not-a-key")
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn("login --with-api-key",(self.root / "calls").read_text())
 
 
 if __name__ == "__main__":

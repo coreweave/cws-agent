@@ -218,6 +218,6 @@ class BackgroundLaunchTests(unittest.TestCase):
                 patch.object(cli, "read_backend_config", return_value=None), \
                 patch.object(cli, "sync_agent_config"), \
                 patch.object(cli, "cmd_bridge_telegram", return_value=0) as bridge:
-            self.assertEqual(cli.main(["resume", "test", "--telegram", "--dangerously-skip-permissions"]), 0)
+            self.assertEqual(cli.main(["restore", "test", "--telegram", "--dangerously-skip-permissions"]), 0)
         self.assertEqual(provision.call_args.kwargs["disk"], "65Gi")
         self.assertTrue(bridge.call_args.args[0].yolo)

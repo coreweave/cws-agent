@@ -84,7 +84,7 @@ class SessionTests(unittest.TestCase):
     def test_resume_uses_recorded_directory(self):
         args = types.SimpleNamespace(name="dev", agent=None, session_id="abc", cwd=None)
         with patch.object(cli, "require_active", return_value=object()), patch.object(cli, "remote_native_history", return_value=[{"agent": "claude", "id": "abc", "cwd": "/workspace/sessions/my work"}]), patch.object(cli, "pty_attach", return_value=0) as attach:
-            cli.cmd_session_resume(args)
+            cli.resume_conversation(object(), args)
         self.assertEqual(attach.call_args.args[1], "cd '/workspace/sessions/my work' && exec claude --resume abc --dangerously-skip-permissions")
 
     def test_resume_parser_routes_without_cloud(self):

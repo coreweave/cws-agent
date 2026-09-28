@@ -366,7 +366,7 @@ class DocumentedSnapshotCommands(unittest.TestCase):
                 patch.object(app, "sync_agent_config") as config_sync, \
                 patch.object(app, "provision_session", return_value=types.SimpleNamespace(sandbox_id="sb-example")) as provision, \
                 patch.object(app, "pty_attach", return_value=0) as attach:
-            self.assertEqual(self.call(["resume", "dev1", "--attach"]), 0)
+            self.assertEqual(self.call(["restore", "dev1", "--attach"]), 0)
         self.assertEqual(provision.call_args.kwargs["restore_snapshot_id"], "ready")
         self.assertEqual(provision.call_args.kwargs["harness"].name, "codex")
         self.assertIsNone(provision.call_args.kwargs["repo_url"])
@@ -376,14 +376,14 @@ class DocumentedSnapshotCommands(unittest.TestCase):
     def test_resume_refuses_existing_sandbox_without_provision(self):
         with patch.object(app, "find_active", return_value=object()), \
                 patch.object(app, "provision_session") as provision, self.assertRaises(SystemExit):
-            self.call(["resume", "dev1"])
+            self.call(["restore", "dev1"])
         provision.assert_not_called()
 
     def test_resume_without_snapshot_does_not_create_sandbox(self):
         with patch.object(app, "find_active", return_value=None), \
                 patch.object(app, "latest_ready_snapshot", return_value=None), \
                 patch.object(app, "provision_session") as provision, self.assertRaises(SystemExit):
-            self.call(["resume", "dev1"])
+            self.call(["restore", "dev1"])
         provision.assert_not_called()
 
     def test_snapshot_and_checkpoint_alias_snapshot_without_stopping(self):
