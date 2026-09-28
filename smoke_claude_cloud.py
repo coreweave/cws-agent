@@ -43,7 +43,7 @@ def main():
                          "chmod 755 /usr/local/bin/cws-cloud-proof\n")
         try:
             cli.main(['cloud', 'start', name, '--environment', args.environment,
-                      '--setup', str(setup), '--lifetime', '30m'])
+                      '--setup', str(setup), '--ttl', '30m'])
             cli.main(['cloud', 'run', name, goal, '--repo', args.repo, '--ref', args.ref])
             sandbox = cli.require_active(name)
             deadline = time.monotonic() + args.timeout

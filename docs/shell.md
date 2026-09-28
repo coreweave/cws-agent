@@ -30,8 +30,22 @@ To stop it without saving a new snapshot, run locally:
 cws-agent stop dev1 --no-snapshot
 ```
 
-New sandboxes have an 8-hour maximum lifetime. Reconnecting doesn't extend it or
-resume the previous shell process. Omit `NAME` to generate a new name, which the
+Set `--ttl` when creating a sandbox to choose its maximum lifetime, up to 30 days.
+The default is 8 hours:
+
+```bash
+cws-agent shell short-task --ttl 5m
+cws-agent shell workday --ttl 8h
+cws-agent shell long-job --ttl 30d
+```
+
+Use a positive integer in seconds, or add `s`, `m`, `h`, or `d` for seconds,
+minutes, hours, or days. For accepted values and expiry behavior, see
+[sandbox lifetime](usage.md#set-the-sandbox-lifetime). For platform guidance, see
+[Run long-running sandboxes](https://docs.coreweave.com/products/sandboxes/long-running-sandboxes).
+
+Reconnecting doesn't extend the lifetime or resume the previous shell process.
+Omit `NAME` to generate a new name, which the
 CLI prints. Names identify `cws-agent` sessions, including ones created by `launch`.
 
 To debug a running sandbox created by `cws-agent launch`, list your sessions, then
@@ -78,6 +92,7 @@ rejects creation options. Use its name without those options to reconnect.
 
 | Creation flag | Value and default |
 | --- | --- |
+| `--ttl` | Maximum sandbox lifetime, such as `5m`, `8h`, or `30d`. Default: `8h`. Maximum: `30d`. |
 | `--mode` | `serverless` or `cks`. Default: serverless, or CKS when `--volume` is present. |
 | `--image` | Container image. Default: `python:3.11`. |
 | `--cpu` | Cores or millicores, such as `2`, `0.5`, or `500m`. Default: `2`. |
@@ -164,8 +179,11 @@ cws-agent shell restored1 --snapshot dev1
 ```
 
 The second command opens a new sandbox from the latest ready snapshot of `dev1`.
+Its lifetime defaults to 8 hours. To choose a different lifetime, pass `--ttl`.
 Use `cws-agent snapshot dev1` to save without stopping, or `down --no-snapshot`
 to stop without requesting a new snapshot.
+
+Lifetime expiry doesn't automatically save a snapshot. Save work before the deadline.
 
 `--snapshot` also accepts an ID or exact snapshot `request_id`. Lookup order is
 ID, request ID, then session name. Ambiguous request IDs and snapshots that aren't

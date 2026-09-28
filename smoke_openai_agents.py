@@ -35,7 +35,7 @@ def main(argv=None):
     report = {"name": name, "passed": False, "checks": []}
     try:
         if cli.main(["launch", "--name", name, "--agent", "openai",
-                     "--openai-model", args.model, "--lifetime", "15m", "--disk", "1Gi"]) != 0:
+                     "--openai-model", args.model, "--ttl", "15m", "--disk", "1Gi"]) != 0:
             raise RuntimeError("launch failed")
         state = cli.read_backend_config(cli.require_active(name))
         session_id = state["target"]
@@ -55,7 +55,7 @@ def main(argv=None):
         report["checks"].append("follow-up changed the file in the same API session")
         if cli.main(["stop", name]) != 0:
             raise RuntimeError("snapshot and stop failed")
-        if cli.main(["restore", name, "--lifetime", "15m"]) != 0:
+        if cli.main(["restore", name, "--ttl", "15m"]) != 0:
             raise RuntimeError("restore failed")
         restored = cli.read_backend_config(cli.require_active(name))
         if restored["target"] != session_id:

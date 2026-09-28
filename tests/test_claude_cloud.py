@@ -31,10 +31,16 @@ class ClaudeCloudTests(unittest.TestCase):
         create.assert_not_called()
 
     def test_missing_secret_and_short_lifetime_do_not_allocate(self):
-        for extra, pattern in (([], 'export'), (['--lifetime', '5m'], '10m')):
-            with patch.dict(os.environ, {}, clear=True), patch.object(cli, 'provision_session') as create:
-                with self.assertRaisesRegex(SystemExit, pattern):
+        for extra in ([], ['--ttl', '5m']):
+            with patch.dict(os.environ, {}, clear=True), patch.object(cli, 'provision_session') as create, \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as raised:
                     cli.main(['cloud', 'start', 'test', '--environment', 'ccpool_test', *extra])
+                if extra:
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn('10m', errors.getvalue())
+                else:
+                    self.assertIn('export', str(raised.exception))
             create.assert_not_called()
 
     def test_start_only_passes_runner_secret_and_uses_isolated_git_proxy(self):
@@ -49,6 +55,7 @@ class ClaudeCloudTests(unittest.TestCase):
              patch.object(cli.time, 'time', return_value=1000), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(['cloud', 'start', 'test', '--environment', 'ccpool_test']), 0)
         self.assertEqual(create.call_args.kwargs['env'], {cli.CLOUD_SECRET: 'secret'})
+        self.assertEqual(create.call_args.kwargs['lifetime_seconds'], 28800)
         command = worker.call_args.args[3]
         self.assertIn('--capacity 1', command)
         self.assertIn('--use-anthropic-git-proxy', command)
@@ -56,6 +63,20 @@ class ClaudeCloudTests(unittest.TestCase):
         self.assertNotIn('secret', command)
         saved = json.loads(sb.write_file.call_args.args[1])
         self.assertEqual(saved, cli.backend_config('claude-cloud', 'ccpool_test', 1))
+
+    def test_custom_ttl_controls_provisioning_and_retirement(self):
+        for ttl, seconds in (('10m', 600), ('30d', 2592000)):
+            with self.subTest(ttl=ttl), \
+                 patch.dict(os.environ, {cli.CLOUD_SECRET: 'fixture'}), \
+                 patch.object(cli, 'find_active', return_value=None), \
+                 patch.object(cli, 'provision_session', return_value=Mock(sandbox_id='sb-example')) as create, \
+                 patch.object(cli, 'exec_retry', return_value=result('2.1.283 (Claude Code)\n--use-anthropic-git-proxy')), \
+                 patch.object(cli, 'start_checked_worker') as worker, \
+                 patch.object(cli, 'cloud_health', return_value={'runner_id': 'r', 'last_poll_age_ms': 0}), \
+                 patch.object(cli.time, 'time', return_value=1000), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(['cloud', 'start', 'test', '--environment', 'ccpool_test', '--ttl', ttl]), 0)
+                self.assertEqual(create.call_args.kwargs['lifetime_seconds'], seconds)
+                self.assertIn(f'--retire-at {1000 + seconds - 300}', worker.call_args.args[3])
 
     def test_failed_registration_stops_allocated_compute(self):
         sb = Mock()

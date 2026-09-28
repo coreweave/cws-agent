@@ -655,7 +655,25 @@ def parse_duration(text: str) -> int:
     mult = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
     seconds = int(m.group(1)) * mult
     if seconds <= 0:
-        raise SystemExit("error: lifetime must be positive")
+        raise SystemExit("error: duration must be positive")
+    return seconds
+
+
+DEFAULT_TTL_SECONDS = 8 * 3600
+MAX_TTL_SECONDS = 30 * 24 * 3600
+
+
+def parse_ttl(text: str, *, minimum_seconds: int = 1) -> int:
+    minimum = "10m (600 seconds)" if minimum_seconds == 600 else f"{minimum_seconds}s"
+    bounds = f"must be between {minimum} and 30d (2592000 seconds)"
+    try:
+        seconds = parse_duration(text)
+    except (SystemExit, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"{bounds}; use whole seconds or an integer with s, m, h, or d"
+        ) from None
+    if not minimum_seconds <= seconds <= MAX_TTL_SECONDS:
+        raise argparse.ArgumentTypeError(bounds)
     return seconds
 
 
@@ -4241,7 +4259,7 @@ def launch_session(args) -> int:
         harness=harness,
         repo_url=repo_url,
         image=image,
-        lifetime_seconds=parse_duration(args.lifetime),
+        lifetime_seconds=args.ttl,
         cpu=args.cpu,
         memory=args.memory,
         disk=args.disk,
@@ -4551,7 +4569,7 @@ def cmd_shell(args) -> int:
     boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(args.name)], auth=sandbox_auth()).result()
     if len(boxes) > 1:
         raise SystemExit("error: multiple running sandboxes have this name; use a unique session name")
-    creation = [flag for flag in ("image", "cpu", "gpu", "memory", "secret", "snapshot", "volume", "add_local", "mode")
+    creation = [flag for flag in ("image", "cpu", "gpu", "memory", "secret", "snapshot", "volume", "add_local", "mode", "ttl")
                 if getattr(args, flag)]
     if boxes:
         if creation:
@@ -4559,6 +4577,7 @@ def cmd_shell(args) -> int:
                              ", ".join("--" + flag.replace("_", "-") for flag in creation))
         sb = boxes[0]
     else:
+        ttl = args.ttl if args.ttl is not None else DEFAULT_TTL_SECONDS
         snapshot = shell_snapshot(args.snapshot) if args.snapshot else None
         disk = "10Gi"
         if snapshot:
@@ -4567,7 +4586,7 @@ def cmd_shell(args) -> int:
         kwargs = dict(
             container_image=args.image or "python:3.11",
             tags=session_tags(args.name, "shell"),
-            max_lifetime_seconds=8 * 3600,
+            max_lifetime_seconds=ttl,
             environment_variables={"CWS_AGENT_NAME": args.name, "CWS_AGENT_HARNESS": "shell",
                                    "CWS_AGENT_DISK": disk},
             resources=ResourceOptions(requests={"cpu": args.cpu or "2", "memory": args.memory or "4Gi"},
@@ -4596,7 +4615,7 @@ def cmd_shell(args) -> int:
                     "memory": args.memory or "4Gi", "disk": disk, "mode": mode,
                     "gpu": args.gpu, "secrets": [s.name for s in args.secret],
                     "volumes": [v.volume_id + ":" + v.mount_path for v in args.volume],
-                    "lifetime_seconds": 8 * 3600,
+                    "lifetime_seconds": ttl,
                 }, restore_snapshot_id=snapshot.file_system_snapshot_id if snapshot else None)
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
@@ -6098,7 +6117,7 @@ def cmd_resume(args) -> int:
         harness=harness,
         repo_url=None,  # project restored from FSS
         image=image,
-        lifetime_seconds=parse_duration(args.lifetime),
+        lifetime_seconds=args.ttl,
         cpu=args.cpu or (checkpoint["cpu"] if checkpoint else "2"),
         memory=args.memory or (checkpoint["memory"] if checkpoint else "4Gi"),
         disk=args.disk or (saved_disk.group(1) if saved_disk else "10Gi"),
@@ -7454,6 +7473,15 @@ class RejectAgentFlag(argparse.Action):
                      "Remove --agent or use 'cws-agent launch NAME --agent AGENT'.")
 
 
+def add_ttl_flag(p: argparse.ArgumentParser, *, default: int | None = DEFAULT_TTL_SECONDS,
+                 minimum_seconds: int = 1) -> None:
+    minimum = "10m" if minimum_seconds == 600 else f"{minimum_seconds}s"
+    p.add_argument("--ttl", type=lambda text: parse_ttl(text, minimum_seconds=minimum_seconds),
+                   default=default, metavar="DURATION",
+                   help="maximum sandbox lifetime on creation: whole seconds or s/m/h/d "
+                        f"(default: 8h; minimum: {minimum}; maximum: 30d)")
+
+
 def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) -> None:
     add_verbose_flag(p)
     add_permission_flags(p)
@@ -7468,8 +7496,7 @@ def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) ->
     p.add_argument("--wandb", action="store_true", help="OpenCode with W&B Serverless Inference and the recommended coding model (needs WANDB_API_KEY)")
     p.add_argument("--wandb-model", metavar="MODEL_ID", help="override --wandb's model with a W&B catalog ID")
     p.add_argument("--image", help="override the harness container image")
-    p.add_argument("--lifetime", default="8h",
-                   help="max sandbox lifetime, e.g. 90m / 8h / 7d (default: 8h)")
+    add_ttl_flag(p)
     p.add_argument("--cpu", default="2", help="CPU request/limit (default: 2)")
     p.add_argument("--memory", default="4Gi", help="memory request/limit (default: 4Gi)")
     p.add_argument("--disk", help="/workspace volume size (launch --local-dir: automatic with headroom; otherwise 10Gi)")
@@ -7567,9 +7594,7 @@ def cmd_cloud_start(args):
     if not NAME_RE.fullmatch(args.name):
         raise SystemExit("error: invalid sandbox name")
     state = backend_config("claude-cloud", args.environment, 1)
-    lifetime = parse_duration(args.lifetime)
-    if lifetime < 600:
-        raise SystemExit("error: cloud runners need a lifetime of at least 10m (includes a 5m retirement margin)")
+    lifetime = args.ttl
     if args.ref and not args.goal:
         raise SystemExit("error: --ref requires --goal when starting a cloud runner")
     secret = os.environ.get(CLOUD_SECRET, "").strip()
@@ -7670,7 +7695,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--environment", required=True, metavar="CCPOOL_ID")
     p.add_argument("--image", help="custom Debian-compatible image with Python, bash, and apt-get")
     p.add_argument("--setup", help="local Bash setup script to run before starting the runner")
-    p.add_argument("--lifetime", default="8h")
+    add_ttl_flag(p, minimum_seconds=600)
     p.add_argument("--cpu", default="2")
     p.add_argument("--memory", default="4Gi")
     p.add_argument("--disk", default="10Gi")
@@ -7692,6 +7717,7 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(func=function)
 
     p = sub.add_parser("shell", help="create or reconnect to a sandbox terminal", allow_abbrev=False)
+    add_ttl_flag(p, default=None)
     p.add_argument("name", nargs="?", help="session name (default: generate a new shell name)")
     p.add_argument("--add-local", type=shell_text, action="append", default=[], metavar="PATH",
                    help="copy a file or directory to /mnt/BASENAME on creation (repeatable)")

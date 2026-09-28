@@ -46,7 +46,7 @@ fi
 MARKER="persisted-$(date +%s)"
 
 step "launch --detach (creates sandbox, installs Claude Code into /opt/agent)"
-"$DIR/cws-agent.py" launch --name "$NAME" --lifetime 30m --detach
+"$DIR/cws-agent.py" launch --name "$NAME" --ttl 30m --detach
 SMOKE_OWNS_SANDBOX=1
 
 step "seed a marker into /workspace/project (proves persistence across restore)"
@@ -62,7 +62,7 @@ step "stop (snapshot + stop)"
 "$DIR/cws-agent.py" stop "$NAME"
 
 step "restore (restore latest snapshot into a fresh sandbox)"
-"$DIR/cws-agent.py" restore "$NAME" --lifetime 30m
+"$DIR/cws-agent.py" restore "$NAME" --ttl 30m
 
 step "verify marker survived the stop/restore round-trip"
 GOT="$("$DIR/cws-agent.py" exec "$NAME" "cat /workspace/project/marker.txt" | tr -d '[:space:]')"
