@@ -522,7 +522,7 @@ if args[0] == "exec":
         self.assertNotEqual(launches[0][2], launches[1][2])
         for call in self.calls():
             if call[0] in ("launch", "restore", "resume"):
-                self.assertEqual(call[call.index("--lifetime") + 1], "30m")
+                self.assertEqual(call[call.index("--ttl") + 1], "30m")
         self.assertEqual(sum(call[0] == "prune" for call in self.calls()), 2)
 
 

@@ -5,6 +5,9 @@
 The provider manages the conversation and agent loop; tools run in your sandbox.
 Set up [sandbox authentication](usage.md#authentication), then choose a provider.
 For the OpenAI Agents API, see [its setup guide](openai-agents.md).
+For Claude Code cloud sessions, see [Run Claude Code cloud sessions in a sandbox](claude-cloud.md).
+That workflow uses a Claude Code runner and a `ccpool_...` environment;
+Claude Managed Agents uses the separate API and credentials described below.
 
 ## Claude Managed Agents
 

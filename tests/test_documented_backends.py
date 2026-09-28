@@ -141,7 +141,7 @@ class BackendRestoreTests(unittest.TestCase):
         self.sandbox.stop.return_value = completed()
         self.args = types.SimpleNamespace(name="workerbox", claude_env=None, outpost=None,
                                           workers=None, agent=None, image=None, env=[], env_passthrough=[],
-                                          lifetime="8h", cpu="2", memory="4Gi", disk="10Gi", mode=None,
+                                          ttl=28800, cpu="2", memory="4Gi", disk="10Gi", mode=None,
                                           attach=False)
 
     def resume(self, harness, state, env, *, start_error=None):

@@ -280,13 +280,58 @@ cws-agent rc my-claude
 Complete `/login` and exit Claude before running `rc`. API keys and setup tokens
 alone do not support this workflow. [Provider requirements](https://code.claude.com/docs/en/remote-control).
 
+## Set the sandbox lifetime
+
+Use `--ttl` to set the maximum lifetime when creating a sandbox. The default is
+8 hours for `launch`, every agent shortcut, `shell`, `restore` (also called
+`resume`), and `cloud start`.
+
+The allowed range is 1 second through 30 days, inclusive. `cloud start` requires
+at least 10 minutes, with the same 30-day maximum.
+
+Specify a positive integer in seconds, or add a lowercase unit suffix:
+
+| Unit | Example | Duration |
+| --- | --- | --- |
+| Seconds (`s`, or no suffix) | `300s` or `300` | 5 minutes |
+| Minutes (`m`) | `5m` | 5 minutes |
+| Hours (`h`) | `8h` | 8 hours |
+| Days (`d`) | `30d` | 30 days |
+
+```bash
+cws-agent shell quick-check --ttl 5m
+cws-agent claude workday --ttl 8h
+cws-agent launch long-job --agent codex --ttl 30d
+```
+
+The CLI rejects values outside the allowed range before any API call and reports
+the minimum and maximum in the error message. Use one unit per value: `90m`
+works, but `1h30m`, fractions, calendar dates, and `infinite`
+don't. `0` doesn't disable expiry. For cloud runner behavior, see
+[Claude Code Cloud](claude-cloud.md#optional-customize-the-sandbox).
+
+The lifetime keeps counting while you are disconnected or work is running.
+Exiting an agent or shell doesn't stop its sandbox. Reconnecting doesn't reset
+or extend the deadline. You can't change the lifetime of a running sandbox.
+When reconnecting, `shell` rejects `--ttl`, as do agent shortcuts with `--resume`.
+
+`restore` and `shell --snapshot` create a new sandbox with the lifetime you specify,
+or 8 hours if omitted.
+
+Expiry terminates the sandbox without automatically saving a snapshot. Save work
+with `snapshot` or `stop` before the deadline. For platform lifetime behavior and
+long-running workloads, see [Run long-running sandboxes](https://docs.coreweave.com/products/sandboxes/long-running-sandboxes).
+
+`--ttl` replaces `--lifetime`. Update existing scripts to use `--ttl`.
+
 ## Options
 
 Run `cws-agent --help` or `cws-agent launch --help` for all commands and flags.
 
 | Task | Options |
 | --- | --- |
-| Set resources | `--cpu 4 --memory 8Gi --disk 20Gi --lifetime 7d` |
+| Set resources | `--cpu 4 --memory 8Gi --disk 20Gi` |
+| Set the sandbox lifetime | `--ttl 5m`, `--ttl 8h`, or `--ttl 30d` (maximum) |
 | Choose an image or placement | `--image IMAGE`, `--mode serverless\|cks` |
 | Pass environment variables | `--env KEY=VALUE`, `--env-passthrough KEY` |
 | Clone or upload a project | `--repo-url URL`, `--local-dir PATH` |

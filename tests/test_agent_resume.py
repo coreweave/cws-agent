@@ -127,7 +127,7 @@ class AgentResumeTests(unittest.TestCase):
 
     def test_creation_options_and_worker_shortcuts_cannot_resume(self):
         for flags in (["--local-dir", "."], ["--detach"], ["--cpu", "4"],
-                      ["--cpu", "2"], ["--cp=2"], ["--memory=4Gi"], ["--lifetime", "8h"],
+                      ["--cpu", "2"], ["--cp=2"], ["--memory=4Gi"], ["--ttl", "8h"], ["--ttl=8h"],
                       ["--env", "EXAMPLE=value"], ["--claude-env", "env_example"],
                       ["--import-codex-auth"], ["--telegram"]):
             with self.subTest(flags=flags), self.assertRaises(SystemExit) as error:
