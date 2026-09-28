@@ -88,6 +88,29 @@ class ShellTests(unittest.TestCase):
         self.assertRegex(name, r"^shell-[a-f0-9]{8}$")
         self.assertIn(name, self.stderr.getvalue())
 
+    def test_ttl_matches_sdk_and_metadata_for_creation_and_restore(self):
+        for auth, mode in ((AuthStrategy.WANDB, "serverless"),
+                           (AuthStrategy.COREWEAVE_API_KEY, "serverless"),
+                           (AuthStrategy.COREWEAVE_API_KEY, "cks")):
+            for restore in ([], ["--snapshot", "fss-example"]):
+                for flags, seconds in (([], 28800), (["--ttl", "5m"], 300),
+                                       (["--ttl", "30d"], 2592000)):
+                    with self.subTest(auth=auth, mode=mode, restore=restore, flags=flags), \
+                         patch.object(agent, "save_workspace_metadata") as metadata:
+                        self.auth.return_value = auth
+                        self.invoke("dev1", "--mode", mode, "--cmd", "true", *restore, *flags)
+                        self.assertEqual(self.run.call_args.kwargs["max_lifetime_seconds"], seconds)
+                        self.assertEqual(metadata.call_args.args[3]["lifetime_seconds"], seconds)
+
+    def test_explicit_ttl_cannot_change_running_sandbox(self):
+        self.list.return_value.result.return_value = [self.sb]
+        for ttl in ("5m", "8h", "30d"):
+            with self.subTest(ttl=ttl), self.assertRaisesRegex(SystemExit, "creation options.*--ttl"):
+                self.invoke("dev1", "--ttl", ttl)
+        self.run.assert_not_called()
+        self.sb.write_file.assert_not_called()
+        self.pty.assert_not_called()
+
     def test_connect_does_not_create_or_modify_existing_sandbox(self):
         self.list.return_value.result.return_value = [self.sb]
         self.invoke("dev1", "--cmd", "nvidia-smi")

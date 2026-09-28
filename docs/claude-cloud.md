@@ -100,8 +100,15 @@ Choose resources when creating a runner:
 
 ```bash
 cws-agent cloud start build1 --environment '[ENVIRONMENT-ID]' \
-  --cpu 4 --memory 8Gi --disk 20Gi --lifetime 8h
+  --cpu 4 --memory 8Gi --disk 20Gi --ttl 8h
 ```
+
+Use `--ttl` to set the sandbox's maximum lifetime. The default is 8 hours, and
+the maximum is `30d` (30 days). Use the [duration format](usage.md#set-the-sandbox-lifetime)
+to specify minutes, hours, or days. Cloud runners require at least `10m` and
+start retiring 5 minutes before the sandbox deadline. A value of `5m` isn't
+valid for `cloud start`. For platform guidance, see
+[Run long-running sandboxes](https://docs.coreweave.com/products/sandboxes/long-running-sandboxes).
 
 Use `--image IMAGE` for a custom Debian-compatible sandbox image with Python,
 Bash, and `apt-get`. The bootstrap installs current Claude Code when absent;
