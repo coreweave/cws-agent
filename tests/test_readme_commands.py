@@ -91,7 +91,7 @@ class ReadmeCommands(unittest.TestCase):
                 self.assertNotIn("./cws-agent", body)
         self.assertIn("https://raw.githubusercontent.com/coreweave/cws-agent/main/install.sh", README)
         self.assertTrue((ROOT / "install.sh").is_file())
-        self.assertIn("zsh and bash", README)
+        self.assertIn("zsh and bash", README.replace("`", ""))
         self.assertLess(len(README.splitlines()), 220, "Keep the quickstart concise")
 
     def test_shell_fences_have_valid_bash_syntax(self):
@@ -105,6 +105,7 @@ class ReadmeCommands(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_all_documented_cli_examples_parse_without_dispatch(self):
+        self.enterContext(patch.object(APP, "read_resume_input"))
         commands = list(documented_commands())
         self.assertTrue(commands, "README has no CLI examples to check")
         # Stub handlers before main builds its parser, so argparse resolves the

@@ -27,20 +27,21 @@ instead of hosting a CLI you drive: `launch --outpost NAME` runs Devin outpost
 workers that claim sessions from Devin Cloud.
 
 Usage:
-    cws-agent claude  [NAME] [--local-dir .]
+    cws-agent claude  [NAME] [--add-dir .]
     cws-agent codex   [NAME] [--import-codex-auth]
     cws-agent devin   [NAME]
     cws-agent opencode [NAME] [--wandb]
     cws-agent cursor  [NAME]
     cws-agent anthropic [NAME] --claude-env ENV_ID
     cws-agent openai  [NAME]
-    cws-agent launch  [NAME] [--agent claude|codex|devin|opencode|cursor] [--local-dir .]
+    cws-agent launch  [NAME] [--agent claude|codex|devin|opencode|cursor] [--add-dir .]
     cws-agent launch  box1 --outpost my-outpost --workers 2
     cws-agent connect  dev1 [--cmd bash]
     cws-agent shell   dev1 [--gpu any:1] [--cmd nvidia-smi]
     cws-agent run     dev1 "fix the failing test" [--yolo]
     cws-agent snapshot dev1
     cws-agent stop    dev1 [--no-snapshot]
+    cws-agent resume   [NAME|SESSION_ID]
     cws-agent restore  dev1 [--connect]
     cws-agent list / status dev1 / snapshots dev1
     cws-agent session start|attach|ls|diff|stop   # parallel agents, one worktree each
@@ -331,7 +332,7 @@ if [ ! -x /opt/agent/bin/codex ] || \
 fi
 export PATH="/opt/agent/bin:$PATH"
 echo -n "[bootstrap] codex: "; codex --version
-if [ -n "$OPENAI_API_KEY" ]; then
+if [ -n "$OPENAI_API_KEY" ] && [ ! -f /workspace/home/.codex/auth.json ]; then
   printf '%s' "$OPENAI_API_KEY" | HOME=/workspace/home codex login --with-api-key >/dev/null 2>&1 \
     && echo "[bootstrap] codex: stored API-key auth" \
     || echo "[bootstrap] codex: could not store API-key auth (run: cws-agent login)"
@@ -699,11 +700,13 @@ def probe_session_meta(sb: Sandbox) -> tuple[str, str]:
     return "?", "?"
 
 
-def active_harness(sb: Sandbox, override: str | None = None) -> Harness:
+def active_harness(sb: Sandbox, override: str | None = None, *, allow_shell=False) -> Harness | None:
     if override:
         return HARNESSES[override]
     _, h = probe_session_meta(sb)
     if h == "shell":
+        if allow_shell:
+            return None
         raise SystemExit("error: this is a shell sandbox; use `cws-agent shell NAME` or `cws-agent exec NAME COMMAND`")
     return HARNESSES.get(h, HARNESSES["claude"])
 
@@ -2251,6 +2254,14 @@ UPLOAD_REMOTE_ROOT = "/workspace/.cws-uploads"
 class UploadPaused(SystemExit):
     """A cached upload can be resumed; launch must not destroy its sandbox."""
 
+    def __init__(self, message, *, upload_id=None, recovery_command=None):
+        super().__init__(message)
+        self.upload_id = upload_id
+        self.recovery_command = recovery_command
+        self.safe_message = "Upload paused; cached files and the running sandbox were retained."
+        if recovery_command:
+            self.safe_message += " Resume: " + recovery_command
+
 
 # This helper uses only the sandbox's Python standard library and tar. Every
 # operation takes the staging lock; filenames are derived only from validated IDs
@@ -2344,11 +2355,12 @@ def main():
         complete = False
         if marker.exists() or marker.is_symlink():
             with regular(marker) as stream:
-                complete = stream.read() == b"complete"
+                saved = stream.read()
+                complete = saved == b"complete" or bool(json.loads(saved).get("complete"))
         action = request["action"]
         if complete:
             cleanup()
-            print(json.dumps({"complete": True, "verified": []}))
+            print(saved.decode() if saved != b"complete" else json.dumps({"complete": True, "verified": []}))
             return
         if action == "status":
             verified = [i for i in range(len(manifest["chunks"])) if valid(i)]
@@ -2389,9 +2401,11 @@ def main():
         elif action == "extract":
             if not all(valid(i) for i in range(len(manifest["chunks"]))):
                 raise ValueError("missing or damaged chunks; resume upload before extraction")
-            directory(project)
+            safe_merge = manifest.get("safe_merge", False)
+            if not safe_merge:
+                directory(project)
             target = project
-            if manifest.get("preserve_existing", False):
+            if safe_merge or manifest.get("preserve_existing", False):
                 target = folder / "unpacked"
                 if target.is_symlink():
                     raise ValueError("unsafe unpacked staging directory")
@@ -2425,7 +2439,9 @@ def main():
                     if proc.poll() is None:
                         proc.kill()
                         proc.wait()
-                if target != project:
+                if safe_merge:
+                    merged = install_directory_upload(str(target), "apply", manifest["overwrite"])
+                elif target != project:
                     # Never replace files created by the live agent. Link each
                     # staged file into place atomically; a race preserves remote work.
                     def merge(source, destination):
@@ -2451,9 +2467,12 @@ def main():
                 # sync is Linux-specific; the sandbox images run Linux.
                 if hasattr(os, "sync"):
                     os.sync()
-            durable(marker, b"complete")
+            receipt = {"complete": True, "verified": []}
+            if safe_merge:
+                receipt["transfer"] = merged
+            durable(marker, json.dumps(receipt).encode())
             cleanup()
-            print(json.dumps({"complete": True, "verified": []}))
+            print(json.dumps(receipt))
         else:
             raise ValueError("invalid upload operation")
 
@@ -2506,6 +2525,9 @@ def upload_manifest(folder):
         chunks = manifest["chunks"]
         if (manifest["version"] != 1 or manifest["id"] != folder.name
                 or type(manifest["clean"]) is not bool or not isinstance(chunks, list) or not chunks
+                or type(manifest.get("safe_merge", False)) is not bool
+                or type(manifest.get("overwrite", False)) is not bool
+                or (manifest.get("safe_merge") and manifest["clean"])
                 or not isinstance(manifest["source"], str)
                 or type(manifest["count"]) is not int or manifest["count"] < 0
                 or type(manifest["unpacked_size"]) is not int or manifest["unpacked_size"] < 0
@@ -2552,17 +2574,23 @@ def discard_upload(folder):
     folder.rmdir()
 
 
-def cache_upload(local_dir, *, include_git, extra_excludes, clean, inventory, preserve_existing=False):
+def cache_upload(local_dir, *, include_git, extra_excludes, clean, inventory, preserve_existing=False,
+                 upload_plan=None, overwrite=False):
     import hashlib
     import secrets
     folder = upload_cache_root() / secrets.token_hex(16)
     folder.mkdir(mode=0o700)
     with upload_lock(folder):
         try:
-            inventory = inventory or scan_local_dir(local_dir, include_git=include_git, extra_excludes=extra_excludes)
-            tar_path, count = build_local_tar(local_dir, include_git=include_git,
-                                             extra_excludes=extra_excludes, inventory=inventory,
-                                             archive_dir=str(folder))
+            if upload_plan is None:
+                inventory = inventory or scan_local_dir(local_dir, include_git=include_git, extra_excludes=extra_excludes)
+                tar_path, count = build_local_tar(local_dir, include_git=include_git,
+                                                 extra_excludes=extra_excludes, inventory=inventory,
+                                                 archive_dir=str(folder))
+            else:
+                inventory = LocalDirectoryInventory("", upload_plan, sum(item["size"] for item in upload_plan),
+                                                    len(upload_plan), set())
+                tar_path, count = build_directory_upload(folder, upload_plan)
             os.replace(tar_path, folder / "archive.tar.gz")
             chunks = []
             size = (folder / "archive.tar.gz").stat().st_size
@@ -2575,6 +2603,8 @@ def cache_upload(local_dir, *, include_git, extra_excludes, clean, inventory, pr
                         "size": size, "count": count, "clean": clean, "chunks": chunks,
                         "unpacked_size": inventory.total + 4096 * len(inventory.entries),
                         "preserve_existing": preserve_existing}
+            if upload_plan is not None:
+                manifest.update(safe_merge=True, overwrite=overwrite)
             # Same atomic, mode-600 JSON writer used for other private local state.
             telegram_save_json(folder / "manifest.json", manifest)
             fd = os.open(folder, os.O_RDONLY)
@@ -2593,7 +2623,10 @@ def upload_command(manifest, action, **kwargs):
     remote_manifest = {key: value for key, value in manifest.items() if key != "source"}
     kwargs.setdefault("timeout", 300)
     request = dict(manifest=remote_manifest, action=action, root=UPLOAD_REMOTE_ROOT, project=PROJECT_DIR, **kwargs)
-    return ["python3", "-c", UPLOAD_REMOTE, json.dumps(request)]
+    helper = UPLOAD_REMOTE
+    if manifest.get("safe_merge"):
+        helper = inspect.getsource(install_directory_upload) + "\n" + helper
+    return ["python3", "-c", helper, json.dumps(request)]
 
 
 def upload_result(result):
@@ -2632,7 +2665,7 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
             state = status()
         if state["complete"]:
             print("Remote extraction already completed; no upload needed.")
-            return
+            return state.get("transfer")
         verified = set(state["verified"])
         saved = sum(manifest["chunks"][i]["size"] for i in verified)
         with TransferProgress("Uploading (verified)", manifest["size"], initial=saved) as progress:
@@ -2678,7 +2711,7 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
                         time.sleep(attempt + 1)
                         current = status()
                         if current["complete"]:
-                            return
+                            return current.get("transfer")
                         if index in current["verified"]:
                             break
                 progress.advance(part["size"])
@@ -2690,41 +2723,48 @@ def transfer_cached_upload(sb, folder, manifest, timeout, session_name=None):
         with startup_step("Extracting uploaded files"):
             with workspace_access(session_name) if session_name else contextlib.nullcontext():
                 result = sb.exec(upload_command(manifest, "extract", timeout=timeout), timeout_seconds=timeout).result()
-            if json.loads(upload_result(result).stdout).get("complete") is not True:
+            receipt = json.loads(upload_result(result).stdout)
+            if receipt.get("complete") is not True:
                 raise ProjectUploadError("missing extraction completion receipt")
+            return receipt.get("transfer")
 
 
 def sync_local_dir(sb: Sandbox, local_dir: str, *, include_git: bool,
                    extra_excludes, clean: bool, inventory: LocalDirectoryInventory | None = None,
                    transfer_timeout: int | None = None, resume_upload: str | None = None,
-                   session_name: str | None = None, preserve_existing=False) -> None:
+                   session_name: str | None = None, preserve_existing=False,
+                   upload_plan=None, overwrite=False):
     folder = upload_folder(resume_upload) if resume_upload else cache_upload(
         local_dir, include_git=include_git, extra_excludes=extra_excludes, clean=clean, inventory=inventory,
-        preserve_existing=preserve_existing)
+        preserve_existing=preserve_existing, upload_plan=upload_plan, overwrite=overwrite)
     with upload_lock(folder):
         manifest = upload_manifest(folder)
         if manifest["clean"] != clean:
             raise SystemExit("error: cached upload clean mode differs; resume a clean upload with --clean")
         name = shlex.quote(session_name or "NAME")
         recovery = f"cws-agent sync {name} --resume-upload {folder.name}" + (" --clean" if clean else "")
+        if manifest.get("safe_merge"):
+            recovery += " --no-snapshot"
         timeout = transfer_timeout or project_upload_timeout(manifest["size"], manifest["count"])
         print(f"Upload {folder.name}: {manifest['count']} files, {transfer_size(manifest['size'])} compressed.")
         print(f"Resume if interrupted: {recovery}", flush=True)
         print(f"Upload/extraction time budget: {(timeout + 59) // 60} minutes (override with --transfer-timeout).", flush=True)
         try:
-            transfer_cached_upload(sb, folder, manifest, timeout, session_name=session_name)
+            result = transfer_cached_upload(sb, folder, manifest, timeout, session_name=session_name)
         except (Exception, KeyboardInterrupt) as error:
             detail = str(error) if isinstance(error, ProjectUploadError) else type(error).__name__
             raise UploadPaused(f"error: upload paused ({detail}). Cached archive and remote chunks retained.\n"
                                f"Resume: {recovery}\n"
                                "The sandbox remains billable until stopped or its original lifetime expires.\n"
                                f"Stop: cws-agent stop {name} --no-snapshot\n"
-                               f"Local cache: {folder} (discard: cws-agent uploads --discard {folder.name})") from None
+                               f"Local cache: {folder} (discard: cws-agent uploads --discard {folder.name})",
+                               upload_id=folder.name, recovery_command=recovery) from None
         try:
             discard_upload(folder)
         except (OSError, SystemExit):
             print(f"warning: upload succeeded; remove leftover local cache with `cws-agent uploads --discard {folder.name}`",
                   file=sys.stderr)
+        return result
 
 
 def cmd_uploads(args):
@@ -2777,7 +2817,15 @@ def start_background_upload(sb, args):
         command.extend(["--transfer-timeout", str(args.transfer_timeout)])
     if getattr(args, "no_snapshot", False):
         command.append("--no-snapshot")
-    command.append(os.path.abspath(args.local_dir))
+    if getattr(args, "add_dir", None):
+        for source in args.add_dir:
+            command.extend(["--_add-dir", os.path.realpath(os.path.expanduser(source))])
+        if getattr(args, "remote_path", None):
+            command.extend(["--_remote-path", args.remote_path])
+        if getattr(args, "overwrite", False):
+            command.append("--_overwrite")
+    else:
+        command.append(os.path.abspath(args.local_dir))
     fd = os.open(folder / "upload.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as log:
         try:
@@ -3058,12 +3106,16 @@ def command_uses_claude(remote_cmd: str) -> bool:
             (words[:1] == ["cd"] and words[2:5] == ["&&", "exec", "claude"]))
 
 
+class ResumeOperationError(SystemExit):
+    """Actionable, client-authored error safe to show during resume."""
+
+
 def pty_attach(sb: Sandbox, remote_cmd: str, *, image_paste: bool | None = None,
                plain_shell: bool = False) -> int:
     if os.name == "nt":
-        raise SystemExit("error: interactive terminal connections are not supported on Windows")
+        raise ResumeOperationError("error: interactive terminal connections are not supported on Windows")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise SystemExit("error: connect requires a TTY (try `run` for headless use)")
+        raise ResumeOperationError("error: connect requires a TTY (try `run` for headless use)")
 
     import signal
     import select
@@ -3820,7 +3872,6 @@ def import_checklist(items, *, cancel_label="cancel command"):
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import HSplit, Layout, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
-    from prompt_toolkit.styles import Style
 
     groups = [(title, [item for item in items if item["kind"] == kind])
               for kind, title in (("skill", "Skills"), ("mcp", "Tools (MCP)"))]
@@ -3938,11 +3989,8 @@ def import_checklist(items, *, cancel_label="cancel command"):
         ]),
                dont_extend_height=True, wrap_lines=True),
     ])
-    style = {} if "NO_COLOR" in os.environ else {
-        "title": "bold ansicyan", "key": "bold ansicyan", "focus": "reverse",
-        "muted": "ansibrightblack", "warning": "ansiyellow"}
     app = Application(layout=Layout(layout, focused_element=control), key_bindings=keys,
-                      style=Style.from_dict(style), full_screen=False, erase_when_done=True)
+                      style=resume_style(), full_screen=False, erase_when_done=True)
     try:
         return app.run()
     except EOFError:
@@ -4093,7 +4141,7 @@ def sync_agent_config(sb, harness, args, *, cancel_label="cancel command") -> No
     proc.stdin.close().result(timeout=30)
     result = proc.result(timeout=130)
     if result.returncode not in (0, None):
-        raise SystemExit("error: configuration import failed; existing remote edits may conflict. " + (result.stderr or "")[-400:])
+        raise ResumeOperationError("error: configuration import failed; inspect the sandbox configuration for conflicting edits or retry with --no-config-sync")
     if result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
     detail = f" ({total} bytes)" if verbose else ""
@@ -4127,6 +4175,10 @@ def cmd_launch(args) -> int:
 
 
 def launch_session(args) -> int:
+    upload_plan = directory_upload_plan(args)
+    sources = getattr(args, "add_dir", []) or []
+    args.local_dir = (os.path.realpath(os.path.expanduser(sources[0]))
+                      if len(sources) == 1 and os.path.isdir(os.path.expanduser(sources[0])) else None)
     if getattr(args, "name", None) is None:
         import secrets
         harness = "ant" if args.claude_env else "devin" if args.outpost else args.agent
@@ -4206,18 +4258,18 @@ def launch_session(args) -> int:
                 "       export DEVIN_OUTPOSTS_TOKEN=<token shown once at creation>")
         env["DEVIN_OUTPOSTS_TOKEN"] = tok  # the exact name the worker reads
     # A local working copy wins over a git clone: sync your actual files in.
-    repo_url = None if args.local_dir else args.repo_url
+    repo_url = None if args.local_dir or upload_plan else args.repo_url
 
     if telegram:
         print("Telegram launch: size disk → install agent → review skills/MCPs → sign in → Telegram ready. "
               "Workspace packaging, upload, and snapshot run in the background.", flush=True)
-    local_inventory = None
-    if args.local_dir:
-        local_inventory = scan_local_dir(args.local_dir, include_git=not args.no_git, extra_excludes=args.exclude)
+    disk_inventory = None
+    if upload_plan:
+        disk_inventory = LocalDirectoryInventory("", upload_plan, sum(item["size"] for item in upload_plan), len(upload_plan), set())
     if args.disk is None:
-        args.disk = local_directory_disk(local_inventory) if local_inventory is not None else "10Gi"
-        if local_inventory is not None and getattr(args, "verbose", False):
-            print(f"Automatic disk: {args.disk} for {transfer_size(local_inventory.total)} of selected files "
+        args.disk = local_directory_disk(disk_inventory) if disk_inventory is not None else "10Gi"
+        if disk_inventory is not None and getattr(args, "verbose", False):
+            print(f"Automatic disk: {args.disk} for {transfer_size(disk_inventory.total)} of selected files "
                   "plus filesystem overhead and working space. Override with --disk.", flush=True)
     if harness.name == "openai":
         with openai_client() as client:
@@ -4254,11 +4306,9 @@ def launch_session(args) -> int:
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
         raise
-    if args.local_dir and not telegram:
+    if upload_plan and not telegram:
         try:
-            sync_local_dir(sb, args.local_dir, include_git=not args.no_git,
-                           extra_excludes=args.exclude, clean=False, inventory=local_inventory,
-                           transfer_timeout=getattr(args, "transfer_timeout", None), session_name=args.name)
+            apply_directory_upload(sb, args, upload_plan)
         except UploadPaused:
             if harness.name == "openai":
                 try:
@@ -4340,7 +4390,7 @@ def launch_session(args) -> int:
             ("Next", "Finish agent sign-in and Telegram pairing"),
         ])
         return start_launched_telegram(sb, harness, args, env)
-    if args.local_dir and not getattr(args, "no_snapshot", False):
+    if (args.local_dir or upload_plan) and not getattr(args, "no_snapshot", False):
         automatic_snapshot(sb, args.name, harness.name)
     if harness.name == "claude":
         if "CLAUDE_CODE_OAUTH_TOKEN" in env:
@@ -4420,44 +4470,6 @@ def shell_volume(value: str):
     return RegisteredVolumeOptions(name=volume_id, volume_id=volume_id, mount_path=path)
 
 
-def shell_local_files(paths, volumes):
-    """Inventory explicit copies before creating compute; do not follow links."""
-    from pathlib import Path, PurePosixPath
-    import stat
-    destinations = [PurePosixPath(v.mount_path) for v in volumes]
-    if len({v.volume_id for v in volumes}) != len(volumes):
-        raise SystemExit("error: each --volume ID may only be specified once")
-    roots = []
-    for value in paths:
-        path = Path(os.path.abspath(os.path.expanduser(value)))
-        if not path.name or path.name in {".", ".."}:
-            raise SystemExit("error: --add-local must name a file or directory, not the filesystem root")
-        destination = PurePosixPath("/mnt") / path.name
-        destinations.append(destination)
-        roots.append((path, destination))
-    for index, destination in enumerate(destinations):
-        for previous in destinations[:index]:
-            if destination == previous or destination in previous.parents or previous in destination.parents:
-                raise SystemExit(f"error: overlapping --add-local/--volume destinations: {previous} and {destination}")
-    entries = []
-    for root, destination in roots:
-        def visit(path, remote):
-            mode = path.lstat().st_mode
-            if stat.S_ISDIR(mode):
-                entries.append((path, str(remote), mode))
-                for child in sorted(path.iterdir()):
-                    visit(child, remote / child.name)
-            elif stat.S_ISREG(mode):
-                entries.append((path, str(remote), mode))
-            else:
-                raise SystemExit(f"error: --add-local supports regular files and directories only: {path}")
-        try:
-            visit(root, destination)
-        except OSError as error:
-            raise SystemExit(f"error: cannot read --add-local path {root}: {error.strerror}") from None
-    return entries
-
-
 def shell_snapshot(reference: str):
     snapshots = Sandbox.list_snapshots(auth=sandbox_auth()).result()
     matches = [s for s in snapshots if s.file_system_snapshot_id == reference]
@@ -4477,35 +4489,355 @@ def shell_command(command: str) -> str:
     return f"export HOME={HOME_DIR}; cd {PROJECT_DIR} || exit; " + command
 
 
-def shell_copy_files(sb, entries):
+def add_directory_flags(parser):
+    parser.add_argument("--add-dir", type=shell_text, action="append", default=[], metavar="PATH",
+                        help="copy file or directory contents to /workspace/project (repeatable)")
+    parser.add_argument("--local-dir", "--add-local", dest="add_dir", type=shell_text, action="append", help=argparse.SUPPRESS)
+    parser.add_argument("--remote-path", metavar="PATH", help="absolute destination; trailing / means directory")
+    parser.add_argument("--overwrite", action="store_true", help="replace incoming file collisions, preserving Git metadata")
+    parser.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
+                        help="upload/extraction deadline, e.g. 4h (default: size-based)")
+    parser.add_argument("--no-git", action="store_true", help="exclude .git from uploads")
+    parser.add_argument("--exclude", action="append", default=[], metavar="NAME",
+                        help="extra directory/file name to exclude from uploads (repeatable)")
+
+
+def directory_upload_plan(args):
+    """Validate selected sources before allocating compute; never follow nested links."""
+    from pathlib import Path, PurePosixPath
     import stat
-    # Uploads are creation-only and never target a registered volume or /workspace.
-    roots = []
-    for _, remote, _ in entries:
-        root = "/".join(remote.split("/")[:3])
-        if root not in roots:
-            roots.append(root)
+    sources = getattr(args, "add_dir", []) or []
+    roots = [Path(value).expanduser().resolve() for value in sources]
+    if len(set(roots)) != len(roots):
+        raise ValueError("Each --add-dir source may be specified only once (including equivalent paths)")
+    remote = getattr(args, "remote_path", None)
+    if remote and not sources:
+        raise ValueError("--remote-path requires --add-dir")
+    if not sources:
+        return []
+    destination = remote or PROJECT_DIR + "/"
+    parts = PurePosixPath(destination).parts
+    if (not destination.startswith("/") or destination.startswith("//") or ".." in parts or
+            any(not c.isprintable() for c in destination) or destination == "/"):
+        raise ValueError("--remote-path must be an absolute sandbox path without .. or control characters")
+    normalized = str(PurePosixPath(destination))
+    for volume in getattr(args, "volume", []):
+        mount = volume.mount_path
+        if normalized == mount or normalized.startswith(mount + "/") or mount.startswith(normalized + "/"):
+            raise ValueError("Upload overlaps a registered volume")
+    protected = (HOME_DIR, SESSIONS_DIR, META_DIR, "/opt", "/proc", "/sys", "/dev", "/etc", "/root")
+    if any(normalized == p or normalized.startswith(p + "/") for p in protected) or any(
+            part.startswith(".cws") or part == ".git" for part in parts):
+        raise ValueError("--remote-path overlaps protected workspace or harness state")
+    if normalized != "/workspace" and not normalized.startswith("/workspace/"):
+        print("warning: uploads outside /workspace are not retained in snapshots.", file=sys.stderr)
+    entries = []
     for root in roots:
-        quoted = shlex.quote(root)
-        result = exec_retry(sb, ["sh", "-c", f"test ! -L /mnt && test ! -e {quoted} && test ! -L {quoted}"], attempts=1)
-        if result.returncode:
-            raise SystemExit(f"error: --add-local destination already exists or /mnt is a symlink: {root}")
-    for path, remote, mode in entries:
-        if stat.S_ISDIR(mode):
-            result = exec_retry(sb, ["mkdir", "-p", "--", remote], attempts=1)
-        else:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            with os.fdopen(fd, "rb") as source:
-                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                    raise SystemExit("error: --add-local source changed to a non-regular file")
-                sb.write_file_streaming(remote, iter(lambda: source.read(1024 * 1024), b"")).result()
-            result = exec_retry(sb, ["chmod", format(mode & 0o777, "o"), "--", remote], attempts=1)
-        if result.returncode:
-            raise SystemExit("error: could not copy --add-local files")
-    for _, remote, mode in reversed(entries):
-        if stat.S_ISDIR(mode):
-            if exec_retry(sb, ["chmod", format(mode & 0o777, "o"), "--", remote], attempts=1).returncode:
-                raise SystemExit("error: could not preserve --add-local directory permissions")
+        if root == Path(root.anchor):
+            raise ValueError("--add-dir cannot copy the filesystem root")
+        if not root.is_file() and not root.is_dir():
+            raise ValueError(f"--add-dir source is not a regular file or directory: {root}")
+        directory = root.is_dir()
+        inventory = (scan_local_dir(str(root), include_git=not getattr(args, "no_git", False),
+                                   extra_excludes=getattr(args, "exclude", [])) if directory else
+                     LocalDirectoryInventory(str(root), [(root, ".", root.stat())], root.stat().st_size, 1, set()))
+        for path, relative, info in inventory.entries:
+            link = None
+            if stat.S_ISLNK(info.st_mode):
+                link = os.readlink(path)
+                # Preserve a link itself, never read its target or leave the selected tree.
+                if os.path.isabs(link) or not Path(path).resolve().is_relative_to(root):
+                    raise ValueError(f"--add-dir symbolic link points outside its source directory: {path}")
+            elif not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"--add-dir unsupported file type: {path}")
+            entries.append({"local": str(path), "relative": relative, "mode": info.st_mode,
+                            "size": info.st_size if stat.S_ISREG(info.st_mode) else 0,
+                            "base": normalized, "directory_source": directory, "source_name": root.name,
+                            "directory_target": destination.endswith("/"), "multiple": len(roots) > 1,
+                            **({"link": link} if link is not None else {})})
+    return entries
+
+
+def open_upload_source(path):
+    """Pin every directory component, refusing symlink substitutions during packaging."""
+    from pathlib import Path
+    import stat
+    parts = Path(path).parts
+    parent = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ValueError(f"Upload source changed type: {path}")
+        return os.fdopen(fd, "rb")
+    finally:
+        os.close(parent)
+
+
+def build_directory_upload(folder, plan):
+    """Retain an immutable archive; target metadata stays out of command-line arguments."""
+    import io
+    import stat
+    import tarfile
+    path = folder / "archive.tar.gz"
+    count = sum(not stat.S_ISDIR(item["mode"]) for item in plan)
+    manifest = json.dumps([{k: v for k, v in item.items() if k != "local"} for item in plan]).encode()
+    with TransferProgress("Packaging", sum(item["size"] for item in plan)) as progress:
+        with tarfile.open(path, "w:gz") as archive:
+            member = tarfile.TarInfo("manifest.json")
+            member.size = len(manifest)
+            archive.addfile(member, io.BytesIO(manifest))
+            for index, item in enumerate(plan):
+                if not stat.S_ISREG(item["mode"]):
+                    continue  # Links are inert metadata until the descriptor-based merge.
+                with open_upload_source(item["local"]) as source:
+                    member = tarfile.TarInfo(str(index))
+                    member.size = os.fstat(source.fileno()).st_size
+                    archive.addfile(member, source)
+                    progress.advance(member.size)
+    os.chmod(path, 0o600)
+    return str(path), count
+
+
+def install_directory_upload(stage, mode="plan", overwrite=False):
+    """Merge through directory descriptors without following destination symlinks."""
+    import contextlib
+    import errno
+    import json
+    import os
+    from pathlib import PurePosixPath
+    import posixpath
+    import stat
+    import tarfile
+    import uuid
+    import re
+
+    with open(stage + "/manifest.json") as source:
+        manifest = json.load(source)
+    volumes = []
+    try:
+        with open("/proc/self/mountinfo") as source:
+            for line in source:
+                fields = line.split()
+                if len(fields) > 4 and fields[4] not in ("/", "/workspace"):
+                    volumes.append(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]))
+    except FileNotFoundError:
+        pass
+
+    def directory(path, create=False):
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in PurePosixPath(path).parts[1:]:
+                if create:
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def exists(path):
+        try:
+            fd = directory(str(PurePosixPath(path).parent))
+        except FileNotFoundError:
+            return None
+        try:
+            try:
+                result = os.stat(PurePosixPath(path).name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            return result
+        finally:
+            os.close(fd)
+
+    targets, collisions, protected_git, blocked, seen = [], [], set(), set(), {}
+    for index, item in enumerate(manifest):
+        base = item["base"]
+        info = exists(base)
+        is_directory = info is not None and stat.S_ISDIR(info.st_mode)
+        if item["multiple"] and not (item["directory_target"] or is_directory):
+            raise ValueError("Repeated --add-dir needs a destination directory; use a trailing /")
+        target = str(PurePosixPath(base) / item["relative"]) if item["directory_source"] else (
+            str(PurePosixPath(base) / item["source_name"]) if item["directory_target"] or is_directory else base)
+        if any(target == v or target.startswith(v + "/") or v.startswith(target + "/") for v in volumes):
+            raise ValueError("Upload destination overlaps a mounted volume: " + target)
+        path = PurePosixPath(target)
+        if ".." in path.parts or not path.is_absolute():
+            raise ValueError("Invalid upload destination: " + target)
+        if any(target == p or target.startswith(p + "/") for p in ("/workspace/home", "/workspace/sessions", "/workspace/.cws-meta", "/etc", "/root", "/opt", "/proc", "/sys", "/dev")):
+            raise ValueError("Upload overlaps protected workspace or harness state: " + target)
+        if any(part.startswith(".cws") for part in path.parts):
+            raise ValueError("Upload contains protected workspace metadata: " + target)
+        incoming_dir = stat.S_ISDIR(item["mode"])
+        if target in seen and not (incoming_dir and seen[target]):
+            raise ValueError("Multiple upload sources target the same file: " + target)
+        seen[target] = incoming_dir
+        skip = target in blocked or any(str(parent) in blocked for parent in path.parents)
+        git = None
+        if not skip and ".git" in path.parts:
+            git = str(PurePosixPath(*path.parts[:path.parts.index(".git") + 1]))
+            if git not in protected_git and exists(git):
+                protected_git.add(git)
+        skip = skip or git in protected_git
+        if not skip:
+            info = exists(target)
+            if info and overwrite and stat.S_ISLNK(info.st_mode):
+                raise ValueError("Upload destination is a symbolic link: " + target)
+            if info and (not incoming_dir or not stat.S_ISDIR(info.st_mode)):
+                collisions.append(target)
+                if incoming_dir != stat.S_ISDIR(info.st_mode):
+                    if overwrite:
+                        raise ValueError("Upload file/directory collision; choose Keep remote or change --remote-path: " + target)
+                    blocked.add(target)
+                    skip = True
+        if stat.S_ISLNK(item["mode"]):
+            link = item.get("link", "")
+            resolved = posixpath.normpath(posixpath.join(str(path.parent), link))
+            if not link or posixpath.isabs(link) or not (resolved == base or resolved.startswith(base + "/")):
+                raise ValueError("Upload symbolic link leaves its destination: " + target)
+        targets.append((index, item, path, skip))
+    if mode == "plan":
+        return {"conflicts": collisions, "copied": 0, "preserved": 0}
+    def staged_source(path):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ValueError("Invalid staged upload")
+        return os.fdopen(fd, "rb")
+
+    copied, preserved = 0, 0
+    legacy_archive = stage + "/files.tar"
+    with contextlib.ExitStack() as stack:
+        archive = stack.enter_context(tarfile.open(legacy_archive, "r:")) if os.path.isfile(legacy_archive) else None
+        members = {m.name: m for m in archive.getmembers()} if archive else {}
+        for index, item, path, skip in targets:
+            incoming_dir = stat.S_ISDIR(item["mode"])
+            if skip:
+                preserved += int(not incoming_dir)
+                continue
+            if incoming_dir:
+                os.close(directory(str(path), create=True))
+                continue
+            parent = directory(str(path.parent), create=True)
+            temporary = ".cws-upload-" + uuid.uuid4().hex
+            try:
+                try:
+                    previous = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    previous = None
+                if previous and not overwrite:
+                    preserved += 1
+                    continue
+                if previous and not stat.S_ISREG(previous.st_mode):
+                    raise ValueError("Upload destination changed type: " + str(path))
+                if stat.S_ISLNK(item["mode"]):
+                    os.symlink(item["link"], temporary, dir_fd=parent)
+                else:
+                    staged = stage + "/" + str(index)
+                    linked = False
+                    if archive is None:
+                        if not stat.S_ISREG(os.stat(staged, follow_symlinks=False).st_mode):
+                            raise ValueError("Invalid staged upload")
+                        try:
+                            os.link(staged, temporary, dst_dir_fd=parent, follow_symlinks=False)
+                            linked = True
+                            staged_fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                            try:
+                                if not stat.S_ISREG(os.fstat(staged_fd).st_mode):
+                                    raise ValueError("Invalid staged upload")
+                                os.fchmod(staged_fd, item["mode"] & 0o777)
+                            finally:
+                                os.close(staged_fd)
+                        except OSError as error:
+                            if error.errno != errno.EXDEV:
+                                raise
+                    if not linked:
+                        member = members.get(str(index)) if archive else None
+                        if archive and (member is None or not member.isfile()):
+                            raise ValueError("Invalid staged upload")
+                        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+                        with os.fdopen(fd, "wb") as output, (archive.extractfile(member) if archive else staged_source(staged)) as source:
+                            while chunk := source.read(1 << 20):
+                                output.write(chunk)
+                            os.fchmod(output.fileno(), item["mode"] & 0o777)
+                if overwrite:
+                    os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+                else:
+                    try:
+                        os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                    except FileExistsError:
+                        preserved += 1
+                        continue
+                copied += 1
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+                os.close(parent)
+    return {"conflicts": collisions, "copied": copied, "preserved": preserved}
+
+
+def apply_directory_upload(sb, args, plan=None):
+    """Preflight a safe merge, then use the shared resumable chunk transport."""
+    plan = directory_upload_plan(args) if plan is None else plan
+    if not plan:
+        return {"copied": 0, "preserved": 0}
+    result = exec_retry(sb, ["sh", "-c", "command -v python3 >/dev/null && python3 -c " +
+        shlex.quote("import tempfile; print(tempfile.mkdtemp(prefix='.cws-upload-', dir='/workspace'))")], attempts=1)
+    stage = (result.stdout or "").strip()
+    if result.returncode not in (0, None) or not re.fullmatch(r"/workspace/\.cws-upload-[A-Za-z0-9_-]+", stage):
+        raise ValueError("--add-dir requires python3 in the sandbox image for safe file merging")
+    overwrite = getattr(args, "overwrite", False)
+    try:
+        manifest = [{k:v for k,v in item.items() if k != "local"} for item in plan]
+        sb.write_file(stage + "/manifest.json", json.dumps(manifest).encode()).result()
+        def review_merge(overwrite):
+            script = inspect.getsource(install_directory_upload) + "\nimport json\ntry:\n    print(json.dumps(install_directory_upload(" + repr(stage) + ", 'plan', " + repr(overwrite) + ")))\nexcept ValueError as error:\n    print(json.dumps({'error': str(error)}))\nexcept OSError as error:\n    print(json.dumps({'error': 'Upload destination is not accessible (errno ' + str(error.errno) + ')'}))"
+            result = exec_retry(sb, ["python3", "-c", script], attempts=1, timeout_seconds=600)
+            if result.returncode not in (0, None):
+                raise ValueError("Upload validation failed; check that the sandbox has Python 3 and writable upload destinations")
+            response = json.loads(result.stdout)
+            if response.get("error"):
+                detail = json.dumps(str(response["error"])[:1600])[1:-1]
+                raise ValueError("Upload validation failed: " + detail)
+            return response
+        review = review_merge(overwrite)
+        if review["conflicts"] and not overwrite:
+            if not getattr(args, "json", False) and sys.stdin.isatty() and sys.stdout.isatty():
+                choice = resume_picker([
+                    {"workspace":"Keep remote", "title":f"Preserve {len(review['conflicts'])} conflicting paths", "resumable":True},
+                    {"workspace":"Overwrite", "title":"Replace incoming files; preserve Git metadata", "resumable":True},
+                    {"workspace":"Cancel", "title":"Leave remote files unchanged", "resumable":True},
+                ], title="Review upload conflicts", notice=", ".join(review["conflicts"][:3]),
+                   search_label="Filter", empty_label="No matching choices")
+                if choice is None or choice["workspace"] == "Cancel":
+                    raise ValueError("Upload cancelled")
+                overwrite = choice["workspace"] == "Overwrite"
+                if overwrite:
+                    review_merge(True)
+            else:
+                print(f"Preserving {len(review['conflicts'])} conflicting paths; use --overwrite to replace files.", file=sys.stderr)
+    finally:
+        exec_retry(sb, ["rm", "-rf", "--", stage], attempts=1)
+    # The temporary preflight never holds file contents. Retained cached chunks and
+    # their manifest own recovery from this point onward, including merge failures.
+    import contextlib
+    with contextlib.redirect_stdout(sys.stderr):
+        result = sync_local_dir(sb, plan[0]["local"], include_git=True, extra_excludes=[], clean=False,
+                                transfer_timeout=getattr(args, "transfer_timeout", None),
+                                session_name=getattr(args, "name", None), upload_plan=plan, overwrite=overwrite)
+    print(f"Uploaded {result['copied']} files; preserved {result['preserved']} remote files.", file=sys.stderr)
+    return result
 
 
 def cmd_shell(args) -> int:
@@ -4517,10 +4849,10 @@ def cmd_shell(args) -> int:
     if not NAME_RE.fullmatch(args.name):
         raise SystemExit("error: session name must match [a-z0-9][a-z0-9-]{0,39}")
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if args.cmd is None and not interactive:
+    if args.cmd is None and not interactive and not getattr(args, "_prepare_only", False):
         raise SystemExit("error: shell requires a terminal; use --cmd COMMAND for non-interactive execution")
     if interactive and os.name == "nt":
-        raise SystemExit("error: interactive terminal connections are not supported on Windows")
+        raise ResumeOperationError("error: interactive terminal connections are not supported on Windows")
     mode = args.mode or ("cks" if args.volume else "serverless")
     if args.volume and mode != "cks":
         raise SystemExit("error: --volume requires CKS placement; use --mode cks or omit --mode")
@@ -4543,7 +4875,13 @@ def cmd_shell(args) -> int:
         if stat.S_ISFIFO(stdin_mode) or stat.S_ISREG(stdin_mode):
             print("warning: shell --cmd does not forward piped or redirected stdin; input will be ignored.",
                   file=sys.stderr)
-    entries = shell_local_files(args.add_local, args.volume)
+    upload_plan = directory_upload_plan(args)
+    if len({v.volume_id for v in args.volume}) != len(args.volume):
+        raise SystemExit("error: each --volume ID may only be specified once")
+    mounts = [v.mount_path for v in args.volume]
+    if any(a == b or a.startswith(b + "/") or b.startswith(a + "/")
+           for i, a in enumerate(mounts) for b in mounts[:i]):
+        raise SystemExit("error: overlapping --volume destinations")
     boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(args.name)], auth=sandbox_auth()).result()
     if len(boxes) > 1:
         raise SystemExit("error: multiple running sandboxes have this name; use a unique session name")
@@ -4556,14 +4894,16 @@ def cmd_shell(args) -> int:
         sb = boxes[0]
     else:
         snapshot = shell_snapshot(args.snapshot) if args.snapshot else None
-        disk = "10Gi"
+        disk = local_directory_disk(LocalDirectoryInventory("", upload_plan,
+                    sum(item["size"] for item in upload_plan), len(upload_plan), set())) if upload_plan else "10Gi"
         if snapshot:
             saved_disk = re.search(r"\|disk=([1-9][0-9]*(?:Gi|Mi|Ti))$", snapshot.request_id or "")
             disk = saved_disk[1] if saved_disk else f"{max(10, ((snapshot.size_bytes or 0) + 2**30 - 1) // 2**30)}Gi"
+        disk = getattr(args, "_restore_disk", disk)
         kwargs = dict(
             container_image=args.image or "python:3.11",
             tags=session_tags(args.name, "shell"),
-            max_lifetime_seconds=8 * 3600,
+            max_lifetime_seconds=getattr(args, "_restore_lifetime", 8 * 3600),
             environment_variables={"CWS_AGENT_NAME": args.name, "CWS_AGENT_HARNESS": "shell",
                                    "CWS_AGENT_DISK": disk},
             resources=ResourceOptions(requests={"cpu": args.cpu or "2", "memory": args.memory or "4Gi"},
@@ -4586,13 +4926,12 @@ def cmd_shell(args) -> int:
                     raise SystemExit("error: image must allow creating /workspace/home, /workspace/project, and /mnt")
                 if snapshot and harness_from_request_id(snapshot.request_id) not in (None, "shell"):
                     snapshot_metadata(sb, "restore-snapshot")
-                shell_copy_files(sb, entries)
                 save_workspace_metadata(sb, args.name, "shell", {
                     "image": args.image or "python:3.11", "cpu": args.cpu or "2",
                     "memory": args.memory or "4Gi", "disk": disk, "mode": mode,
                     "gpu": args.gpu, "secrets": [s.name for s in args.secret],
                     "volumes": [v.volume_id + ":" + v.mount_path for v in args.volume],
-                    "lifetime_seconds": 8 * 3600,
+                    "lifetime_seconds": getattr(args, "_restore_lifetime", 8 * 3600),
                 }, restore_snapshot_id=snapshot.file_system_snapshot_id if snapshot else None)
         except (Exception, SystemExit, KeyboardInterrupt):
             stop_failed_sandbox(sb)
@@ -4603,6 +4942,16 @@ def cmd_shell(args) -> int:
             ("Name", args.name), ("Sandbox", sb.sandbox_id),
             ("Connect", f"cws-agent shell {args.name}"),
         ], file=sys.stderr)
+    try:
+        apply_directory_upload(sb, args, upload_plan)
+    except UploadPaused:
+        raise
+    except (Exception, SystemExit, KeyboardInterrupt):
+        if not boxes:
+            stop_failed_sandbox(sb)
+        raise
+    if getattr(args, "_prepare_only", False):
+        return sb
     command = ("exec sh -c " + shlex.quote(args.cmd) if args.cmd is not None else
                "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi")
     if interactive:
@@ -4619,8 +4968,13 @@ def cmd_shell(args) -> int:
 def cmd_attach(args) -> int:
     if args.cmd and (args.yolo or args.permission_mode not in (None, "accept-edits")):
         raise SystemExit("error: permission flags cannot be combined with --cmd")
+    upload_plan = directory_upload_plan(args)
     sb = require_active(args.name)
-    harness = active_harness(sb, args.agent)
+    harness = active_harness(sb, args.agent, allow_shell=True)
+    apply_directory_upload(sb, args, upload_plan)
+    if harness is None:
+        command = "exec sh -c " + shlex.quote(args.cmd) if args.cmd else "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+        return pty_attach(sb, command, image_paste=False, plain_shell=True)
     if args.cmd and getattr(args, "import_codex_auth", False):
         raise SystemExit("error: --import-codex-auth cannot be combined with --cmd")
     codex_auth = local_codex_auth(harness, args)
@@ -5017,7 +5371,7 @@ def start_launched_telegram(sb, harness, args, env):
             result = pty_attach(sb, harness.login_cmd)
             if result:
                 return result
-        if getattr(args, "local_dir", None):
+        if getattr(args, "add_dir", None) or getattr(args, "local_dir", None):
             start_background_upload(sb, args)
         bridge_args = argparse.Namespace(
             name=args.name, timeout=300, setup=False, allow_chat=None, allow_user=None,
@@ -5937,7 +6291,7 @@ def cmd_login(args) -> int:
 
 
 def cmd_sync(args) -> int:
-    if args.resume_upload and (args.local_dir is not None or args.no_git or args.exclude):
+    if args.resume_upload and (args.local_dir is not None or args.no_git or args.exclude or getattr(args, "add_dir", None)):
         raise SystemExit("error: --resume-upload reuses a cached archive; do not pass a directory or new filters")
     if args.clean and getattr(args, "preserve_existing", False):
         raise SystemExit("error: --clean cannot be combined with --preserve-existing")
@@ -5956,11 +6310,14 @@ def cmd_sync(args) -> int:
         if folder and (job.get("name") != args.name or job.get("sandbox_id") != sb.sandbox_id):
             raise SystemExit("error: background upload target no longer matches the original sandbox")
         report("uploading", "Workspace packaging/upload is running. You can use the agent; local files will arrive later. Remote edits are preserved.")
-        sync_local_dir(sb, args.local_dir or ".", include_git=not args.no_git,
-                       extra_excludes=args.exclude, clean=args.clean,
-                       transfer_timeout=getattr(args, "transfer_timeout", None),
-                       resume_upload=args.resume_upload, session_name=args.name,
-                       preserve_existing=getattr(args, "preserve_existing", False))
+        if getattr(args, "add_dir", None):
+            apply_directory_upload(sb, args)
+        else:
+            sync_local_dir(sb, args.local_dir or ".", include_git=not args.no_git,
+                           extra_excludes=args.exclude, clean=args.clean,
+                           transfer_timeout=getattr(args, "transfer_timeout", None),
+                           resume_upload=args.resume_upload, session_name=args.name,
+                           preserve_existing=getattr(args, "preserve_existing", False))
         print("synced.")
         if not getattr(args, "no_snapshot", False):
             report("snapshotting", "Workspace uploaded. Saving a reusable snapshot; agent requests may briefly wait while it is captured.")
@@ -6032,13 +6389,13 @@ def cmd_stop(args) -> int:
     if args.no_snapshot:
         print(f"session {args.name!r} stopped without a new snapshot; restore requires an existing READY snapshot.")
     else:
-        restore = (f"cws-agent shell {args.name} --snapshot {args.name}" if harness_name == "shell"
-                   else f"cws-agent restore {args.name}")
+        restore = f"cws-agent resume {args.name}"
         print(f"session {args.name!r} stopped. `{restore}` brings its workspace back.")
     return 0
 
 
 def cmd_resume(args) -> int:
+    upload_plan = directory_upload_plan(args)
     if getattr(args, "telegram", False) and args.attach:
         raise SystemExit("error: choose --telegram or --connect, not both")
     if args.workers is not None and args.workers < 1:
@@ -6128,6 +6485,12 @@ def cmd_resume(args) -> int:
     except (Exception, SystemExit, KeyboardInterrupt):
         stop_failed_sandbox(sb)
         raise
+    try:
+        apply_directory_upload(sb, args, upload_plan)
+    except (Exception, SystemExit, KeyboardInterrupt):
+        print(f"Upload did not complete. Sandbox {sb.sandbox_id} remains running. "
+              f"Reconnect: cws-agent connect {args.name}", file=sys.stderr)
+        raise
     session_summary("Session restored", [
         ("Name", args.name), ("Agent", harness.name), ("Sandbox", sb.sandbox_id),
     ])
@@ -6168,9 +6531,7 @@ def cmd_list(args) -> int:
         started = format_started_at(getattr(b, "started_at", None))
         rows.append((name, harness, status, started, b.sandbox_id))
     header = ("NAME", "AGENT", "STATUS", "STARTED (LOCAL)", "SANDBOX")
-    widths = [max(len(str(r[i])) for r in rows + [header]) for i in range(len(header))]
-    for r in [header] + sorted(rows):
-        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)))
+    cli_table(header, sorted(rows))
     return 0
 
 
@@ -6204,10 +6565,9 @@ def cmd_status(args) -> int:
 
 
 def cmd_snapshots(args) -> int:
-    for s in session_snapshots(args.name):
-        mib = (s.size_bytes or 0) / (1 << 20)
-        print(f"{s.file_system_snapshot_id}  {s.status}  {mib:.1f} MiB  "
-              f"{s.created_at}  (from {s.source_sandbox_id})")
+    cli_table(("SNAPSHOT", "STATE", "SIZE", "SAVED", "SOURCE SANDBOX"), [
+        (s.file_system_snapshot_id, s.status, f"{(s.size_bytes or 0) / (1 << 20):.1f} MiB",
+         s.created_at, s.source_sandbox_id) for s in session_snapshots(args.name)])
     return 0
 
 
@@ -6521,10 +6881,16 @@ def remote_native_history(sb: Sandbox, opencode_cwd: str | None = None) -> list[
               + "print(json.dumps(sorted(rows, key=lambda r: r['modified'], reverse=True)))")
     result = exec_retry(sb, ["python3", "-c", script], timeout_seconds=60)
     if result.returncode not in (0, None):
-        raise SystemExit("error: could not read native session histories: "
-                         + (result.stderr or "")[:300])
+        raise SystemExit("error: could not read native session histories; inspect the agent history in the sandbox")
     try:
-        return json.loads(result.stdout or "[]")
+        rows = json.loads(result.stdout or "[]")
+        if not isinstance(rows, list) or any(not isinstance(row, dict)
+                or row.get("agent") not in ("claude", "codex", "opencode")
+                or not isinstance(row.get("id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", row["id"])
+                or not isinstance(row.get("cwd"), str) or not row["cwd"].startswith("/") for row in rows):
+            raise ValueError("invalid history rows")
+        return rows
     except ValueError:
         raise SystemExit("error: invalid session history response")
 
@@ -6556,10 +6922,8 @@ def cmd_session_history(args) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
-        print("AGENT   SESSION ID                            DIRECTORY")
-        for row in rows:
-            # JSON escaping keeps terminal control sequences in paths inert.
-            print(f'{row["agent"]:7} {row["id"]:37} {json.dumps(row["cwd"])}')
+        cli_table(("AGENT", "SESSION ID", "CONVERSATION", "UPDATED", "DIRECTORY"),
+                  [(r["agent"], r["id"], r.get("title") or "—", updated_label(r), r["cwd"]) for r in rows])
         if not rows:
             print("No saved Claude/Codex/OpenCode CLI conversations found.")
     if args.agent is None:
@@ -7121,46 +7485,602 @@ def cmd_session_transfer(args) -> int:
             print(f"warning: could not remove temporary history bundle {remote_temp}", file=sys.stderr)
 
 
-def cmd_agent_resume(args) -> int:
-    native_resume_command(args.agent, args.session_id)  # validate before remote access
-    if args.cwd and not args.cwd.startswith("/"):
-        raise SystemExit("error: --cwd must be an absolute sandbox directory")
-    if getattr(args, "name", None) is not None:
-        if not NAME_RE.fullmatch(args.name):
-            raise SystemExit("error: sandbox name must match [a-z0-9][a-z0-9-]{0,39}")
-        return cmd_session_resume(args)
-    if args.agent in ("devin", "cursor"):
-        raise SystemExit(f"error: {args.agent} requires a sandbox name to resume; use "
-                         f"`cws-agent {args.agent} SANDBOX --resume SESSION_ID`")
+CLOUD_RUNNER_DOCS = "https://github.com/coreweave/cws-agent/blob/main/docs/sessions.md#cloud-code-runners"
 
-    boxes = Sandbox.list(tags=[SESSION_TAG], auth=sandbox_auth()).result()
-    matches = []
+
+def display_text(value, limit=180):
+    """Untrusted titles and names must never send controls to the terminal."""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value or ""))
+    return " ".join("".join(c if c.isprintable() else " " for c in text).split())[:limit]
+
+
+
+def activity_timestamp(value):
+    import math
+    if type(value) not in (int, float) or not 0 <= value <= 253402300799 or not math.isfinite(value):
+        return None
+    return value
+
+
+def resume_row(name, agent, sandbox_id, *, conversation=None, saved=None, config=None,
+               backend=None, workspace_id=None, sb=None, snapshot=None):
+    conversation = conversation if isinstance(conversation, dict) else {}
+    updated = activity_timestamp(conversation.get("updated_at"))
+    source = conversation.get("updated_source")
+    if updated is None or source not in ("message", "harness", "file_mtime"):
+        source = "unknown"
+    unavailable = bool(backend) or agent in ("ant", "openai")
+    reason = ("Resume unavailable · Cloud runner docs: " + CLOUD_RUNNER_DOCS if backend == "claude-cloud"
+              else "Managed worker: use restore with its provider configuration" if unavailable else None)
+    return {"workspace": name, "workspace_id": workspace_id, "agent": agent,
+            "sandbox_id": sandbox_id, "session_id": conversation.get("id"),
+            "title": display_text(conversation.get("title"), 400) or None,
+            "excerpt": display_text(conversation.get("excerpt"), 1200) or None,
+            "cwd": conversation.get("cwd"), "updated_at": updated,
+            "updated_source": source,
+            "saved_at": activity_timestamp(saved), "state": "unavailable" if unavailable else "live" if sb else "saved",
+            "resumable": not unavailable, "reason": reason,
+            "snapshot_id": getattr(snapshot, "file_system_snapshot_id", None),
+            "backend": backend, "_config": config, "_sb": sb, "_snapshot": snapshot}
+
+
+
+def discover_resume(*, name=None, sandbox=None, opencode_cwd=None):
+    """Join authorized live compute and READY snapshots with a best-effort local index."""
+    scoped_name = name
+    rows, errors, live_sources, live_names = [], [], set(), set()
+    try:
+        boxes = Sandbox.list(tags=[SESSION_TAG, name_tag(name)] if name else [SESSION_TAG], status="running", auth=sandbox_auth()).result()
+    except Exception:
+        boxes = []
+        errors.append({"code": "live_discovery_failed", "message": "Could not list running workspaces; check sandbox credentials and access"})
+    local_records = read_workspace_catalog()
     for sb in boxes:
-        if getattr(getattr(sb, "status", None), "value", None) != "running":
+        if sandbox and sb.sandbox_id != sandbox:
             continue
-        name, harness = probe_session_meta(sb)
-        if not NAME_RE.fullmatch(name):
-            raise SystemExit("error: could not identify a running sandbox; specify its name before --resume")
-        if harness in ("ant", "openai", "shell"):
+        live_sources.add(sb.sandbox_id)
+        if getattr(getattr(sb, "status", None), "value", "running") != "running":
             continue
-        rows = (remote_native_history(sb, opencode_cwd=args.cwd)
-                if args.agent == "opencode" and args.cwd else remote_native_history(sb))
-        if any(row["agent"] == args.agent and row["id"] == args.session_id for row in rows):
-            matches.append((sb, name))
-    if not matches:
-        raise SystemExit("error: agent session not found in running sandboxes. Use `cws-agent list` and "
-                         "`cws-agent session history SANDBOX`. If stopped, run `cws-agent restore SANDBOX` first.")
-    if len(matches) > 1:
-        names = ", ".join(sorted(name for _, name in matches))
-        raise SystemExit(f"error: agent session found in multiple sandboxes ({names}); use "
-                         f"`cws-agent {args.agent} SANDBOX --resume SESSION_ID`")
-    sb, args.name = matches[0]
-    print(f"Resuming {args.agent} session in sandbox {args.name!r}.")
-    return resume_conversation(sb, args)
+        try:
+            name, agent = probe_session_meta(sb)
+            if not NAME_RE.fullmatch(name) or agent not in (*HARNESSES, "shell"):
+                raise ValueError("invalid identity")
+            live_names.add(name)
+            document = read_workspace_document(sb)
+            backend = document.get("kind") or (document.get("backend") or {}).get("kind")
+            trusted = next((r for r in local_records if r["sandbox_id"] == sb.sandbox_id and not r.get("snapshot_id")), {})
+            history = [] if backend or agent in ("shell", "ant", "openai", "cursor", "devin") else remote_native_history(sb, opencode_cwd=opencode_cwd)
+            live_sources.update(trusted.get("sandbox_ids", []))
+            for conversation in history or [{}]:
+                rows.append(resume_row(name, conversation.get("agent", agent), sb.sandbox_id,
+                    conversation=conversation, config=trusted.get("config"), backend=backend,
+                    workspace_id=trusted.get("id"), sb=sb))
+            update_workspace_catalog({"id": trusted.get("id"), "sandbox_ids": trusted.get("sandbox_ids", [sb.sandbox_id]),
+                                      "config": trusted.get("config"), "name": name, "agent": agent, "sandbox_id": sb.sandbox_id,
+                                      "conversations": history, "backend": backend, "observed_at": time.time()})
+        except (Exception, SystemExit):
+            errors.append({"code": "workspace_discovery_failed", "sandbox_id": sb.sandbox_id,
+                           "message": "Could not read workspace history"})
+    try:
+        snapshots = Sandbox.list_snapshots(status="ready", auth=sandbox_auth()).result()
+    except Exception:
+        snapshots = []
+        errors.append({"code": "snapshot_discovery_failed", "message": "Could not list saved workspaces; check sandbox credentials and access"})
+    catalog = {r["snapshot_id"]: r for r in read_workspace_catalog() if r.get("snapshot_id")}
+    source_identity = {}
+    for snap in snapshots:
+        record = catalog.get(snap.file_system_snapshot_id, {})
+        if record.get("id"):
+            source_identity[snap.source_sandbox_id] = record["id"]
+            for source in record.get("sandbox_ids", []):
+                source_identity[source] = record["id"]
+    groups = {}
+    for snap in snapshots:
+        if "ready" not in str(snap.status).lower() or is_managed_checkpoint(snap):
+            continue
+        request = getattr(snap, "request_id", "") or ""
+        match = re.fullmatch(r"cwsa1\|([a-z0-9][a-z0-9-]{0,39})\|([a-z]+)\|([0-9]+)(?:\|disk=([1-9][0-9]*(?:Mi|Gi|Ti)))?", request)
+        record = catalog.get(snap.file_system_snapshot_id, {})
+        if not match and not record:
+            continue  # unrelated snapshots are deliberately absent from the picker
+        name = match[1] if match else record.get("name", "unnamed")
+        agent = match[2] if match else record.get("agent", "shell")
+        if (scoped_name and name != scoped_name) or (sandbox and snap.source_sandbox_id != sandbox):
+            continue
+        if agent not in (*HARNESSES, "shell"):
+            continue
+        source = snap.source_sandbox_id
+        if source in live_sources or (not record.get("id") and name in live_names):
+            continue
+        created = getattr(snap, "created_at", None)
+        stamp = activity_timestamp(created.timestamp() if created else int(match[3]) if match else record.get("saved_at", 0)) or 0
+        key = source_identity.get(source) or (name, source)
+        if key not in groups or stamp > groups[key][0]:
+            groups[key] = (stamp, snap, record, name, agent)
+    for stamp, snap, record, name, agent in groups.values():
+        for conversation in record.get("conversations") or [{}]:
+            rows.append(resume_row(name, conversation.get("agent", agent), snap.source_sandbox_id,
+                conversation=conversation, saved=stamp, config=record.get("config"),
+                backend=record.get("backend"), workspace_id=record.get("id"), snapshot=snap))
+    rows.sort(key=lambda r: (r.get("updated_at") or r.get("saved_at") or 0), reverse=True)
+    return rows, errors
+
+
+
+def updated_label(row):
+    stamp = row.get("updated_at")
+    if stamp is None:
+        return "—"
+    age = max(0, int(time.time() - stamp))
+    label = f"{age // 86400}d ago" if age >= 86400 else f"{age // 3600}h ago" if age >= 3600 else f"{age // 60}m ago"
+    return ("~" if row.get("updated_source") == "file_mtime" else "") + label
+
+
+
+def public_resume_row(row):
+    from datetime import datetime, timezone
+    result = {k: v for k, v in row.items() if not k.startswith("_")}
+    for key in ("updated_at", "saved_at"):
+        value = result.get(key)
+        try:
+            result[key] = (datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+                           if type(value) in (int, float) and value >= 0 else None)
+        except (ValueError, OverflowError, OSError):
+            result[key] = None
+    return result
+
+
+
+def resume_result(args, *, rows=(), errors=(), selected=None, action=None, proposal=None, transfer=None):
+    result = {"schema_version": 1, "rows": [public_resume_row(r) for r in rows],
+              "errors": list(errors), "partial": any(e.get("code", "").endswith("discovery_failed") for e in errors), "action": action,
+              "selected": public_resume_row(selected) if selected else None, "proposal": proposal, "transfer": transfer}
+    if getattr(args, "json", False):
+        print(json.dumps(result))
+    return result
+
+
+
+def resolve_resume_rows(rows, args):
+    target = getattr(args, "target", None)
+    name = getattr(args, "name", None)
+    session = getattr(args, "session_id", None)
+    sandbox = getattr(args, "sandbox", None)
+    agent = getattr(args, "agent", None)
+    if session and (name or sandbox or target):
+        rows = [{**r, "session_id": session} if r["agent"] in ("cursor", "devin") and not r["session_id"] else r for r in rows]
+    found = [r for r in rows if (not target or target in (r["workspace"], r["sandbox_id"], r["session_id"]))
+             and (not name or r["workspace"] == name or r["sandbox_id"] == name)
+             and (not sandbox or sandbox == r["sandbox_id"])
+             and (not session or session == r["session_id"])]
+    if agent and found and not any(r["agent"] == agent for r in found):
+        actual = found[0]["agent"]
+        raise ValueError(f"Harness mismatch: this conversation uses {actual}. Use cws-agent resume --agent {actual}.")
+    return [r for r in found if not agent or r["agent"] == agent]
+
+
+
+def recovery_config(row, args):
+    saved_config = row.get("_config") or {}
+    config = dict(saved_config)
+    agent = row["agent"]
+    defaults = {"image": "python:3.11" if agent == "shell" else HARNESSES[agent].image,
+                "cpu": "2", "memory": "4Gi", "disk": "10Gi", "mode": None, "lifetime_seconds": 28800}
+    request = getattr(row.get("_snapshot"), "request_id", "") or ""
+    disk = re.search(r"\|disk=([1-9][0-9]*(?:Mi|Gi|Ti))$", request)
+    if disk:
+        defaults["disk"] = disk[1]
+    for key, value in defaults.items():
+        if config.get(key) is None:
+            config[key] = value
+    for key in ("image", "cpu", "memory", "disk", "mode"):
+        if getattr(args, key, None) is not None:
+            config[key] = getattr(args, key)
+    if getattr(args, "lifetime", None):
+        config["lifetime_seconds"] = parse_duration(args.lifetime)
+    if (not isinstance(config["image"], str) or not config["image"] or
+            type(config["lifetime_seconds"]) is not int or config["lifetime_seconds"] <= 0 or
+            config["mode"] not in (None, "serverless", "cks")):
+        raise ValueError("Invalid saved workspace configuration")
+    config["cpu"] = shell_cpu(str(config["cpu"]))
+    config["memory"] = shell_memory(str(config["memory"]))
+    if not re.fullmatch(r"[1-9][0-9]*(?:Gi|Mi|Ti)", str(config["disk"])):
+        raise ValueError("Invalid saved disk size")
+    return config, any(saved_config.get(key) is None for key in ("image", "cpu", "memory", "disk", "lifetime_seconds"))
+
+
+
+def restore_resume_row(row, args, config):
+    """Allocate once from the already-selected snapshot; never repeat discovery."""
+    if Sandbox.list(tags=[SESSION_TAG, name_tag(row["workspace"])], status="running", auth=sandbox_auth()).result():
+        raise ValueError("Workspace became active; run resume again to select live compute")
+    if row["agent"] == "shell":
+        shell_args = argparse.Namespace(name=row["workspace"], cmd=None, image=config["image"],
+            cpu=config["cpu"], memory=config["memory"], gpu=config.get("gpu"), mode=config["mode"],
+            secret=[shell_secret(s) for s in config.get("secrets", [])],
+            volume=[shell_volume(v) for v in config.get("volumes", [])],
+            snapshot=row["snapshot_id"], add_local=[], _prepare_only=True,
+            _restore_disk=config["disk"], _restore_lifetime=config["lifetime_seconds"])
+        return cmd_shell(shell_args)
+    harness = HARNESSES[row["agent"]]
+    env = build_env(harness, getattr(args, "env", []), getattr(args, "env_passthrough", []))
+    for key in config.get("env_names", []):
+        if harness.name == "codex" and key == "OPENAI_API_KEY" and key not in os.environ:
+            continue  # Codex snapshots retain their login; an ambient API key is optional.
+        if key not in env:
+            if key not in os.environ:
+                raise ValueError(f"Required environment variable is unavailable: {key}")
+            env[key] = os.environ[key]
+    return provision_session(name=row["workspace"], harness=harness, repo_url=None,
+        image=config["image"], cpu=config["cpu"], memory=config["memory"], disk=config["disk"],
+        mode=config["mode"], lifetime_seconds=config["lifetime_seconds"], env=env,
+        restore_snapshot_id=row["snapshot_id"])
+
+
+
+def resume_style():
+    from prompt_toolkit.styles import Style
+    return Style.from_dict({} if "NO_COLOR" in os.environ else {
+        "title": "bold #79c0ff", "key": "bold #79c0ff", "heading": "bold #79c0ff", "focus": "bg:#24364b #ffffff", "muted": "#8b949e",
+        "accent": "#79c0ff", "warning": "#e3b341"})
+
+
+
+def resume_picker_lines(rows, cursor, *, title, query, warning, columns, height, expanded=False,
+                        search_label="Search", empty_label="No matching conversations"):
+    """Render conversation-first rows within the terminal's cell and line budget."""
+    from rich.console import Console
+    from rich.text import Text
+    from prompt_toolkit.utils import get_cwidth
+
+    width = max(12, columns - 1)
+    console = Console(width=width)
+
+    def clip(value, cells):
+        text = Text(display_text(value, 4096))
+        text.truncate(max(1, cells), overflow="ellipsis")
+        return text.plain
+
+    def wrap(value, count):
+        lines = [line.plain for line in Text(display_text(value, 4096)).wrap(console, width)]
+        if len(lines) > count:
+            lines[count - 1] = clip(lines[count - 1], width - 1).rstrip("…") + "…"
+        return lines[:count]
+
+    selected = rows[cursor % len(rows)] if rows else {}
+    preview = []
+    if selected:
+        label = selected.get("title") or selected.get("label") or selected.get("workspace") or "Workspace"
+        preview = [("class:heading", "Selected conversation" if selected.get("agent") else "Selected option")]
+        preview.extend(("", line) for line in wrap(label, 3 if expanded else 2))
+        if expanded:
+            for key, name in (("workspace", "Workspace"), ("session_id", "Session"),
+                              ("sandbox_id", "Sandbox"), ("cwd", "Directory")):
+                if selected.get(key):
+                    preview.extend(("class:muted", line) for line in wrap(f"{name}: {selected[key]}", 2))
+        excerpt = selected.get("reason") or selected.get("excerpt")
+        if excerpt and excerpt != label:
+            preview.extend(("class:muted", line) for line in wrap(excerpt, 6 if expanded else 2))
+        preview = preview[:max(2, min(16 if expanded else 5, height // 2 if expanded else height // 3))]
+    header = [("class:heading", clip(title, width)),
+              ("class:muted", clip(f"{search_label}: {query}   {cursor + 1 if rows else 0}/{len(rows)}", width)), ("", "")]
+    footer = [("class:warning", line) for line in wrap(warning, 2)] if warning else []
+    footer.extend(("class:muted", line) for line in wrap("↑/↓ move · Enter select · type to filter · Ctrl-O details · Esc cancel", 3))
+    row_height = 2 if any(r.get("agent") or r.get("state") for r in rows) else 1
+    capacity = max(1, (height - len(header) - len(preview) - len(footer) - 2) // row_height)
+    start = max(0, min(cursor - capacity + 1, len(rows) - capacity))
+    result = header
+    for i, row in enumerate(rows[start:start + capacity], start):
+        agent = row.get("backend") or row.get("agent")
+        label = row.get("title") or row.get("session_id") or row.get("label") or "Workspace"
+        if not agent:
+            label = f"{row.get('workspace', '')} · {label}"
+        style = "class:focus" if i == cursor else "class:muted" if not row.get("resumable", True) else ""
+        result.append((style, ("› " if i == cursor else "  ") + clip(label, width - 2)))
+        if row_height == 2:
+            name = f"{row.get('workspace', '')} ({agent})" if agent else row.get("workspace", "")
+            activity = updated_label(row)
+            if row.get("updated_at") is None and row.get("saved_at"):
+                activity = "Saved " + updated_label({"updated_at": row["saved_at"]})
+            metadata = clip(f"{activity} · {row.get('state', '')}", max(8, width // 2))
+            name_width = max(1, width - get_cwidth(metadata) - 4)
+            name = clip(name, name_width)
+            result.append((style if i == cursor else "class:muted",
+                           "  " + name + " " * (name_width - get_cwidth(name) + 2) + metadata))
+    if not rows:
+        result.append(("class:muted", empty_label))
+    if preview:
+        result.append(("", ""))
+        result.extend(preview)
+    result.extend(footer)
+    bounded = []
+    for style, line in result:
+        text = Text(line)
+        text.truncate(width, overflow="ellipsis")
+        bounded.append((style, text.plain + "\n"))
+    return bounded
+
+
+
+def resume_picker(rows, *, title="Resume a conversation", notice="",
+                  search_label="Search", empty_label="No matching conversations"):
+    """Shared conversation list, narrowed choices and confirmation controls."""
+    from prompt_toolkit import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.keys import Keys
+    from prompt_toolkit.application import get_app
+    cursor, query, warning, expanded = 0, "", notice, False
+    keys = KeyBindings()
+
+    def matches():
+        return [r for r in rows if query.lower() in " ".join(str(r.get(k) or "") for k in
+                ("workspace", "agent", "title", "excerpt", "session_id", "sandbox_id")).lower()]
+
+    def content():
+        size = get_app().output.get_size()
+        return resume_picker_lines(matches(), cursor, title=title, query=query, warning=warning,
+                                   columns=size.columns, height=size.rows, expanded=expanded,
+                                   search_label=search_label, empty_label=empty_label)
+
+    @keys.add("c-o")
+    def details(event):
+        nonlocal expanded
+        expanded = not expanded
+
+    @keys.add("up")
+    @keys.add("down")
+    def move(event):
+        nonlocal cursor
+        cursor = (cursor + (1 if event.key_sequence[0].key == "down" else -1)) % max(1, len(matches()))
+
+    @keys.add("enter")
+    def accept(event):
+        nonlocal warning
+        visible = matches()
+        if visible:
+            row = visible[cursor % len(visible)]
+            if row.get("resumable", True):
+                event.app.exit(result=row)
+            else:
+                warning = row.get("reason") or "This conversation cannot be resumed"
+
+    @keys.add("escape")
+    @keys.add("c-c")
+    @keys.add("c-d")
+    def cancel(event):
+        event.app.exit(result=None)
+
+    @keys.add("backspace")
+    def erase(event):
+        nonlocal query, cursor
+        query, cursor = query[:-1], 0
+
+    @keys.add(Keys.Any)
+    def search(event):
+        nonlocal query, cursor
+        if event.data.isprintable():
+            query, cursor = (query + event.data)[:120], 0
+
+    return Application(layout=Layout(HSplit([Window(FormattedTextControl(content), always_hide_cursor=True)])),
+                       key_bindings=keys, style=resume_style(), full_screen=False).run()
+
+
+
+def cli_table(headers, rows, *, muted=()):
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+    rows = [[display_text(value, 300) for value in row] for row in rows]
+    table = Table(box=None, pad_edge=False, header_style="bold #79c0ff")
+    for title in headers:
+        table.add_column(title)
+    for index, row in enumerate(rows):
+        table.add_row(*(Text(value) for value in row), style="dim" if index in muted else None)
+    width = None if sys.stdout.isatty() else max(80, sum(max([len(str(headers[i])), *[len(row[i]) for row in rows]]) for i in range(len(headers))) + 2 * len(headers))
+    Console(no_color="NO_COLOR" in os.environ, width=width).print(table)
+
+
+
+def render_resume_table(rows):
+    cli_table(("Workspace (agent)", "Conversation", "Updated", "State"), [
+        (f"{r['workspace']} ({r.get('backend') or r['agent']})", r.get("title") or r.get("session_id") or "Workspace",
+         updated_label(r), r["state"]) for r in rows], muted={i for i,r in enumerate(rows) if not r["resumable"]})
+
+
+
+class ResumeInputError(ValueError):
+    """Invalid local resume input, safe to report before platform operations."""
+
+
+def validate_resume_args(args):
+    try:
+        for item in getattr(args, "env", []):
+            if not isinstance(item, str) or "=" not in item or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item.split("=", 1)[0]):
+                raise ValueError("--env expects KEY=VALUE with a valid variable name")
+        if getattr(args, "legacy_restore_attach", False):
+            raise ValueError("--connect/--attach belongs to restore; use cws-agent restore NAME --connect. Resume opens the conversation automatically.")
+        session = getattr(args, "session_id", None)
+        if session:
+            native_resume_command(getattr(args, "agent", None) or "claude", session)
+        if getattr(args, "cwd", None) and not args.cwd.startswith("/"):
+            raise ValueError("--cwd must be an absolute sandbox directory")
+        for key, check in (("cpu", shell_cpu), ("memory", shell_memory)):
+            if getattr(args, key, None) is not None:
+                setattr(args, key, check(getattr(args, key)))
+        if getattr(args, "mode", None) not in (None, "serverless", "cks"):
+            raise ValueError("--mode must be serverless or cks")
+        if getattr(args, "disk", None) and not re.fullmatch(r"[1-9][0-9]*(?:Gi|Mi|Ti)", args.disk):
+            raise ValueError("--disk must be a positive size such as 10Gi")
+        if getattr(args, "lifetime", None) and parse_duration(args.lifetime) <= 0:
+            raise ValueError("--lifetime must be positive")
+    except (ValueError, argparse.ArgumentTypeError, SystemExit) as error:
+        raise ResumeInputError(str(error)) from None
+
+
+def cmd_unified_resume(args):
+    machine = getattr(args, "json", False)
+    validate_resume_args(args)
+    if getattr(args, "list", False) and getattr(args, "dry_run", False):
+        raise ResumeInputError("Choose --list or --dry-run")
+    try:
+        upload_plan = directory_upload_plan(args)
+    except (ValueError, OSError, SystemExit) as error:
+        raise ResumeInputError(display_text(error, 500)) from None
+    if machine:
+        args.no_config_sync = True
+    scoped_name = getattr(args, "name", None)
+    scoped_box = getattr(args, "sandbox", None)
+    if scoped_name and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", scoped_name):
+        scoped_box, scoped_name = scoped_name, None
+    rows, errors = discover_resume(name=scoped_name, sandbox=scoped_box, opencode_cwd=getattr(args, "cwd", None))
+    for error in errors:
+        print(error.get("message", "Workspace discovery incomplete"), file=sys.stderr)
+    try:
+        found = resolve_resume_rows(rows, args)
+    except ValueError as error:
+        resume_result(args, errors=[{"code": "harness_mismatch", "message": str(error)}])
+        if not machine:
+            print(str(error), file=sys.stderr)
+        return 2
+    if getattr(args, "list", False):
+        if machine:
+            resume_result(args, rows=found, errors=errors)
+        else:
+            render_resume_table(found)
+        return 0 if not errors else 2
+    explicit = any(getattr(args, key, None) for key in ("target", "name", "sandbox", "session_id"))
+    if not found:
+        message = "No matching conversation or saved workspace. On another device, select the workspace name to discover its saved conversations."
+        resume_result(args, errors=[*errors, {"code": "not_found", "message": message}])
+        if not machine:
+            print(message, file=sys.stderr)
+        return 2
+    if machine and not any(getattr(args, flag, False) for flag in ("dry_run", "no_attach")):
+        resume_result(args, rows=found, errors=[*errors, {"code":"terminal_required", "message":"Use --list, --dry-run or --no-attach with --json"}])
+        return 2
+    if len(found) != 1 or not explicit or errors:
+        if machine or not sys.stdin.isatty() or not sys.stdout.isatty():
+            resume_result(args, rows=found, errors=[*errors, {"code": "selection_required", "message": "Select a workspace and conversation explicitly"}])
+            if not machine:
+                render_resume_table(found)
+                print("Choose a workspace and --session ID in a terminal." + (" Discovery may be incomplete." if errors else ""), file=sys.stderr)
+            return 2
+        row = resume_picker(found, notice="Discovery incomplete; available results shown" if errors else "")
+        if row is None:
+            return 130
+    else:
+        row = found[0]
+    def fail(code, message, proposal=None):
+        resume_result(args, selected=row, errors=[{"code": code, "message": message}], proposal=proposal)
+        if not machine:
+            print(message, file=sys.stderr)
+        return 2
+    if not row["resumable"]:
+        return fail("unresumable", row["reason"])
+    if getattr(args, "running_only", False) and row["_sb"] is None:
+        return fail("not_running", "Workspace is saved; omit --running-only to restore it")
+    try:
+        config, missing = (None, False) if row["_sb"] else recovery_config(row, args)
+    except (ValueError, argparse.ArgumentTypeError) as error:
+        return fail("invalid_configuration", str(error))
+    action = "attach" if row["_sb"] else "restore"
+    if getattr(args, "dry_run", False):
+        resume_result(args, selected=row, errors=errors, action=action, proposal=config)
+        if not machine:
+            render_resume_table([row])
+            print("Would " + ("restore saved compute and resume this conversation." if action == "restore"
+                              else "resume this conversation on its running sandbox."))
+            if config:
+                cli_table(("Recovery setting", "Value"), [(key.replace("_", " "), str(value))
+                          for key, value in config.items() if value is not None])
+            if missing:
+                print("Original configuration is incomplete; confirmation is required before restoring.")
+        return 0
+    if missing and not getattr(args, "allow_default_config", False):
+        if machine or not sys.stdin.isatty():
+            return fail("configuration_required", "Original configuration is unavailable; review defaults before restoring", config)
+        choice = resume_picker([
+            {"workspace": "Restore", "title": "Restore with shown defaults", "resumable": True},
+            {"workspace": "Change", "title": "Exit and supply --image, --cpu, --memory, --disk or --mode", "resumable": True},
+            {"workspace": "Cancel", "title": "Leave workspace saved", "resumable": True},
+        ], title="Original configuration unavailable", notice=display_text(json.dumps(config), 240))
+        if not choice or choice["workspace"] != "Restore":
+            return 130
+    if not getattr(args, "no_attach", False) and (not sys.stdin.isatty() or not sys.stdout.isatty()):
+        return fail("terminal_required", "Resume requires a terminal; use --no-attach to prepare the workspace")
+    sb = row["_sb"]
+    if sb is None:
+        from contextlib import redirect_stdout
+        with redirect_stdout(sys.stderr):
+            sb = restore_resume_row(row, args, config)
+        row = {**row, "_sb": sb, "sandbox_id": sb.sandbox_id, "state": "live"}
+    try:
+        document = read_workspace_document(sb)
+        if document.get("kind") or document.get("backend"):
+            return fail("unresumable", f"Saved workspace contains a managed worker. Sandbox {sb.sandbox_id} is running; stop with cws-agent stop {row['workspace']} --no-snapshot")
+        if row["agent"] != "shell":
+            history = [] if row["agent"] in ("cursor", "devin") else remote_native_history(sb, opencode_cwd=getattr(args, "cwd", None) if row["agent"] == "opencode" else None)
+            if row["session_id"]:
+                verified = [r for r in history if r["id"] == row["session_id"] and r["agent"] == row["agent"]]
+                if row["agent"] not in ("cursor", "devin") and len(verified) != 1:
+                    return fail("conversation_missing", f"Conversation is absent from this snapshot. Sandbox {sb.sandbox_id} is running; stop with cws-agent stop {row['workspace']} --no-snapshot")
+                if verified:
+                    row["cwd"] = verified[0]["cwd"]
+            elif history:
+                choices = [resume_row(row["workspace"], r["agent"], sb.sandbox_id, conversation=r, sb=sb) for r in history]
+                if machine or not sys.stdin.isatty():
+                    resume_result(args, rows=choices, selected=row, errors=[{"code":"selection_required", "message":"Workspace restored; select a conversation"}])
+                    if not machine:
+                        render_resume_table(choices)
+                        print("Workspace restored; select a conversation in a terminal.", file=sys.stderr)
+                    return 2
+                choice = resume_picker(choices, title="Choose a saved conversation")
+                if choice is None:
+                    return 130
+                row = choice
+            elif row["agent"] not in ("cursor", "devin"):
+                return fail("conversation_missing", f"No saved conversations found. Workspace is running: {sb.sandbox_id}; use cws-agent connect {row['workspace']} to start work")
+        if row["agent"] != "shell":
+            cwd = getattr(args, "cwd", None) or row.get("cwd") or PROJECT_DIR
+            if not isinstance(cwd, str) or not cwd.startswith("/"):
+                return fail("invalid_history", "Conversation working directory is invalid")
+            check = exec_retry(sb, ["sh", "-lc", AGENT_ENV + f"test -d {shlex.quote(cwd)} && command -v {shlex.quote(HARNESSES[row['agent']].agent_bin)} >/dev/null"], attempts=1)
+            if check.returncode not in (0, None):
+                return fail("conversation_unavailable", f"Agent executable or working directory is unavailable. Sandbox {sb.sandbox_id} is running; inspect it before retrying")
+        args.name = row["workspace"]
+        transfer = apply_directory_upload(sb, args, upload_plan)
+        if getattr(args, "no_attach", False):
+            resume_result(args, selected=row, action=action, transfer=transfer)
+            if not machine:
+                print(f"Workspace ready: {row['workspace']} ({sb.sandbox_id})")
+            return 0
+        if machine:
+            return fail("terminal_required", "Use --no-attach with --json to prepare a workspace")
+        args.session_id, args.agent = row["session_id"], row["agent"]
+        args.cwd = getattr(args, "cwd", None) or row.get("cwd")
+        if row["agent"] == "shell":
+            return pty_attach(sb, "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi", image_paste=False, plain_shell=True)
+        sync_agent_config(sb, HARNESSES[row["agent"]], args)
+        return resume_conversation(sb, args)
+    except UploadPaused as error:
+        return fail("upload_paused", error.safe_message + f" Sandbox: {sb.sandbox_id}")
+    except ResumeOperationError as error:
+        return fail("resume_failed", f"{display_text(error, 500)}. Sandbox {sb.sandbox_id} remains running")
+    except (Exception, SystemExit) as error:
+        return fail("resume_failed", f"Resume failed ({type(error).__name__}). Sandbox {sb.sandbox_id} remains running; inspect it before retrying, or stop with cws-agent stop {row['workspace']} --no-snapshot")
+    finally:
+        if not machine:
+            print(f"Workspace is still running. Save and stop: cws-agent stop {row['workspace']}", file=sys.stderr)
+
+
+def cmd_agent_resume(args) -> int:
+    return cmd_unified_resume(args)
 
 
 def cmd_session_resume(args) -> int:
-    return resume_conversation(require_active(args.name), args)
+    return cmd_unified_resume(args)
 
 
 def resume_conversation(sb, args) -> int:
@@ -7173,11 +8093,13 @@ def resume_conversation(sb, args) -> int:
         rows = [r for r in history if r["id"] == args.session_id
                 and (not args.agent or r["agent"] == args.agent)]
         if len(rows) != 1:
-            raise SystemExit("error: session ID not found or ambiguous; use `session history` "
+            raise ResumeOperationError("error: session ID not found or ambiguous; use `session history` "
                              "and --agent (Devin and Cursor require an explicit --agent)")
         agent, cwd = rows[0]["agent"], args.cwd or rows[0]["cwd"]
     command = native_resume_command(agent, args.session_id) + permission_flags(HARNESSES[agent], args)
     # Fail on missing cwd instead of silently resuming against unrelated files.
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        raise ValueError("Saved conversation has no absolute working directory")
     return pty_attach(sb, f"cd {shlex.quote(cwd)} && exec {command}")
 
 
@@ -7365,9 +8287,7 @@ def cmd_session_ls(args) -> int:
     header = ("SESSION", "BRANCH", "AGENT", "CHANGES")
     table = [(r["name"], r["branch"], "running" if r["alive"] else "stopped",
               f'{r["changed"]} files') for r in rows]
-    widths = [max(len(str(x[i])) for x in table + [header]) for i in range(4)]
-    for row in [header] + table:
-        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(row)))
+    cli_table(header, table)
     return 0
 
 
@@ -7468,7 +8388,7 @@ def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) ->
                    help="max sandbox lifetime, e.g. 90m / 8h / 7d (default: 8h)")
     p.add_argument("--cpu", default="2", help="CPU request/limit (default: 2)")
     p.add_argument("--memory", default="4Gi", help="memory request/limit (default: 4Gi)")
-    p.add_argument("--disk", help="/workspace volume size (launch --local-dir: automatic with headroom; otherwise 10Gi)")
+    p.add_argument("--disk", help="/workspace volume size (launch --add-dir: automatic with headroom; otherwise 10Gi)")
     p.add_argument("--mode", choices=["serverless", "cks"], default=None,
                    help="placement mode (default: backend default)")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
@@ -7477,16 +8397,159 @@ def add_create_flags(p: argparse.ArgumentParser, *, agent: str | None = None) ->
                    help="copy a local env var into the sandbox (repeatable)")
 
 
+def resume_input_schema():
+    strings = ("target", "session_id", "sandbox", "agent", "cwd", "image", "cpu", "memory", "disk", "mode", "lifetime", "remote_path")
+    booleans = ("list", "dry_run", "no_attach", "running_only", "allow_default_config", "overwrite")
+    return {"$schema":"https://json-schema.org/draft/2020-12/schema", "title":"cws-agent resume input v1",
+            "type":"object", "additionalProperties":False,
+            "properties": {**{k:{"type":"string", "minLength":1} for k in strings},
+                           **{k:{"type":"boolean"} for k in booleans},
+                           "agent":{"type":"string", "enum":[*sorted(HARNESSES), "shell"]},
+                           "mode":{"type":"string", "enum":["serverless", "cks"]},
+                           "add_dir":{"type":"array", "items":{"type":"string", "minLength":1}},
+                           "schema_version":{"const":1}}}
+
+
+
+def cmd_resume_schema(args):
+    schema = {"schema_version":1, "input":resume_input_schema(),
+        "output":{"$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object",
+            "required":["schema_version", "rows", "errors", "partial", "action", "selected", "proposal", "transfer"],
+            "properties":{"schema_version":{"const":1}, "rows":{"type":"array", "items":{"$ref":"#/$defs/row"}},
+                "selected":{"anyOf":[{"$ref":"#/$defs/row"},{"type":"null"}]},
+                "partial":{"type":"boolean"}, "action":{"enum":[None,"attach","restore"]},
+                "proposal":{"type":["object","null"]}, "transfer":{"type":["object","null"]},
+                "errors":{"type":"array","items":{"type":"object","required":["code","message"],
+                    "properties":{"code":{"type":"string"},"message":{"type":"string"}}}}},
+            "$defs":{"row":{"type":"object","required":["workspace","agent","sandbox_id","session_id","resumable","state"],
+                "properties": {**{k:{"type":["string","null"]} for k in
+                    ("workspace","workspace_id","agent","sandbox_id","session_id","title","excerpt","cwd","updated_at","updated_source","saved_at","reason","snapshot_id","backend")},
+                    "state":{"enum":["live","saved","unavailable"]},"resumable":{"type":"boolean"}}}}}}
+    result = schema if args.topic else {"schema_version": 1, "commands": {"resume": schema}}
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+
+def read_resume_input(args, argv, parser):
+    from pathlib import Path
+    source = getattr(args, "input_json", None)
+    if not source:
+        return
+    if source == "-":
+        raw = sys.stdin.read((1 << 20) + 1)
+    elif source.startswith("@"):
+        with Path(source[1:]).expanduser().open() as stream:
+            raw = stream.read((1 << 20) + 1)
+    else:
+        raise ValueError("--input-json accepts @file or - for stdin")
+    if len(raw) > 1 << 20:
+        raise ValueError("JSON input exceeds 1 MiB")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON input key: " + key)
+            result[key] = value
+        return result
+    try:
+        data = json.loads(raw, object_pairs_hook=unique)
+    except RecursionError:
+        raise ValueError("JSON input nesting exceeds the parser limit") from None
+    schema = resume_input_schema()["properties"]
+    if not isinstance(data, dict) or set(data) - set(schema):
+        raise ValueError("JSON input must be an object with known resume fields")
+    command_parser = next(action.choices[args.command] for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+    if args.command == "session":
+        command_parser = next(action.choices[args.session_command] for action in command_parser._actions if isinstance(action, argparse._SubParsersAction))
+    option_tokens = [token.partition("=")[0] for token in argv if token.startswith("--")]
+    for key, value in data.items():
+        definition = schema[key]
+        if key == "schema_version":
+            valid = type(value) is int and value == 1
+        elif definition["type"] == "boolean":
+            valid = type(value) is bool
+        elif definition["type"] == "array":
+            valid = isinstance(value, list) and all(isinstance(v, str) and v for v in value)
+        else:
+            valid = isinstance(value, str) and bool(value)
+        if not valid or ("enum" in definition and value not in definition["enum"]):
+            raise ValueError("Invalid JSON input field: " + key)
+        if key == "agent" and args.command in HARNESSES and value != args.command:
+            raise ValueError("JSON agent conflicts with the harness shortcut; use cws-agent resume --agent AGENT")
+        if key != "schema_version":
+            previous = getattr(args, key, None)
+            action = next((a for a in command_parser._actions if a.dest == key), None)
+            if action is not None and action.type is not None:
+                try:
+                    value = ([action.type(item) for item in value] if definition["type"] == "array"
+                             else action.type(value))
+                except (ValueError, argparse.ArgumentTypeError, SystemExit):
+                    raise ValueError("Invalid JSON input field: " + key) from None
+            explicit = bool(action and any(option.startswith(token) for option in action.option_strings for token in option_tokens))
+            default = action.default if action else None
+            if previous not in (None, False, [], "") and previous != value and (explicit or previous != default):
+                raise ValueError("Conflicting CLI and JSON field: " + key)
+            setattr(args, key, value)
+    if getattr(args, "agent", None) not in (None, *HARNESSES, "shell"):
+        raise ValueError("Unknown agent")
+    args._resume_input_fields = list(data)
+    args.json = True
+
+
+
+def add_resume_flags(parser):
+    parser.add_argument("--input-json", metavar="@FILE|-", help="read versioned resume input; implies --json")
+    parser.add_argument("--running-only", action="store_true", help="never allocate compute")
+    parser.add_argument("--no-attach", action="store_true", help="prepare workspace without opening a terminal")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--list", action="store_true", help="list conversations without resuming")
+    modes.add_argument("--dry-run", action="store_true", help="show the proposed action without allocating")
+    parser.add_argument("--json", action="store_true", help="machine-readable results; never prompt or sync configuration")
+    parser.add_argument("--allow-default-config", action="store_true", help="allow recovery with proposed defaults when configuration is unavailable")
+    if "--no-config-sync" not in parser._option_string_actions:
+        parser.add_argument("--no-config-sync", action="store_true", help="skip local configuration import")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
+    options = argv[:argv.index("--")] if "--" in argv else argv
+    machine = any(token == "--json" or token.split("=", 1)[0] == "--input-json" for token in options)
+    try:
+        return _main(argv, machine=machine)
+    except ResumeInputError as error:
+        if machine:
+            resume_result(argparse.Namespace(json=True), errors=[{"code":"invalid_input", "message":display_text(error, 500)}])
+        else:
+            print("error: " + display_text(error, 500), file=sys.stderr)
+        return 2
+
+
+def _main(argv, *, machine=False):
+    class CommandParser(argparse.ArgumentParser):
+        def _get_value(self, action, value):
+            try:
+                return super()._get_value(action, value)
+            except SystemExit as error:
+                if machine:
+                    raise ResumeInputError(str(error)) from None
+                raise
+
+        def error(self, message):
+            if machine:
+                if message.startswith("unrecognized arguments:"):
+                    message = "Unrecognized command arguments; see cws-agent resume --help"
+                raise ResumeInputError(message)
+            super().error(message)
+
+    parser = CommandParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
     add_verbose_flag(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("shell", help="create or reconnect to a sandbox terminal", allow_abbrev=False)
     p.add_argument("name", nargs="?", help="session name (default: generate a new shell name)")
-    p.add_argument("--add-local", type=shell_text, action="append", default=[], metavar="PATH",
-                   help="copy a file or directory to /mnt/BASENAME on creation (repeatable)")
+    add_directory_flags(p)
+    p.set_defaults(add_local=[])
     p.add_argument("--image", type=shell_text, help="container image (default: python:3.11)")
     p.add_argument("--cpu", type=shell_cpu, help="CPUs, e.g. 2 or 500m (default: 2)")
     p.add_argument("--gpu", type=shell_gpu, metavar="any[:COUNT]", help="request 1 to 8 GPUs (default: none; any means any:1)")
@@ -7514,14 +8577,9 @@ def main(argv: list[str] | None = None) -> int:
                           help="compatibility alias for the positional session name")
         add_create_flags(p, agent=shortcut_agent)
         p.add_argument("--repo-url", help="git URL to clone into /workspace/project")
-        p.add_argument("--local-dir", metavar="PATH",
-                       help="sync a local directory into /workspace/project (wins over --repo-url)")
+        add_directory_flags(p)
+        p.set_defaults(local_dir=None)
         p.add_argument("--no-snapshot", action="store_true", help="skip the automatic snapshot after project upload")
-        p.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
-                       help="upload/extraction deadline, e.g. 4h (default: size-based)")
-        p.add_argument("--no-git", action="store_true", help="exclude .git when syncing --local-dir")
-        p.add_argument("--exclude", action="append", default=[], metavar="NAME",
-                       help="extra dir/file name to exclude from --local-dir sync (repeatable)")
         p.add_argument("--claude-env", metavar="ENV_ID",
                        help="serve this Claude Managed Agents self-hosted environment "
                             "(env_...); implies --agent ant. Needs ANTHROPIC_ENVIRONMENT_KEY.")
@@ -7537,8 +8595,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--detach", action="store_true", help="do not attach after launch")
         p.add_argument("--telegram", action="store_true", help="create sandbox, guide agent sign-in, pair Telegram, and start its bridge in one command")
         if shortcut_agent not in (None, "ant", "openai"):
+            add_resume_flags(p)
             p.add_argument("--resume", dest="session_id", default=argparse.SUPPRESS, metavar="SESSION_ID",
-                           help="continue a saved agent session in a running sandbox (does not create or restore one)")
+                           help="continue a live or saved conversation; restore compute when needed")
             p.add_argument("--cwd", default=argparse.SUPPRESS,
                            help="sandbox directory for --resume (default: saved session directory)")
         p.set_defaults(func=cmd_launch)
@@ -7551,6 +8610,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-snapshot", action="store_true", help="skip the automatic snapshot after upload")
     p.add_argument("--preserve-existing", action="store_true", help="keep remote files on collisions (used by background Telegram launches)")
     p.add_argument("--_upload-job", help=argparse.SUPPRESS)
+    p.add_argument("--_add-dir", dest="add_dir", action="append", default=[], help=argparse.SUPPRESS)
+    p.add_argument("--_remote-path", dest="remote_path", help=argparse.SUPPRESS)
+    p.add_argument("--_overwrite", dest="overwrite", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--transfer-timeout", type=parse_duration, metavar="DURATION",
                    help="upload/extraction deadline, e.g. 4h (default: size-based)")
     p.add_argument("--no-git", action="store_true", help="exclude .git")
@@ -7572,6 +8634,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.add_argument("--cmd", help="command to run instead of the agent (e.g. bash)")
     p.add_argument("--agent", choices=sorted(HARNESSES), default=None, help=argparse.SUPPRESS)
+    add_directory_flags(p)
     p.set_defaults(func=cmd_attach)
 
     p = sub.add_parser("run", help="headless one-shot prompt (`claude -p` / `devin -p`)")
@@ -7605,7 +8668,27 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--abort-checkpoint", action="store_true", help="abandon an uncommitted checkpoint and release its writer gate")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("restore", aliases=["resume"], help="restore the latest snapshot into a fresh sandbox (resume is a compatibility alias)")
+    p = sub.add_parser("resume", help="choose and resume a live or saved conversation")
+    p.add_argument("target", nargs="?", help="workspace name, full sandbox ID, or native session ID")
+    p.add_argument("--session", dest="session_id", help="native harness conversation ID")
+    p.add_argument("--sandbox", help="scope to a full sandbox ID")
+    p.add_argument("--agent", choices=[*sorted(HARNESSES), "shell"], help="select the original conversation harness")
+    p.add_argument("--connect", "--attach", dest="legacy_restore_attach", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--cwd", help="remote conversation directory")
+    p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="set an environment variable when restoring compute")
+    p.add_argument("--env-passthrough", action="append", default=[], metavar="KEY", help="forward a local variable when restoring compute")
+    add_permission_flags(p)
+    add_resume_flags(p)
+    for flag in ("image", "disk", "lifetime"):
+        p.add_argument("--" + flag, help="override recovery configuration")
+    p.add_argument("--cpu", type=shell_cpu, help="override recovery CPUs")
+    p.add_argument("--memory", type=shell_memory, help="override recovery memory")
+    p.add_argument("--mode", choices=("serverless", "cks"), help="override recovery placement")
+    add_directory_flags(p)
+    add_verbose_flag(p)
+    p.set_defaults(func=cmd_unified_resume)
+
+    p = sub.add_parser("restore", help="restore the latest snapshot into a fresh sandbox")
     p.add_argument("name")
     add_create_flags(p)
     p.add_argument("--checkpoint-dir", metavar="PATH", help="restore the exact committed checkpoint instead of the latest ordinary snapshot")
@@ -7614,6 +8697,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workers", type=int, default=None, help="override saved worker count")
     p.add_argument("--connect", "--attach", dest="attach", action="store_true", help="open a terminal after restoring (--attach is a compatibility alias)")
     p.add_argument("--telegram", action="store_true", help="restore workspace and reconnect its saved Telegram bot")
+    add_directory_flags(p)
     p.set_defaults(func=cmd_resume, cpu=None, memory=None)
 
     p = sub.add_parser("list", help="list active agent sessions")
@@ -7686,6 +8770,8 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("session_id")
     q.add_argument("--agent", choices=sorted(set(HARNESSES) - {"ant", "openai"}), help="required for Devin/Cursor, otherwise inferred")
     q.add_argument("--cwd", help="remote project directory (default: saved session directory)")
+    add_resume_flags(q)
+    add_directory_flags(q)
     q.set_defaults(func=cmd_session_resume)
 
     q = ssub.add_parser("restart", help="restart a stopped worktree agent without recreating its branch")
@@ -7741,33 +8827,68 @@ def main(argv: list[str] | None = None) -> int:
         p = config_sub.add_parser(command)
         add_verbose_flag(p)
         p.add_argument("name", help="active sandbox name")
-        p.add_argument("--local-dir", help="project configuration source (default: current directory)")
+        p.add_argument("--project-dir", dest="local_dir", help="project configuration source (default: current directory)")
+        p.add_argument("--local-dir", dest="local_dir", help=argparse.SUPPRESS)
         p.add_argument("--select", action="append", help="name or exact skill:NAME/mcp:NAME to import (repeatable), or a for all")
         p.add_argument("--env-var", action="append", help="also copy this local environment variable for selected items (repeatable; values stay hidden)")
         p.add_argument("--env-file", action="append", help="read referenced values from this dotenv file (repeatable; overrides other local sources)")
         p.add_argument("--yes", action="store_true", help="confirm explicitly selected imports without a prompt")
         p.set_defaults(func=cmd_config, preview=command == "preview")
 
+    p = sub.add_parser("schema", help="print a machine interface schema")
+    p.add_argument("topic", nargs="?", choices=["resume"], help="omit to describe all versioned machine interfaces")
+    p.set_defaults(func=cmd_resume_schema)
+
     args = parser.parse_args(argv)
+    try:
+        read_resume_input(args, argv, parser)
+    except (ValueError, OSError) as error:
+        args.json = True
+        resume_result(args, errors=[{"code":"invalid_input", "message":str(error)}])
+        return 2
     if getattr(args, "command", None) in set(HARNESSES) - {"ant", "openai"}:
         command_parser = sub.choices[args.command]
-        if hasattr(args, "session_id"):
-            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose"}
+        if hasattr(args, "session_id") or any(getattr(args, k, False) for k in ("list", "dry_run", "json", "input_json")):
+            resume_options = {"name", "agent", "session_id", "cwd", "permission_mode", "yolo", "verbose", "running_only", "no_attach", "list", "dry_run", "json", "allow_default_config", "no_config_sync", "add_dir", "remote_path", "overwrite", "no_git", "exclude", "transfer_timeout", "input_json", "cpu", "memory", "disk", "image", "mode", "lifetime", "env", "env_passthrough"}
+            explicit_fields = set(getattr(args, "_resume_input_fields", []))
             option_tokens = argv[:argv.index("--")] if "--" in argv else argv
             supplied_options = [token.partition("=")[0] for token in option_tokens if token.startswith("--")]
             for action in command_parser._actions:
                 explicit = any(option.startswith(token) for option in action.option_strings
                                for token in supplied_options)
+                if explicit:
+                    explicit_fields.add(action.dest)
                 if (action.dest not in resume_options
                         and (explicit or getattr(args, action.dest, action.default) != action.default)):
                     command_parser.error(f"{action.option_strings[0]} cannot be combined with --resume; "
                                          "resume continues an existing agent session")
             args.cwd = getattr(args, "cwd", None)
+            args.session_id = getattr(args, "session_id", None)
+            for key in ("cpu", "memory", "lifetime"):
+                if key not in explicit_fields:
+                    setattr(args, key, None)
             args.func = cmd_agent_resume
+        elif getattr(args, "no_attach", False) or getattr(args, "running_only", False):
+            command_parser.error("--no-attach and --running-only require --resume; use --detach when launching")
         elif hasattr(args, "cwd"):
             command_parser.error("--cwd requires --resume")
     try:
+        if getattr(args, "json", False) and args.func in (cmd_unified_resume, cmd_agent_resume, cmd_session_resume):
+            try:
+                return args.func(args)
+            except ResumeInputError as error:
+                resume_result(args, errors=[{"code":"invalid_input", "message":display_text(error, 500)}])
+                return 2
+            except ResumeOperationError as error:
+                resume_result(args, errors=[{"code":"resume_failed", "message":display_text(error, 500)}])
+                return 2
+            except (Exception, SystemExit):
+                resume_result(args, errors=[{"code":"resume_failed", "message": "Resume failed; inspect workspace status before retrying"}])
+                return 2
         return args.func(args)
+    except ValueError as error:
+        print("error: " + display_text(error, 500), file=sys.stderr)
+        return 2
     except CWSandboxAuthenticationError as error:
         if getattr(args, "command", None) == "shell":
             # The SDK also uses this class for permission/entitlement failures.
