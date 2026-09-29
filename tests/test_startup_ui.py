@@ -137,9 +137,10 @@ class StartupOutputTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), \
                 patch.object(app, "find_active", return_value=None), \
                 patch.object(app, "build_env", return_value={}), \
-                patch.object(app, "scan_local_dir", return_value=app.LocalDirectoryInventory("/project", [], 0, 0, set())), \
+                patch.object(app.os.path, "isdir", return_value=True), \
+                patch.object(app, "directory_upload_plan", return_value=[{"size": 0}]), \
                 patch.object(app, "provision_session", return_value=sb), \
-                patch.object(app, "sync_local_dir"), \
+                patch.object(app, "apply_directory_upload"), \
                 patch.object(app, "take_snapshot", side_effect=lambda *a: print("snapshot finished") or "fss-example"):
             self.assertEqual(app.main(["claude", "example", "--local-dir", "/project", "--detach"]), 0)
         text = output.getvalue()

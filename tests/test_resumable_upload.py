@@ -254,7 +254,7 @@ class ResumableUploadTests(unittest.TestCase):
             with patch.object(cli, "find_active", return_value=None), \
                     patch.object(cli, "build_env", return_value={}), \
                     patch.object(cli, "provision_session", return_value=self.sb), \
-                    patch.object(cli, "sync_local_dir", side_effect=error), \
+                    patch.object(cli, "apply_directory_upload", side_effect=error), \
                     patch.object(cli, "stop_failed_sandbox") as stop, \
                     self.assertRaises(type(error)):
                 cli.cmd_launch(args)
@@ -267,7 +267,7 @@ class ResumableUploadTests(unittest.TestCase):
                     patch.object(cli, "find_active", return_value=None), \
                     patch.object(cli, "build_env", return_value={}), \
                     patch.object(cli, "provision_session", return_value=self.sb), \
-                    patch.object(cli, "sync_local_dir", side_effect=cli.UploadPaused("resume me")), \
+                    patch.object(cli, "apply_directory_upload", side_effect=cli.UploadPaused("resume me")), \
                     contextlib.redirect_stderr(io.StringIO()) as output, \
                     self.assertRaises(cli.UploadPaused):
                 cli.main(["launch", "test", "--local-dir", str(self.source), *options])
@@ -371,3 +371,55 @@ class ResumableUploadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def merge(self, uid=None, overwrite=False):
+        args = types.SimpleNamespace(add_dir=[str(self.source)], remote_path=str(self.project)+'/', volume=[])
+        plan = None if uid else cli.directory_upload_plan(args)
+        return cli.sync_local_dir(self.sb, str(self.source), include_git=True, extra_excludes=[], clean=False,
+                                  resume_upload=uid, transfer_timeout=30, upload_plan=plan, overwrite=overwrite)
+
+    def test_safe_merge_chunk_resume_preserves_remote_and_original_destination(self):
+        self.project.mkdir(parents=True)
+        (self.project/'file').write_text('remote work')
+        (self.source/'new').write_text('new content')
+        (self.source/'.claude').mkdir()
+        (self.source/'.claude/settings.json').write_text('{}')
+        self.sb.interrupt_index = 1
+        with self.assertRaises(cli.UploadPaused):
+            self.merge()
+        folder = self.cache()
+        manifest = cli.upload_manifest(folder)
+        self.assertTrue(manifest['safe_merge'])
+        self.assertNotIn('local', json.dumps(cli.upload_command(manifest, 'status')[-1]))
+        (self.source/'new').unlink()
+        self.sb.interrupt_index = None
+        self.sb.requests.clear()
+        result = self.merge(folder.name)
+        self.assertNotIn(0, self.puts())
+        self.assertEqual(result['preserved'], 1)
+        self.assertEqual((self.project/'file').read_text(), 'remote work')
+        self.assertEqual((self.project/'new').read_text(), 'new content')
+        self.assertEqual((self.project/'.claude/settings.json').read_text(), '{}')
+
+    def test_safe_merge_lost_receipt_returns_original_counts_without_reapplying(self):
+        self.sb.lost_ack = 'extract'
+        with self.assertRaises(cli.UploadPaused):
+            self.merge(overwrite=True)
+        folder = self.cache()
+        (self.project/'file').write_text('new remote work')
+        self.sb.requests.clear()
+        result = self.merge(folder.name)
+        self.assertEqual(result['copied'], 1)
+        self.assertEqual(self.puts(), [])
+        self.assertEqual((self.project/'file').read_text(), 'new remote work')
+
+    def test_safe_merge_keeps_file_plan_out_of_command_arguments(self):
+        args = types.SimpleNamespace(add_dir=[str(self.source)], remote_path=str(self.project)+'/', volume=[])
+        plan = cli.directory_upload_plan(args)
+        folder = cli.cache_upload(str(self.source), include_git=True, extra_excludes=[], clean=False,
+                                  inventory=None, upload_plan=plan)
+        manifest = cli.upload_manifest(folder)
+        command = cli.upload_command(manifest, 'extract')
+        self.assertNotIn(str(self.source), command[-1])
+        self.assertNotIn('relative', command[-1])
+        self.assertNotIn(str(self.project), json.dumps(manifest))

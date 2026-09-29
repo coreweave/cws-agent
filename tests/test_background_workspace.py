@@ -131,8 +131,10 @@ class BackgroundLaunchTests(unittest.TestCase):
 
     def args(self):
         with patch.object(cli, "cmd_launch", side_effect=lambda args: args):
-            return cli.main(["launch", "--name", "test", "--telegram", "--local-dir", str(self.root),
+            args = cli.main(["launch", "--name", "test", "--telegram", "--local-dir", str(self.root),
                              "--dangerously-skip-permissions"])
+            args.local_dir = str(self.root)
+            return args
 
     def test_launch_imports_and_signs_in_before_starting_background_upload_and_pairing(self):
         events = []
@@ -143,7 +145,7 @@ class BackgroundLaunchTests(unittest.TestCase):
                 patch.object(cli, "build_env", return_value={}), \
                 patch.object(cli, "scan_local_dir", return_value=cli.LocalDirectoryInventory(str(self.root), [], 0, 0, set())), \
                 patch.object(cli, "provision_session", return_value=self.sb), \
-                patch.object(cli, "sync_local_dir", side_effect=AssertionError("foreground upload blocked launch")), \
+                patch.object(cli, "apply_directory_upload", side_effect=AssertionError("foreground upload blocked launch")), \
                 patch.object(cli, "sync_agent_config", side_effect=lambda *a, **kw: events.append("imports")), \
                 patch.object(cli, "pty_attach", side_effect=lambda *a: events.append("login") or 0), \
                 patch.object(cli, "start_background_upload", side_effect=lambda *a: events.append("background")), \
@@ -171,7 +173,7 @@ class BackgroundLaunchTests(unittest.TestCase):
         events = []
         with patch.object(cli, "require_active", return_value=self.sb), \
                 patch.object(cli, "active_harness", return_value=cli.HARNESSES["claude"]), \
-                patch.object(cli, "sync_local_dir", side_effect=lambda *a, **k: events.append("upload")), \
+                patch.object(cli, "apply_directory_upload", side_effect=lambda *a, **k: events.append("upload")), \
                 patch.object(cli, "automatic_snapshot", side_effect=lambda *a: events.append("snapshot") or "snap"):
             self.assertEqual(cli.main(command), 0)
         self.assertEqual(events, ["upload", "snapshot"])
@@ -182,7 +184,7 @@ class BackgroundLaunchTests(unittest.TestCase):
             path = Path(cli.start_background_upload(self.sb, self.args()))
         with patch.object(cli, "require_active", return_value=self.sb), \
                 patch.object(cli, "active_harness", return_value=cli.HARNESSES["claude"]), \
-                patch.object(cli, "sync_local_dir"), \
+                patch.object(cli, "apply_directory_upload"), \
                 patch.object(cli, "automatic_snapshot", return_value=None):
             self.assertEqual(cli.main(spawn.call_args.args[0][2:]), 1)
         self.assertEqual(json.loads(path.read_text())["phase"], "snapshot-failed")
@@ -191,7 +193,7 @@ class BackgroundLaunchTests(unittest.TestCase):
         with patch("subprocess.Popen") as spawn:
             path = Path(cli.start_background_upload(self.sb, self.args()))
         with patch.object(cli, "require_active", return_value=self.sb), \
-                patch.object(cli, "sync_local_dir", side_effect=cli.UploadPaused("resume-upload test-id")), \
+                patch.object(cli, "apply_directory_upload", side_effect=cli.UploadPaused("resume-upload test-id")), \
                 patch.object(cli, "automatic_snapshot") as snapshot, self.assertRaises(cli.UploadPaused):
             cli.main(spawn.call_args.args[0][2:])
         snapshot.assert_not_called()
@@ -203,7 +205,7 @@ class BackgroundLaunchTests(unittest.TestCase):
         with patch("subprocess.Popen") as spawn:
             path = Path(cli.start_background_upload(self.sb, self.args()))
         with patch.object(cli, "require_active", return_value=types.SimpleNamespace(sandbox_id="different")), \
-                patch.object(cli, "sync_local_dir") as upload, self.assertRaises(SystemExit):
+                patch.object(cli, "apply_directory_upload") as upload, self.assertRaises(SystemExit):
             cli.main(spawn.call_args.args[0][2:])
         upload.assert_not_called()
         self.assertEqual(json.loads(path.read_text())["phase"], "paused")
@@ -218,6 +220,6 @@ class BackgroundLaunchTests(unittest.TestCase):
                 patch.object(cli, "read_backend_config", return_value=None), \
                 patch.object(cli, "sync_agent_config"), \
                 patch.object(cli, "cmd_bridge_telegram", return_value=0) as bridge:
-            self.assertEqual(cli.main(["resume", "test", "--telegram", "--dangerously-skip-permissions"]), 0)
+            self.assertEqual(cli.main(["restore", "test", "--telegram", "--dangerously-skip-permissions"]), 0)
         self.assertEqual(provision.call_args.kwargs["disk"], "65Gi")
         self.assertTrue(bridge.call_args.args[0].yolo)

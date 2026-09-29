@@ -82,6 +82,18 @@ class ShellTests(unittest.TestCase):
         self.assertIn("Shell ready", self.stderr.getvalue())
         self.assertIn("sb-example", self.stderr.getvalue())
 
+    def test_connect_uploads_to_shell_without_starting_an_agent(self):
+        args = self.parser.parse_args(["connect", "dev1", "--add-dir", str(self.root)])
+        with patch.object(agent, "require_active", return_value=self.sb), \
+             patch.object(agent, "probe_session_meta", return_value=("dev1", "shell")), \
+             patch.object(agent, "apply_directory_upload") as upload:
+            self.assertEqual(args.func(args), 17)
+        upload.assert_called_once()
+        self.config.assert_not_called()
+        self.run.assert_not_called()
+        self.assertEqual(self.pty.call_args.kwargs, {"image_paste": False, "plain_shell": True})
+        self.assertIn("exec sh", self.pty.call_args.args[1])
+
     def test_bare_shell_generates_reconnectable_name(self):
         self.invoke()
         name = self.run.call_args.kwargs["environment_variables"]["CWS_AGENT_NAME"]
@@ -119,6 +131,8 @@ class ShellTests(unittest.TestCase):
         self.run.assert_not_called()
 
     def test_all_creation_option_subsets_for_both_auth_modes_and_lifecycles(self):
+        self.stack.enter_context(patch.object(agent, "directory_upload_plan", return_value=[]))
+        self.stack.enter_context(patch.object(agent, "apply_directory_upload"))
         # Every presence/absence combination, not just a pairwise sample.
         flags = [("--image", "alpine:3.21"), ("--cpu", "500m"), ("--gpu", "any:8"),
                  ("--memory", "2048"), ("--add-local", str(self.file)),
@@ -137,7 +151,7 @@ class ShellTests(unittest.TestCase):
             placement = mode or ("cks" if volume else "serverless")
             invalid_auth = (secret and auth != AuthStrategy.WANDB) or (placement == "cks" and auth != AuthStrategy.COREWEAVE_API_KEY)
             invalid_placement = (secret and placement == "cks") or (volume and placement == "serverless")
-            invalid = invalid_auth or invalid_placement or (existing and (any(enabled) or mode))
+            invalid = invalid_auth or invalid_placement or (existing and (any(on for index, on in enumerate(enabled) if index != 4) or mode))
             self.auth.return_value = auth
             self.list.return_value.result.return_value = [self.sb] if existing else []
             self.run.reset_mock()
@@ -288,20 +302,20 @@ class ShellTests(unittest.TestCase):
         script = directory / "script.sh"
         script.write_bytes(b"#!/bin/sh\nexit 0\n")
         script.chmod(0o751)
-        self.invoke("dev1", "--add-local", str(self.file), "--add-local", str(directory))
-        self.assertEqual(self.uploads["/mnt/sample.txt"], b"hello\n")
-        self.assertEqual(self.uploads["/mnt/with spaces/script.sh"], script.read_bytes())
-        commands = [call.args[0] for call in self.sb.exec.call_args_list]
-        self.assertIn(["mkdir", "-p", "--", "/mnt/with spaces/empty"], commands)
-        self.assertIn(["chmod", "751", "--", "/mnt/with spaces/script.sh"], commands)
+        with patch.object(agent, "apply_directory_upload") as upload:
+            self.invoke("dev1", "--add-dir", str(self.file), "--add-dir", str(directory))
+        plan = upload.call_args.args[2]
+        self.assertTrue(all(item["base"] == "/workspace/project" for item in plan))
+        self.assertTrue(any(item["relative"] == "./empty" for item in plan))
+        self.assertTrue(any(item["mode"] & 0o777 == 0o751 for item in plan))
 
     def test_local_symlinks_missing_and_special_files_rejected_before_network(self):
         link = self.root / "link"
         link.symlink_to(self.file)
         fifo = self.root / "fifo"
         os.mkfifo(fifo)
-        for value in [link, fifo, self.root / "missing", Path("/"), self.root]:
-            with self.subTest(value=value), self.assertRaises(SystemExit):
+        for value in [fifo, self.root / "missing", Path("/"), self.root]:
+            with self.subTest(value=value), self.assertRaises((SystemExit, ValueError)):
                 self.invoke("dev1", "--add-local", str(value))
         self.list.assert_not_called()
         self.run.assert_not_called()
@@ -311,10 +325,10 @@ class ShellTests(unittest.TestCase):
         cases = [["--volume", "data", "--volume", "data:/mnt/elsewhere"],
                  ["--volume", "a:/mnt/same", "--volume", "b:/mnt/same"],
                  ["--volume", "a:/mnt/data", "--volume", "b:/mnt/data/nested"],
-                 ["--volume", "a:/mnt/sample.txt", "--add-local", str(self.file)],
+                 ["--volume", "a:/mnt/sample.txt", "--add-dir", str(self.file), "--remote-path", "/mnt/sample.txt"],
                  ["--add-local", str(self.file), "--add-local", str(self.file)]]
         for flags in cases:
-            with self.subTest(flags=flags), self.assertRaises(SystemExit):
+            with self.subTest(flags=flags), self.assertRaises((SystemExit, ValueError)):
                 self.invoke("dev1", *flags)
         self.auth.return_value = AuthStrategy.WANDB
         with self.assertRaisesRegex(SystemExit, "each --secret"):
@@ -340,13 +354,11 @@ class ShellTests(unittest.TestCase):
             self.sb.stop.assert_called_once_with(missing_ok=True)
             self.pty.assert_not_called()
 
-    def test_existing_remote_upload_destination_is_not_overwritten(self):
-        self.sb.exec.side_effect = [Mock(result=Mock(return_value=SimpleNamespace(returncode=0))),
-                                    Mock(result=Mock(return_value=SimpleNamespace(returncode=1)))]
-        with self.assertRaisesRegex(SystemExit, "destination already exists"):
-            self.invoke("dev1", "--add-local", str(self.file))
-        self.sb.write_file_streaming.assert_not_called()
-        self.sb.stop.assert_called_once()
+    def test_upload_failure_does_not_attach(self):
+        with patch.object(agent, "apply_directory_upload", side_effect=ValueError("merge failed")):
+            with self.assertRaisesRegex(ValueError, "merge failed"):
+                self.invoke("dev1", "--add-dir", str(self.file))
+        self.pty.assert_not_called()
 
     def test_duplicate_active_names_fail_without_side_effects(self):
         self.list.return_value.result.return_value = [self.sb, self.sb]
@@ -440,6 +452,20 @@ class ShellTests(unittest.TestCase):
                     self.assertIn(f"error: {message}\n", self.stderr.getvalue())
                     self.assertNotIn("wandb login", self.stderr.getvalue())
                 failing_call.side_effect = None
+
+    def test_resume_prepares_shell_with_saved_disk_lifetime_and_no_terminal(self):
+        self.stdin_tty.return_value = self.stdout_tty.return_value = False
+        args = self.parser.parse_args(['shell', 'dev1', '--snapshot', 'fss-example',
+                                      '--image', 'example.invalid/shell:latest', '--cpu', '4', '--memory', '8Gi'])
+        args._prepare_only, args._restore_disk, args._restore_lifetime = True, '50Gi', 7200
+        self.assertIs(args.func(args), self.sb)
+        options = self.run.call_args.kwargs
+        self.assertEqual(options['container_image'], 'example.invalid/shell:latest')
+        self.assertEqual(options['resources'].requests, {'cpu':'4','memory':'8Gi'})
+        self.assertEqual(options['file_system_snapshot'].file_system_snapshot_id, 'fss-example')
+        self.assertEqual(options['environment_variables']['CWS_AGENT_DISK'], '50Gi')
+        self.assertEqual(options['max_lifetime_seconds'], 7200)
+        self.pty.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -73,8 +73,7 @@ class NewAgentWorkflowTests(unittest.TestCase):
         with patch.object(cli, "require_active", return_value="sandbox"), \
                 patch.object(cli, "remote_native_history") as history, \
                 patch.object(cli, "pty_attach", return_value=0) as terminal:
-            cli.main(["session", "resume", "test", "chat-test", "--agent", "cursor",
-                      "--cwd", "/workspace/project with spaces", "--permission-mode", "native"])
+            cli.resume_conversation("sandbox", types.SimpleNamespace(agent="cursor", session_id="chat-test", cwd="/workspace/project with spaces", permission_mode="native", yolo=False))
         history.assert_not_called()
         command = terminal.call_args.args[1]
         self.assertIn("cd '/workspace/project with spaces' && exec cursor-agent --resume chat-test", command)
