@@ -3260,9 +3260,18 @@ def pty_attach(sb: Sandbox, remote_cmd: str, *, image_paste: bool | None = None,
                 resize_thread.join(timeout=2)
         finally:
             try:
-                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+                # Remote TUIs change emulator state independently of termios.
+                # On disconnect they cannot disable mouse reports themselves;
+                # leave the local shell with normal mouse selection again.
+                try:
+                    write_output(b"\x1b[?9;1000;1002;1003;1005;1006;1015;1016l")
+                except (OSError, ValueError):
+                    pass  # the terminal may already be closed
             finally:
-                signal.signal(signal.SIGWINCH, old_sigwinch)
+                try:
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+                finally:
+                    signal.signal(signal.SIGWINCH, old_sigwinch)
     if input_errors:
         print(f"error: terminal input/resize failed: {input_errors[0]}", file=sys.stderr)
         return 1

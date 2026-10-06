@@ -40,6 +40,16 @@ fails. Detached and headless agents cannot copy to a local clipboard.
 
 ## Troubleshooting
 
+If mouse movement types characters or makes the shell beep after a disconnect,
+the remote app left mouse reporting enabled. Press **Ctrl+C**, then run:
+
+```sh
+printf '\033[?9;1000;1002;1003;1005;1006;1015;1016l'
+```
+
+New attaches disable mouse reporting when they exit, including on connection
+errors. A forcibly killed client cannot run this cleanup.
+
 For misplaced cursors or broken redraws, reconnect and resize the terminal.
 Restart existing tmux agents to pick up changed terminal settings.
 The CLI uses the window's actual size and falls back to `xterm-256color` when
