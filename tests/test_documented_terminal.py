@@ -104,7 +104,8 @@ class DocumentedTerminalTests(unittest.TestCase):
         script = self.sandbox.shell.call_args.args[0][2]
         self.assertIn("export TERM=", script)
         self.assertIn("xterm-256color", script)
-        self.assertEqual(self.stdout.buffer.getvalue(), b"\x1b[H\xf0\x9f\x91\xbb\r\n\xff")
+        self.assertEqual(self.stdout.buffer.getvalue(), b"\x1b[H\xf0\x9f\x91\xbb\r\n\xff"
+                         + b"\x1b[?9;1000;1002;1003;1005;1006;1015;1016l")
 
     def test_placeholder_term_types_get_interactive_capability_fallback(self):
         for term in ("", "dumb", "unknown"):

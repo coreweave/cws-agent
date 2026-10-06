@@ -139,7 +139,8 @@ class TerminalTests(unittest.TestCase):
         stdout = TerminalFile(self.slave)
         with patch.object(sys, "stdin", TerminalFile(self.slave)), patch.object(sys, "stdout", stdout):
             self.assertEqual(agent.pty_attach(Sandbox(), "exec bash", plain_shell=plain_shell), 7)
-        self.assertEqual(stdout.buffer.getvalue(), b"".join(chunks))
+        self.assertEqual(stdout.buffer.getvalue(), b"".join(chunks)
+                         + b"\x1b[?9;1000;1002;1003;1005;1006;1015;1016l")
         self.assertEqual(b"".join(received), b"\x1b[A\x03\xff")
         after = termios.tcgetattr(self.slave)
         # macOS sets the kernel-maintained PENDIN bit when leaving raw mode.
@@ -234,6 +235,49 @@ class TerminalTests(unittest.TestCase):
         after[3] &= ~getattr(termios, "PENDIN", 0)
         before[3] &= ~getattr(termios, "PENDIN", 0)
         self.assertEqual(after, before)
+        self.assertEqual(signal.getsignal(signal.SIGWINCH), handler)
+
+    def test_disconnect_disables_remote_mouse_reporting(self):
+        for failure in (None, ConnectionError("connection lost"), KeyboardInterrupt()):
+            with self.subTest(failure=failure):
+                enabled = b"\x1b[?1003h\x1b[?1006h"
+
+                def output():
+                    yield enabled
+                    if failure is not None:
+                        raise failure
+
+                session = Mock(returncode=0)
+                session.wait.return_value = 0
+                session.output = Output(output(), lambda: None)
+                sandbox = Mock()
+                sandbox.shell.return_value = session
+                stdout = TerminalFile(self.slave)
+                with patch.object(sys, "stdin", TerminalFile(self.slave)), patch.object(sys, "stdout", stdout):
+                    if isinstance(failure, ConnectionError):
+                        with self.assertRaisesRegex(ConnectionError, "connection lost"):
+                            agent.pty_attach(sandbox, "exec bash")
+                    else:
+                        self.assertEqual(agent.pty_attach(sandbox, "exec bash"),
+                                         130 if failure else 0)
+                self.assertEqual(stdout.buffer.getvalue(),
+                                 enabled + b"\x1b[?9;1000;1002;1003;1005;1006;1015;1016l")
+                self.assertTrue(termios.tcgetattr(self.slave)[3] & termios.ICANON)
+
+    def test_failed_mouse_reset_still_restores_terminal(self):
+        session = Mock(returncode=0)
+        session.wait.return_value = 0
+        session.output = Output([], lambda: None)
+        sandbox = Mock()
+        sandbox.shell.return_value = session
+        stdout = TerminalFile(self.slave)
+        stdout.buffer = Mock()
+        stdout.buffer.write.side_effect = OSError("terminal closed")
+        handler = signal.getsignal(signal.SIGWINCH)
+        with patch.object(sys, "stdin", TerminalFile(self.slave)), patch.object(sys, "stdout", stdout):
+            self.assertEqual(agent.pty_attach(sandbox, "exec bash"), 0)
+        stdout.buffer.write.assert_called_once()
+        self.assertTrue(termios.tcgetattr(self.slave)[3] & termios.ICANON)
         self.assertEqual(signal.getsignal(signal.SIGWINCH), handler)
 
     def test_resize_and_write_errors_cancel_stream_and_restore_terminal(self):
