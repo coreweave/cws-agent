@@ -3977,6 +3977,7 @@ def import_checklist(items, *, cancel_label="cancel command"):
         event.app.exit(result=set())
 
     @keys.add("c-c")
+    @keys.add("<sigint>")  # Launchers may forward Ctrl-C as a signal.
     def cancel(event):
         event.app.exit(exception=KeyboardInterrupt())
 
