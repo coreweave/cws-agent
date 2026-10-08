@@ -1,12 +1,14 @@
 """Exercise terminal controls in memory; no cloud resources or local app UI."""
+import asyncio
 import contextlib
 import io
 import os
+import signal
 import types
 import unittest
 from unittest.mock import patch
 
-from prompt_toolkit.application import create_app_session
+from prompt_toolkit.application import Application, create_app_session
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.data_structures import Size
@@ -68,6 +70,23 @@ class ChecklistTests(unittest.TestCase):
     def test_launch_cancellation_label_explains_cleanup(self):
         self.choose("s", cancel_label="abort launch (stops sandbox)")
         self.assertIn("abort launch (stops sandbox)", self.output.text)
+
+    def test_sigint_cancels_checklist(self):
+        run = Application.run
+        previous_handler = signal.getsignal(signal.SIGINT)
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+            def interrupt():
+                loop = asyncio.get_running_loop()
+                loop.call_soon(os.kill, os.getpid(), signal.SIGINT)
+                # A swallowed signal must fail the test instead of hanging it.
+                loop.call_later(0.1, pipe.send_text, "s")
+
+            def run_with_interrupt(application):
+                return run(application, pre_run=interrupt)
+
+            with patch.object(Application, "run", run_with_interrupt), self.assertRaises(KeyboardInterrupt):
+                app.import_checklist(self.items)
+        self.assertEqual(signal.getsignal(signal.SIGINT), previous_handler)
 
     def test_oversize_submit_stays_open_and_allows_smaller_selection(self):
         self.items[0]["bytes"] = app.IMPORT_MAX_BYTES + 1
@@ -149,13 +168,18 @@ class StartupOutputTests(unittest.TestCase):
 
     def test_checklist_abort_cleans_up_new_sandbox_and_labels_that_action(self):
         sb = types.SimpleNamespace(sandbox_id="sb-example")
-        with contextlib.redirect_stdout(io.StringIO()), \
+        items = [dict(id="skill:review", name="review", kind="skill", blocked="", bytes=42)]
+        def sync_checklist(*args, **kwargs):
+            return app.import_checklist(items, **kwargs)
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()), \
+                contextlib.redirect_stdout(io.StringIO()), \
                 patch.object(app, "find_active", return_value=None), \
                 patch.object(app, "build_env", return_value={}), \
                 patch.object(app, "provision_session", return_value=sb), \
-                patch.object(app, "sync_agent_config", side_effect=KeyboardInterrupt()) as sync, \
+                patch.object(app, "sync_agent_config", side_effect=sync_checklist) as sync, \
                 patch.object(app, "stop_failed_sandbox") as stop:
-            self.assertEqual(app.main(["claude", "example"]), 130)
+            pipe.send_text("\x03\x04")
+            self.assertEqual(app.main(["codex", "example"]), 130)
         self.assertEqual(sync.call_args.kwargs["cancel_label"], "abort launch (stops sandbox)")
         stop.assert_called_once_with(sb)
 
