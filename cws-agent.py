@@ -6249,16 +6249,26 @@ def cmd_prune(args) -> int:
     return 0
 
 
+def remote_control_permission_flag(args) -> str:
+    # The remote-control server rejects --dangerously-skip-permissions; it only
+    # takes --permission-mode for the sessions it spawns.
+    flags = permission_flags(HARNESSES["claude"], args)
+    if flags == HARNESSES["claude"].yolo_flag:
+        return " --permission-mode bypassPermissions"
+    return flags
+
+
 def cmd_rc(args) -> int:
     sb = require_active(args.name)
     _, harness_name = probe_session_meta(sb)
     if harness_name != "claude":
         raise SystemExit("error: remote-control is a Claude Code feature")
+    prepare_claude_rc(sb, None)
     print("starting `claude remote-control` (requires a full /login done via login first) ...")
     log = shlex.quote(f"{HOME_DIR}/remote-control.log")
     command = (AGENT_ENV +
                "unset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; "
-               f"cd {shlex.quote(PROJECT_DIR)}; exec claude remote-control{permission_flags(HARNESSES['claude'], args)} > {log} 2>&1")
+               f"cd {shlex.quote(PROJECT_DIR)}; exec claude remote-control{remote_control_permission_flag(args)} > {log} 2>&1")
     # tmux provides a checkable, persistent process and prevents duplicate
     # launches. An auth/startup failure must not be reported as a working URL.
     script = SH_WRAP.format(cmd=(
@@ -6284,6 +6294,56 @@ def cmd_rc(args) -> int:
     print("\nRemote Control is running. Use its session URL or QR code from the log above; "
           f"if still connecting, check {HOME_DIR}/remote-control.log.")
     return 0
+
+
+# Remote Control refuses untrusted workspaces, and --dangerously-skip-permissions
+# skips the trust dialog without recording acceptance, so record it here. The
+# optional stdin payload is a full claude.ai login: the setup token cws-agent
+# passes through is inference-only and hides Remote Control.
+CLAUDE_RC_PREP_SCRIPT = r'''
+import json, os, sys, tempfile
+
+home, project = sys.argv[1], sys.argv[2]
+login = json.loads(sys.stdin.read() or "null")
+# Same layout Claude Code uses: CLAUDE_CONFIG_DIR (set with launch --env) holds
+# both files; otherwise .claude.json sits in HOME beside ~/.claude.
+config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+config = os.path.join(config_dir, ".claude.json") if config_dir else os.path.join(home, ".claude.json")
+creds = os.path.join(config_dir or os.path.join(home, ".claude"), ".credentials.json")
+
+def write_private(path, data):
+    # A fresh exclusive temp file is 0600 and never follows a planted symlink;
+    # os.replace then swaps the directory entry itself.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".cws-")
+    with os.fdopen(fd, "w") as stream:
+        json.dump(data, stream)
+    os.replace(tmp, path)
+
+state = json.load(open(config)) if os.path.isfile(config) else {}
+state.setdefault("hasCompletedOnboarding", True)
+state["remoteDialogSeen"] = True  # `claude remote-control` otherwise waits on an enable prompt
+state.setdefault("projects", {}).setdefault(project, {})["hasTrustDialogAccepted"] = True
+if login:
+    state["oauthAccount"] = login["account"]
+    write_private(creds, {"claudeAiOauth": login["oauth"]})
+write_private(config, state)
+'''
+
+
+def prepare_claude_rc(sb: Sandbox, login: dict | None) -> None:
+    """Send the login only over exec stdin, never command arguments or logs."""
+    command = ("exec python3 -c " + shlex.quote(CLAUDE_RC_PREP_SCRIPT)
+               + f" {shlex.quote(HOME_DIR)} {shlex.quote(PROJECT_DIR)}")
+    try:
+        proc = sb.exec(["sh", "-lc", SH_WRAP.format(cmd=command)], stdin=True, timeout_seconds=60)
+        proc.stdin.write(json.dumps(login).encode()).result(timeout=30)
+        proc.stdin.close().result(timeout=30)
+        result = proc.result(timeout=75)
+    except Exception:
+        raise SystemExit("error: could not prepare Claude Code for Remote Control in the sandbox") from None
+    if result.returncode != 0:
+        raise SystemExit("error: could not prepare Claude Code for Remote Control in the sandbox")
 
 
 # ---------------------------------------------------------------------------

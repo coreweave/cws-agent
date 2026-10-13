@@ -195,11 +195,63 @@ class DocumentedLoginAndRemoteControlTests(unittest.TestCase):
 
     def test_remote_control_propagates_failure_and_diagnostics(self):
         result = types.SimpleNamespace(returncode=17, stdout="startup failed\n", stderr="auth required\n")
-        with patch.object(agent, "require_active"), patch.object(agent, "probe_session_meta", return_value=("dev1", "claude")), patch.object(agent, "exec_retry", return_value=result), patch.object(sys, "stdout", io.StringIO()) as output, patch.object(sys, "stderr", io.StringIO()) as error:
+        with patch.object(agent, "require_active"), patch.object(agent, "probe_session_meta", return_value=("dev1", "claude")), patch.object(agent, "prepare_claude_rc"), patch.object(agent, "exec_retry", return_value=result), patch.object(sys, "stdout", io.StringIO()) as output, patch.object(sys, "stderr", io.StringIO()) as error:
             self.assertEqual(agent.cmd_rc(types.SimpleNamespace(name="dev1")), 17)
         self.assertIn("startup failed", output.getvalue())
         self.assertIn("auth required", error.getvalue())
         self.assertNotIn("is running", output.getvalue())
+
+    def test_remote_control_server_gets_a_permission_mode_it_accepts(self):
+        args = types.SimpleNamespace(name="dev1", permission_mode=None, yolo=False)
+        self.assertEqual(agent.remote_control_permission_flag(args), " --permission-mode bypassPermissions")
+        args.permission_mode = "accept-edits"
+        self.assertEqual(agent.remote_control_permission_flag(args), " --permission-mode acceptEdits")
+
+    def test_remote_control_prep_trusts_project_and_installs_login_privately(self):
+        with tempfile.TemporaryDirectory(prefix="cws-rc-prep-") as home:
+            Path(home, ".claude.json").write_text('{"theme": "light", "projects": {"/other": {"x": 1}}}')
+            login = {"oauth": {"refreshToken": "example-refresh"}, "account": {"emailAddress": "user@example.test"}}
+            subprocess.run([sys.executable, "-c", agent.CLAUDE_RC_PREP_SCRIPT, home, "/workspace/project"],
+                           input=agent.json.dumps(login), text=True, check=True, timeout=10)
+            state = agent.json.loads(Path(home, ".claude.json").read_text())
+            creds = Path(home, ".claude", ".credentials.json")
+            self.assertEqual(state["theme"], "light")
+            self.assertEqual(state["projects"]["/other"], {"x": 1})
+            self.assertTrue(state["projects"]["/workspace/project"]["hasTrustDialogAccepted"])
+            self.assertTrue(state["remoteDialogSeen"])
+            self.assertEqual(state["oauthAccount"], login["account"])
+            self.assertEqual(agent.json.loads(creds.read_text()), {"claudeAiOauth": login["oauth"]})
+            self.assertEqual(creds.stat().st_mode & 0o777, 0o600)
+
+    def test_remote_control_prep_replaces_planted_temp_files_without_following_them(self):
+        with tempfile.TemporaryDirectory(prefix="cws-rc-prep-") as home:
+            claude_dir = Path(home, ".claude")
+            claude_dir.mkdir()
+            outside = Path(home, "outside.json")
+            outside.write_text("untouched")
+            (claude_dir / ".credentials.json.tmp").symlink_to(outside)
+            Path(home, ".claude.json.tmp").write_text("{}")
+            Path(home, ".claude.json.tmp").chmod(0o644)
+            login = {"oauth": {"refreshToken": "example-refresh"}, "account": {}}
+            subprocess.run([sys.executable, "-c", agent.CLAUDE_RC_PREP_SCRIPT, home, "/workspace/project"],
+                           input=agent.json.dumps(login), text=True, check=True, timeout=10)
+            creds = claude_dir / ".credentials.json"
+            self.assertEqual(outside.read_text(), "untouched")
+            self.assertEqual(creds.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(creds.is_symlink())
+            self.assertEqual(Path(home, ".claude.json").stat().st_mode & 0o777, 0o600)
+
+    def test_remote_control_prep_follows_a_custom_claude_config_dir(self):
+        with tempfile.TemporaryDirectory(prefix="cws-rc-prep-") as home:
+            config_dir = Path(home, "claude-state")
+            login = {"oauth": {"refreshToken": "example-refresh"}, "account": {"emailAddress": "user@example.test"}}
+            subprocess.run([sys.executable, "-c", agent.CLAUDE_RC_PREP_SCRIPT, home, "/workspace/project"],
+                           input=agent.json.dumps(login), text=True, check=True, timeout=10,
+                           env={**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)})
+            state = agent.json.loads((config_dir / ".claude.json").read_text())
+            self.assertTrue(state["projects"]["/workspace/project"]["hasTrustDialogAccepted"])
+            self.assertTrue((config_dir / ".credentials.json").is_file())
+            self.assertFalse(Path(home, ".claude", ".credentials.json").exists())
 
     def test_remote_control_rejects_other_harnesses(self):
         for harness in ("devin", "codex", "ant"):
@@ -235,7 +287,7 @@ exit 2
                 def execute(sandbox, command, **kwargs):
                     self.assertIn("unset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", command[2])
                     return subprocess.run(["sh", "-c", command[2]], env=env, capture_output=True, text=True, timeout=5)
-                with patch.object(agent, "HOME_DIR", directory), patch.object(agent, "SH_WRAP", "{cmd}"), patch.object(agent, "AGENT_ENV", ""), patch.object(agent, "require_active"), patch.object(agent, "probe_session_meta", return_value=("dev1", "claude")), patch.object(agent, "exec_retry", side_effect=execute), patch.object(sys, "stdout", io.StringIO()), patch.object(sys, "stderr", io.StringIO()):
+                with patch.object(agent, "HOME_DIR", directory), patch.object(agent, "SH_WRAP", "{cmd}"), patch.object(agent, "AGENT_ENV", ""), patch.object(agent, "require_active"), patch.object(agent, "probe_session_meta", return_value=("dev1", "claude")), patch.object(agent, "prepare_claude_rc"), patch.object(agent, "exec_retry", side_effect=execute), patch.object(sys, "stdout", io.StringIO()), patch.object(sys, "stderr", io.StringIO()):
                     self.assertEqual(agent.cmd_rc(types.SimpleNamespace(name="dev1")), expected)
                 self.assertEqual((root / "launched").exists(), mode != "already")
 
