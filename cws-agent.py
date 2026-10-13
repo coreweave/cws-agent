@@ -45,6 +45,7 @@ Usage:
     cws-agent list / status dev1 / snapshots dev1
     cws-agent session start|attach|ls|diff|stop   # parallel agents, one worktree each
     cws-agent rc      dev1          # start `claude remote-control` (after /login)
+    cws-agent handoff [SESSION_ID]  # move this Claude conversation to a sandbox + phone
 
 Auth: sandbox access uses WANDB_API_KEY or a saved W&B login. An explicit
 CWSANDBOX_API_KEY selects CoreWeave authentication instead. CWSANDBOX_BASE_URL
@@ -58,7 +59,9 @@ volume.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
+import io
 import json
 import os
 import re
@@ -66,7 +69,8 @@ import shlex
 import shutil
 import sys
 import time
-from contextlib import contextmanager
+import unicodedata
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 
 from cwsandbox import (
@@ -6331,6 +6335,42 @@ write_private(config, state)
 '''
 
 
+# Claude Code records each Remote Control connection as a bridge_status entry in
+# the transcript. Counting entries tells a new connection apart from an old one
+# replayed by --resume, and from conversation text that quotes the status line.
+CLAUDE_RC_STATUS_SCRIPT = r'''
+import json, os, sys
+
+home, project_key, session_id = sys.argv[1:4]
+root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude")
+count, content = 0, ""
+try:
+    with open(os.path.join(root, "projects", project_key, session_id + ".jsonl")) as stream:
+        for line in stream:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(entry, dict) and entry.get("type") == "system" and entry.get("subtype") == "bridge_status"
+                    and str(entry.get("content", "")).startswith("/remote-control is active")):
+                count, content = count + 1, entry["content"]
+except OSError:
+    pass
+print(json.dumps({"count": count, "content": content}))
+'''
+
+
+def remote_control_status(sb: Sandbox, session_id: str) -> dict:
+    project_key = re.sub(r"[^a-zA-Z0-9]", "-", PROJECT_DIR)
+    command = ("exec python3 -c " + shlex.quote(CLAUDE_RC_STATUS_SCRIPT)
+               + f" {shlex.quote(HOME_DIR)} {shlex.quote(project_key)} {shlex.quote(session_id)}")
+    result = exec_retry(sb, ["sh", "-lc", SH_WRAP.format(cmd=command)], timeout_seconds=30)
+    try:
+        return json.loads((result.stdout or "").strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return {"count": 0, "content": ""}
+
+
 def prepare_claude_rc(sb: Sandbox, login: dict | None) -> None:
     """Send the login only over exec stdin, never command arguments or logs."""
     command = ("exec python3 -c " + shlex.quote(CLAUDE_RC_PREP_SCRIPT)
@@ -6344,6 +6384,246 @@ def prepare_claude_rc(sb: Sandbox, login: dict | None) -> None:
         raise SystemExit("error: could not prepare Claude Code for Remote Control in the sandbox") from None
     if result.returncode != 0:
         raise SystemExit("error: could not prepare Claude Code for Remote Control in the sandbox")
+
+
+def local_claude_login() -> dict:
+    """Read the local claude.ai login (not the MCP tokens stored beside it)."""
+    import subprocess
+    from pathlib import Path
+
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    raw = None
+    if sys.platform == "darwin":
+        # Claude Code keys each profile's Keychain entry by its config directory,
+        # so a custom profile never reads the default profile's login.
+        service = "Claude Code-credentials"
+        if config_dir:
+            service += "-" + hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode()).hexdigest()[:8]
+        found = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
+                               capture_output=True, text=True)
+        if found.returncode == 0:
+            raw = found.stdout
+    creds_file = Path(config_dir or Path.home() / ".claude") / ".credentials.json"
+    if raw is None and creds_file.is_file():
+        raw = creds_file.read_text()
+    account_file = Path(config_dir) / ".claude.json" if config_dir else Path.home() / ".claude.json"
+    try:
+        oauth = json.loads(raw or "{}").get("claudeAiOauth")
+        account = json.loads(account_file.read_text()).get("oauthAccount")
+    except (OSError, ValueError, AttributeError):
+        oauth = account = None
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken") or not isinstance(account, dict):
+        raise SystemExit("error: no local claude.ai login found. Run `claude` and `/login` locally first "
+                         "(an API key or setup token cannot use Remote Control).")
+    return {"oauth": oauth, "account": account}
+
+
+def handoff_tmux_session(session_id: str) -> str:
+    return f"{TMUX_PREFIX}handoff-{session_id[:8]}"
+
+
+def conversation_title(path: str) -> str | None:
+    """A name to spot a conversation by in the Claude app, read from its transcript.
+
+    Order: the user's /rename title, then the summary title Claude Code already
+    stored, then the first prompt. Nothing here calls a model.
+    """
+    custom = summary = first_prompt = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if first_prompt and '"custom-title"' not in line and '"ai-title"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") == "custom-title" and isinstance(entry.get("customTitle"), str):
+                    custom = entry["customTitle"]
+                elif entry.get("type") == "ai-title" and isinstance(entry.get("aiTitle"), str):
+                    summary = entry["aiTitle"]
+                elif first_prompt is None and entry.get("type") == "user" and not entry.get("isMeta"):
+                    content = (entry.get("message") or {}).get("content") if isinstance(entry.get("message"), dict) else None
+                    if isinstance(content, str) and not content.lstrip().startswith("<"):
+                        first_prompt = content
+    except OSError:
+        return None
+    clean = lambda text: " ".join("".join(c if c.isprintable() else " " for c in (text or "")).split())
+    title = clean(custom) or clean(summary)
+    if not title and clean(first_prompt):
+        prompt = clean(first_prompt)
+        title = prompt if len(prompt) <= 40 else prompt[:39].rstrip() + "…"
+    return title[:60] or None
+
+
+def running_claude_sessions(folder: str) -> set[str]:
+    """IDs of interactive Claude Code sessions running in this folder right now.
+
+    Claude Code keeps one sessions/<pid>.json per live process; a file whose
+    process is gone is stale and ignored.
+    """
+    from pathlib import Path
+
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "sessions"
+    found = set()
+    for path in root.glob("*.json"):
+        try:
+            info = json.loads(path.read_text())
+            pid = int(info["pid"])
+            os.kill(pid, 0)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if info.get("kind", "interactive") == "interactive" and isinstance(info.get("sessionId"), str) \
+                and os.path.realpath(str(info.get("cwd", ""))) == folder:
+            found.add(info["sessionId"])
+    return found
+
+
+def cmd_handoff(args) -> int:
+    from pathlib import Path
+
+    rows = scan_native_history(str(Path.home()), os.environ.get("CLAUDE_CONFIG_DIR"), os.environ.get("CODEX_HOME"))
+    # Claude Code exports its own session ID to `!` shell commands, so running
+    # handoff from inside a conversation hands off exactly that conversation.
+    session_id = args.session_id or (None if args.dir else os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    last = getattr(args, "last", None)
+    if last is not None and last < 1:
+        raise SystemExit("error: --last must be at least 1")
+    if session_id and last is not None:
+        raise SystemExit("error: --last picks this folder's newest conversations; pass it without a session ID")
+    if session_id:
+        matches = [r for r in rows if r["id"] == session_id]
+    else:
+        here = os.path.realpath(args.dir or os.getcwd())
+        here_rows = sorted((r for r in rows if r["agent"] == "claude" and os.path.realpath(r["cwd"]) == here),
+                           key=lambda r: r["updated_at"])
+        # Without --last, every session still open here moves: those are the
+        # copies that would diverge. With none open, the newest conversation.
+        running = running_claude_sessions(here) if last is None else set()
+        matches = [r for r in here_rows if r["id"] in running] or here_rows[-(last or 1):]
+    if not matches:
+        raise SystemExit("error: no local Claude conversation found"
+                         + (f" with ID {session_id}" if session_id else " for this folder")
+                         + "; pass a session ID (shown by `/status` in Claude Code)")
+    if matches[0]["agent"] != "claude":
+        raise SystemExit(f"error: {matches[0]['agent']} has no Remote Control; move the conversation without "
+                         f"phone control using `cws-agent session transfer NAME --upload {matches[0]['id']}`")
+    folder = Path(args.dir or matches[0]["cwd"]).expanduser().resolve()
+    if not folder.is_dir():
+        raise SystemExit(f"error: project folder {folder} does not exist; pass --dir")
+    name = args.name or re.sub(r"[^a-z0-9-]+", "-", folder.name.lower()).strip("-")[:40].strip("-") or "handoff"
+    if not NAME_RE.fullmatch(name):
+        raise SystemExit("error: sandbox name must match [a-z0-9][a-z0-9-]{0,39}; pass --name")
+    login = local_claude_login()  # fail before creating anything
+    verbose = getattr(args, "verbose", False)
+    # The Remote Control name is what the Claude app lists, so name each
+    # conversation by its title; conversations sharing a sandbox stay distinct.
+    for row in matches:
+        title = conversation_title(row["path"]) if row.get("path") else None
+        row["label"] = f'"{title}"' if title else row["id"]
+        row["rc_name"] = f"{name}: {title}" if title else name
+    if len(matches) == 1:
+        print(f"Handing off conversation {matches[0]['label']} to sandbox {name!r}")
+    else:
+        print(f"Handing off {len(matches)} conversations to sandbox {name!r}")
+
+    if find_active(name) is None:
+        launch = ["launch", name, "--agent", "claude", "--local-dir", str(folder),
+                  "--detach", "--no-config-sync", "--ttl", str(args.ttl)]
+        for item in args.env:
+            launch += ["--env", item]
+        for item in args.exclude:
+            launch += ["--exclude", item]
+        with handoff_step("Create the sandbox and upload the project", verbose):
+            if main(launch):
+                raise SystemExit("error: sandbox launch failed")
+    else:
+        # Stop earlier handoffs of these conversations first, so they cannot
+        # write to a transcript while the transfer replaces it.
+        kills = "".join(f"tmux kill-session -t '={handoff_tmux_session(row['id'])}' 2>/dev/null; " for row in matches)
+        check = f"command -v claude >/dev/null && {{ {kills}true; }}"
+        installed = exec_retry(require_active(name), ["sh", "-lc", SH_WRAP.format(cmd=check)], timeout_seconds=30)
+        if installed.returncode not in (0, None):
+            raise SystemExit(f"error: sandbox {name!r} has no Claude Code; pass --name to create a new sandbox")
+        print(f"  ✓ Reuse the running sandbox (project files are not re-synced; use `cws-agent sync {name}`)")
+    for row in matches:
+        with handoff_step("Copy the conversation" if len(matches) == 1 else f"Copy {row['label']}", verbose):
+            if main(["session", "transfer", name, "--upload", row["id"], "--replace"]):
+                raise SystemExit("error: conversation transfer failed")
+    with handoff_step("Sign in with your claude.ai login", verbose):
+        sb = require_active(name)
+        prepare_claude_rc(sb, login)
+    for row in matches:
+        label = "Claude Code" if len(matches) == 1 else row["label"]
+        with handoff_step(f"Start {label} with Remote Control", verbose):
+            row["url"] = start_handoff_remote_control(sb, name, row, args)
+
+    print("\nRemote Control is active. In the Claude app, open Code and pick:")
+    for row in matches:
+        print(f"  {row['rc_name']}")
+        if row["url"]:
+            print(f"    {row['url']}")
+    print("Close your local " + ("session" if len(matches) == 1 else "sessions") + " so the copies don't diverge.")
+    return 0
+
+
+def start_handoff_remote_control(sb: Sandbox, name: str, row: dict, args) -> str | None:
+    """Resume one conversation under Remote Control; return its session URL."""
+    tmux = handoff_tmux_session(row["id"])
+    claude = (native_resume_command("claude", row["id"]) + " --remote-control " + shlex.quote(row["rc_name"])
+              + permission_flags(HARNESSES["claude"], args))
+    command = (AGENT_ENV + "unset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; "
+               f"cd {shlex.quote(PROJECT_DIR)}; exec {claude}")
+    start = (f"tmux kill-session -t '={tmux}' 2>/dev/null; "
+             f"tmux new-session -d -s {tmux} -x 200 -y 50 sh -lc {shlex.quote(command)}")
+    before = remote_control_status(sb, row["id"])["count"]
+    result = exec_retry(sb, ["sh", "-lc", start], timeout_seconds=60)
+    if result.returncode not in (0, None):
+        raise SystemExit("error: could not start Claude Code in the sandbox")
+    for _ in range(45):
+        time.sleep(2)
+        probe = exec_retry(sb, ["sh", "-lc", f"tmux capture-pane -p -t '={tmux}:'"], timeout_seconds=30)
+        if probe.returncode not in (0, None):
+            raise SystemExit(f"error: Claude Code exited during startup; inspect with `cws-agent connect {name}`")
+        status = remote_control_status(sb, row["id"])
+        if status["count"] > before:
+            break
+    else:
+        print("\n".join(line for line in (probe.stdout or "").splitlines() if line.strip())[-2000:])
+        raise SystemExit(f"error: Remote Control did not start; run `cws-agent connect {name}`, "
+                         f"then `tmux attach -t {tmux}` to see why")
+    # Startup announcements (e.g. the fullscreen renderer offer) block the
+    # prompt until dismissed; Escape is a no-op on an idle prompt.
+    exec_retry(sb, ["sh", "-lc", f"sleep 2; tmux send-keys -t '={tmux}:' Escape"], timeout_seconds=30)
+    url = re.search(r"https://claude\.ai/code/\S+", status["content"])
+    return url.group(0) if url else None
+
+
+@contextmanager
+def handoff_step(label: str, verbose: bool):
+    """One status line per step; the step's own output appears only on failure or with -v."""
+    tty = sys.stdout.isatty()
+    pending = f"  … {label}"
+    if tty and not verbose:
+        # The ✓ line rewrites exactly one line, so the pending one must not wrap.
+        pending = pending[:max(shutil.get_terminal_size().columns - 1, 8)]
+    if verbose or tty:
+        print(pending, flush=True)
+    if verbose:
+        yield
+        print(f"  ✓ {label}", flush=True)
+        return
+    buffer = io.StringIO()
+    try:
+        with redirect_stdout(buffer), redirect_stderr(buffer):
+            yield
+    except BaseException:
+        print(f"  ✗ {label}", flush=True)
+        sys.stderr.write(buffer.getvalue())
+        raise
+    print(("\033[1A\033[2K" if tty else "") + f"  ✓ {label}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -7744,6 +8024,8 @@ def cmd_cloud_logs(args):
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", argv[0]):
+        argv.insert(0, "handoff")  # session IDs are UUIDs, so they cannot shadow a subcommand
     parser = argparse.ArgumentParser(prog="cws-agent", description=__doc__.split("\n\n")[0])
     add_verbose_flag(parser)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -7926,6 +8208,25 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--keep", type=int, default=3, help="snapshots to keep (default: 3)")
     p.add_argument("--include-checkpoints", action="store_true", help="also prune snapshots protected by checkpoint manifests")
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("handoff", help="move a local Claude conversation into a new sandbox and control it "
+                                       "from your phone (`cws-agent SESSION_ID` is a shortcut)")
+    p.add_argument("session_id", nargs="?", metavar="SESSION_ID",
+                   help="local Claude Code session ID (default: the Claude sessions running in this folder, "
+                        "else its newest conversation)")
+    p.add_argument("--name", help="sandbox name (default: the project folder's name)")
+    p.add_argument("--dir", help="project folder to upload (default: the conversation's folder)")
+    p.add_argument("--last", type=int, metavar="N",
+                   help="hand off this folder's N newest conversations, open or not, into the same sandbox")
+    p.add_argument("--ttl", type=lambda text: parse_ttl(text), default=8 * 3600, metavar="DURATION",
+                   help="maximum sandbox lifetime on creation (default: 8h; maximum: 30d)")
+    p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                   help="extra env var inside the sandbox (repeatable)")
+    p.add_argument("--exclude", action="append", default=[], metavar="NAME",
+                   help="skip this file or directory name when uploading (repeatable)")
+    add_permission_flags(p)
+    add_verbose_flag(p)
+    p.set_defaults(func=cmd_handoff)
 
     p = sub.add_parser("rc", help="start Claude Code remote-control in the session")
     add_permission_flags(p)

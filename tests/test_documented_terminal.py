@@ -253,6 +253,195 @@ class DocumentedLoginAndRemoteControlTests(unittest.TestCase):
             self.assertTrue((config_dir / ".credentials.json").is_file())
             self.assertFalse(Path(home, ".claude", ".credentials.json").exists())
 
+    def test_local_login_reads_the_keychain_entry_of_a_custom_profile(self):
+        with tempfile.TemporaryDirectory(prefix="cws-login-") as config_dir:
+            Path(config_dir, ".claude.json").write_text('{"oauthAccount": {"emailAddress": "work@example.test"}}')
+            services = []
+            def security(command, **kwargs):
+                services.append(command[command.index("-s") + 1])
+                return types.SimpleNamespace(returncode=0, stdout='{"claudeAiOauth": {"refreshToken": "work"}}')
+            with patch.object(sys, "platform", "darwin"), patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": config_dir}), patch("subprocess.run", side_effect=security):
+                login = agent.local_claude_login()
+        digest = agent.hashlib.sha256(config_dir.encode()).hexdigest()[:8]
+        self.assertEqual(services, [f"Claude Code-credentials-{digest}"])
+        self.assertEqual(login["account"]["emailAddress"], "work@example.test")
+
+    def test_remote_control_status_ignores_conversation_text_that_quotes_it(self):
+        with tempfile.TemporaryDirectory(prefix="cws-rc-status-") as home:
+            transcript = Path(home, ".claude", "projects", "-workspace-project", "abc.jsonl")
+            transcript.parent.mkdir(parents=True)
+            quoted = "/remote-control is active · Continue here, on your phone, or at https://claude.ai/code/fake"
+            lines = [{"type": "user", "message": {"content": quoted}},
+                     {"type": "assistant", "message": {"content": [{"type": "text", "text": quoted}]}},
+                     {"type": "system", "subtype": "bridge_status",
+                      "content": "/remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_real"}]
+            transcript.write_text("\n".join(agent.json.dumps(line) for line in lines) + "\nnot json\n")
+            result = subprocess.run([sys.executable, "-c", agent.CLAUDE_RC_STATUS_SCRIPT, home, "-workspace-project", "abc"],
+                                    capture_output=True, text=True, check=True, timeout=10,
+                                    env={k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"})
+        status = agent.json.loads(result.stdout)
+        self.assertEqual(status["count"], 1)
+        self.assertTrue(status["content"].endswith("session_real"))
+
+    def run_handoff(self, statuses, *, running=None, has_claude=True, rows=None, last=1, running_ids=frozenset()):
+        row = {"agent": "claude", "id": "5fdcd1b8-7ceb-48e6-95e4-93360d3e2613", "cwd": os.getcwd(), "updated_at": 1}
+        rows = rows or [row]
+        nested, commands = [], []
+        def execute(sandbox, command, **kwargs):
+            commands.append(command[-1])
+            missing = "command -v claude" in command[-1] and not has_claude
+            return types.SimpleNamespace(returncode=1 if missing else 0, stdout="pane", stderr="")
+        args = types.SimpleNamespace(session_id=None, dir=None, name="proj", ttl=3600, env=[], exclude=[],
+                                     verbose=False, permission_mode=None, yolo=False, last=last)
+        output = io.StringIO()
+        with patch.object(agent, "scan_native_history", return_value=rows), patch.object(agent, "running_claude_sessions", return_value=running_ids), patch.object(agent, "local_claude_login", return_value={"oauth": {}, "account": {}}), patch.object(agent, "find_active", return_value=running), patch.object(agent, "main", side_effect=lambda argv: nested.append(argv) or 0), patch.object(agent, "require_active"), patch.object(agent, "prepare_claude_rc") as prepare, patch.object(agent, "exec_retry", side_effect=execute), patch.object(agent, "remote_control_status", side_effect=statuses), patch.object(agent.time, "sleep"), patch.dict(os.environ), patch.object(sys, "stdout", output), patch.object(sys, "stderr", io.StringIO()):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            try:
+                code = agent.cmd_handoff(args)
+            except SystemExit as error:
+                code = error
+        return code, nested, commands, output.getvalue(), prepare
+
+    def test_handoff_creates_sandbox_transfers_and_reports_the_new_connection(self):
+        url = "https://claude.ai/code/session_new"
+        statuses = [{"count": 0, "content": ""}, {"count": 0, "content": ""},
+                    {"count": 1, "content": f"/remote-control is active · Continue here, on your phone, or at {url}"}]
+        code, nested, commands, output, prepare = self.run_handoff(statuses)
+        self.assertEqual(code, 0)
+        self.assertEqual(nested[0][:2], ["launch", "proj"])
+        self.assertIn("--ttl", nested[0])
+        self.assertEqual(nested[1], ["session", "transfer", "proj", "--upload", "5fdcd1b8-7ceb-48e6-95e4-93360d3e2613", "--replace"])
+        prepare.assert_called_once()
+        start = next(command for command in commands if "new-session" in command)
+        self.assertIn("kill-session -t '=cws-handoff-5fdcd1b8'", start)
+        self.assertIn("--resume", start)
+        self.assertIn(url, output)
+
+    def test_handoff_last_moves_a_folders_conversations_under_their_own_titles(self):
+        with tempfile.TemporaryDirectory(prefix="cws-handoff-") as directory:
+            rows = []
+            for index, (session_id, title) in enumerate([("aaaaaaaa-0000-4000-8000-000000000000", "Old idea"),
+                                                         ("bbbbbbbb-0000-4000-8000-000000000000", "Add retry logic"),
+                                                         ("cccccccc-0000-4000-8000-000000000000", None)]):
+                path = Path(directory, session_id + ".jsonl")
+                lines = [{"type": "user", "message": {"content": "hi"}}]
+                if title:
+                    lines.append({"type": "ai-title", "aiTitle": title})
+                path.write_text("\n".join(agent.json.dumps(line) for line in lines) + "\n")
+                rows.append({"agent": "claude", "id": session_id, "cwd": os.getcwd(), "updated_at": index, "path": str(path)})
+            ready = {"count": 1, "content": "/remote-control is active · https://claude.ai/code/session_x"}
+            statuses = [{"count": 0, "content": ""}, ready, {"count": 0, "content": ""}, ready]
+            code, nested, commands, output, prepare = self.run_handoff(statuses, rows=rows, last=2)
+        self.assertEqual(code, 0)
+        self.assertEqual([argv[4] for argv in nested if argv[0] == "session"],
+                         ["bbbbbbbb-0000-4000-8000-000000000000", "cccccccc-0000-4000-8000-000000000000"])
+        starts = [command for command in commands if "new-session" in command]
+        self.assertIn("'proj: Add retry logic'", starts[0])
+        self.assertIn("cws-handoff-cccccccc", starts[1])
+        self.assertIn("proj: Add retry logic", output)
+        self.assertNotIn("Old idea", output)
+        prepare.assert_called_once()
+
+    def test_handoff_progress_line_fits_a_narrow_terminal_so_the_check_line_replaces_it(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        screen = Terminal()
+        label = 'Start "Done command for marking items finished" with Remote Control'
+        with patch.object(sys, "stdout", screen), patch.object(agent.shutil, "get_terminal_size", return_value=os.terminal_size((40, 20))):
+            with agent.handoff_step(label, False):
+                pass
+        pending, done = screen.getvalue().split("\n")[:2]
+        self.assertLessEqual(len(pending), 39)
+        self.assertTrue(done.startswith("\033[1A\033[2K  ✓ Start"))
+
+    def test_plain_handoff_moves_every_session_still_open_in_the_folder(self):
+        rows = [{"agent": "claude", "id": f"{c * 8}-0000-4000-8000-000000000000", "cwd": os.getcwd(), "updated_at": i}
+                for i, c in enumerate("abc")]
+        ready = {"count": 1, "content": "/remote-control is active · https://claude.ai/code/session_x"}
+        statuses = [{"count": 0, "content": ""}, ready] * 2
+        open_ids = {rows[0]["id"], rows[1]["id"]}
+        code, nested, commands, output, prepare = self.run_handoff(statuses, rows=rows, last=None, running_ids=open_ids)
+        self.assertEqual(code, 0)
+        self.assertEqual({argv[4] for argv in nested if argv[0] == "session"}, open_ids)
+        code, nested, *_ = self.run_handoff(statuses[:2], rows=rows, last=None)
+        self.assertEqual([argv[4] for argv in nested if argv[0] == "session"], [rows[2]["id"]])
+
+    def test_running_sessions_come_from_live_claude_processes_in_the_folder(self):
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait()
+        with tempfile.TemporaryDirectory(prefix="cws-claude-") as config_dir:
+            sessions = Path(config_dir, "sessions")
+            sessions.mkdir()
+            here = os.path.realpath(config_dir)
+            for name, pid, cwd, kind in [("live", os.getpid(), here, "interactive"), ("dead", finished.pid, here, "interactive"),
+                                         ("elsewhere", os.getpid(), "/", "interactive"), ("headless", os.getpid(), here, "print")]:
+                Path(sessions, f"{name}.json").write_text(agent.json.dumps(
+                    {"pid": pid, "sessionId": name, "cwd": cwd, "kind": kind}))
+            Path(sessions, "broken.json").write_text("{")
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": config_dir}):
+                self.assertEqual(agent.running_claude_sessions(here), {"live"})
+
+    def test_handoff_sandboxes_default_to_an_eight_hour_lifetime(self):
+        with patch.object(agent, "cmd_handoff", return_value=0) as handoff:
+            agent.main(["handoff"])
+        self.assertEqual(handoff.call_args.args[0].ttl, 8 * 3600)
+        self.assertIsNone(handoff.call_args.args[0].last)
+
+    def test_conversation_title_falls_back_to_the_first_prompt_without_a_model(self):
+        with tempfile.TemporaryDirectory(prefix="cws-title-") as directory:
+            path = Path(directory, "s.jsonl")
+            path.write_text("\n".join(agent.json.dumps(line) for line in [
+                {"type": "user", "isMeta": True, "message": {"content": "<local-command-caveat>"}},
+                {"type": "user", "message": {"content": "Add retry logic to the upload client and log each attempt"}}]) + "\n")
+            self.assertEqual(agent.conversation_title(str(path)), "Add retry logic to the upload client an…")
+
+    def test_conversation_title_prefers_the_users_rename(self):
+        with tempfile.TemporaryDirectory(prefix="cws-title-") as directory:
+            path = Path(directory, "s.jsonl")
+            path.write_text("\n".join(agent.json.dumps(line) for line in [
+                {"type": "ai-title", "aiTitle": "Auto summary"}, {"type": "custom-title", "customTitle": "My\nname"},
+                {"type": "ai-title", "aiTitle": "Later summary"}]) + "\nnot json\n")
+            self.assertEqual(agent.conversation_title(str(path)), "My name")
+            self.assertIsNone(agent.conversation_title(str(Path(directory, "missing.jsonl"))))
+
+    def test_handoff_rerun_waits_for_a_connection_newer_than_the_replayed_one(self):
+        old = {"count": 1, "content": "/remote-control is active · at https://claude.ai/code/session_old"}
+        code, nested, commands, output, prepare = self.run_handoff([old] * 46, running=object())
+        self.assertIsInstance(code, SystemExit)
+        self.assertIn("did not start", str(code))
+        self.assertEqual([argv[0] for argv in nested], ["session"])
+        self.assertIn("kill-session -t '=cws-handoff-5fdcd1b8'", commands[0])
+        self.assertNotIn("session_old", output)
+
+    def test_handoff_refuses_to_reuse_a_sandbox_without_claude_before_copying_anything(self):
+        code, nested, commands, output, prepare = self.run_handoff([], running=object(), has_claude=False)
+        self.assertIsInstance(code, SystemExit)
+        self.assertIn("no Claude Code", str(code))
+        self.assertEqual(nested, [])
+        prepare.assert_not_called()
+
+    def test_bare_session_id_routes_to_handoff(self):
+        session_id = "5fdcd1b8-7ceb-48e6-95e4-93360d3e2613"
+        with patch.object(agent, "cmd_handoff", return_value=0) as handoff:
+            self.assertEqual(agent.main([session_id]), 0)
+        self.assertEqual(handoff.call_args.args[0].session_id, session_id)
+
+    def test_handoff_refuses_agents_without_remote_control(self):
+        row = {"agent": "codex", "id": "abc", "cwd": "/tmp", "updated_at": 1}
+        with patch.object(agent, "scan_native_history", return_value=[row]), patch.object(agent, "find_active") as find:
+            with self.assertRaisesRegex(SystemExit, "session transfer"):
+                agent.cmd_handoff(types.SimpleNamespace(session_id="abc", dir=None, name=None))
+            find.assert_not_called()
+
+    def test_handoff_inside_claude_uses_the_current_session(self):
+        rows = [{"agent": "claude", "id": "current", "cwd": "/elsewhere", "updated_at": 1},
+                {"agent": "codex", "id": "newer", "cwd": os.getcwd(), "updated_at": 2}]
+        with patch.object(agent, "scan_native_history", return_value=rows), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "current"}), patch.object(agent, "local_claude_login", side_effect=SystemExit("stop")) as login:
+            with self.assertRaisesRegex(SystemExit, "project folder /elsewhere does not exist"):
+                agent.cmd_handoff(types.SimpleNamespace(session_id=None, dir=None, name=None))
+            login.assert_not_called()
+
     def test_remote_control_rejects_other_harnesses(self):
         for harness in ("devin", "codex", "ant"):
             with patch.object(agent, "require_active"), patch.object(agent, "probe_session_meta", return_value=("box", harness)), patch.object(agent, "exec_retry") as execute:
