@@ -45,6 +45,25 @@ This copies your local login into the sandbox before Codex opens.
 See [Codex login import](docs/usage.md#reuse-a-local-codex-login) for existing sessions
 and credential storage details.
 
+## Hand off to your phone
+
+![Handing off a local Claude Code conversation with cws-agent handoff](docs/assets/handoff-demo.gif)
+
+To keep a local Claude Code conversation going from your phone, run this from
+your project folder:
+
+```bash
+cws-agent handoff
+```
+
+The command uploads the folder to a sandbox and signs the sandbox in with your
+local claude.ai login. It then continues every Claude Code session open in that
+folder there, with Remote Control on. If none are open, it continues the
+folder's newest conversation. Open them in the Claude app under **Code**, then
+close your local sessions. To pick a conversation, pass its ID:
+`cws-agent SESSION_ID`.
+For details, see [Hand off a local conversation](docs/usage.md#hand-off-a-local-conversation).
+
 ## Open a shell
 
 Create or reconnect to a sandbox terminal without starting a coding agent:

@@ -280,6 +280,45 @@ cws-agent rc my-claude
 Complete `/login` and exit Claude before running `rc`. API keys and setup tokens
 alone do not support this workflow. [Provider requirements](https://code.claude.com/docs/en/remote-control).
 
+### Hand off a local conversation
+
+`handoff` moves a local Claude Code conversation into a sandbox and continues it
+there with Remote Control, so you can keep working from the Claude app. It
+supports Claude Code conversations only.
+
+```bash
+cws-agent handoff
+cws-agent handoff --last 2
+cws-agent handoff SESSION_ID --name my-claude --ttl 7d
+```
+
+Without a session ID, `handoff` moves every Claude Code session open in the
+current folder, and uploads that folder. If no session is open there, it moves
+the folder's newest conversation. With a session ID, it uploads the folder where
+the conversation started. To upload a different folder, pass `--dir`.
+`cws-agent SESSION_ID` is a shortcut for `cws-agent handoff SESSION_ID`.
+To move conversations you already closed, `--last N` hands off the folder's `N`
+newest conversations into one sandbox.
+To hand off only the conversation you're in, type `! cws-agent handoff` in
+Claude Code, then exit it after the handoff finishes.
+
+The command creates the sandbox with a default lifetime of 8 hours; pass `--ttl`
+for up to 30 days. It copies the conversation and your local claude.ai login,
+marks the project as trusted, and starts Claude Code with Remote Control in a
+tmux session. When Remote Control is active, it prints the session URL. The session also appears in the Claude app
+under **Code** as `SANDBOX: TITLE`. `TITLE` is the name you gave the
+conversation with `/rename`. Without one, it's the title Claude Code generated
+for the conversation, or else the start of its first prompt. Close your local
+session so the two copies don't diverge.
+
+If a sandbox with that name is already running, `handoff` reuses it. It copies
+the latest conversation and restarts it, but doesn't re-upload project files.
+To update them, use `sync`.
+
+Only the claude.ai login is copied, not MCP server logins. The sandbox and your
+machine share that login. If one side refreshes it, the other can be signed out.
+Run `/login` again on the side that was signed out.
+
 ## Set the sandbox lifetime
 
 Use `--ttl` to set the maximum lifetime when creating a sandbox. The default is
