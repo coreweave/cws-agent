@@ -43,12 +43,31 @@ Claude Code, Codex, Devin CLI, OpenCode, and Cursor CLI.
 | OpenCode | `~/.config/opencode/skills`, project `.opencode/skills`, compatible skill directories | Global or project `opencode.json` or `.jsonc` |
 | Cursor CLI | `~/.cursor/skills`, project `.cursor/skills`, compatible skill directories | `~/.cursor/mcp.json`, project `.cursor/mcp.json` |
 
+For Claude Code, a nonempty `CLAUDE_CONFIG_DIR` in the shell running `cws-agent`
+selects the local user profile. Skills come from `$CLAUDE_CONFIG_DIR/skills`,
+user environment settings from `$CLAUDE_CONFIG_DIR/settings.json`, and user MCP
+servers from `$CLAUDE_CONFIG_DIR/.claude.json`. For example:
+
+```sh
+CLAUDE_CONFIG_DIR="$HOME/.claude-sandbox" cws-agent config preview dev1 --verbose
+```
+
+The selected directory replaces the default user sources, even when files are
+missing. An unset or empty variable uses the default paths in the table. Paths
+beginning with `~` are expanded; relative paths use the current working directory.
+Project sources keep their existing locations and precedence. This selection
+applies to Claude imports during launch, connect, restore, preview, and sync.
+
 Later sources win for duplicate IDs. Plugin caches, ancestor directories, and
-alternate config-home locations aren't scanned. `--project-dir PATH` selects the
-project. Otherwise the current directory is used.
+other alternate config-home locations aren't scanned. `--project-dir PATH`
+selects the project. Otherwise the current directory is used.
 
 Skills go into the agent's user directory. MCP names get a `cws-import-` prefix.
 Unrelated settings remain. Restart the agent to load changes.
+Selecting another local profile leaves previously imported remote items in place
+unless an imported item with the same ID updates them. Imports continue to use
+the sandbox's standard configuration paths; the local `CLAUDE_CONFIG_DIR` value
+is excluded from automatic environment imports.
 
 ## Review before importing
 

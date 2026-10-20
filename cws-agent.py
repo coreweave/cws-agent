@@ -3291,7 +3291,7 @@ IMPORT_ENV_RE = re.compile(r"(?:\$\{(?:env:)?|\{env:)([A-Za-z_][A-Za-z0-9_]*)(?:
 # These describe the remote process, not a portable local tool credential.
 IMPORT_REMOTE_ENV = {"HOME", "PATH", "PWD", "OLDPWD", "SHELL", "USER", "LOGNAME", "TMPDIR",
                      "SHLVL", "_", "ARGUMENTS", "RANDOM", "BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH",
-                     "PYTHONPATH", "CLAUDE_PROJECT_DIR", "CODEX_HOME", "XDG_CACHE_HOME",
+                     "PYTHONPATH", "CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CACHE_HOME",
                      "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR",
                      "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT",
                      "GOPATH", "GOMODCACHE", "npm_config_cache", "PIP_CACHE_DIR"}
@@ -3383,6 +3383,16 @@ def skill_env_references(files):
     return required
 
 
+def claude_import_paths(home):
+    from pathlib import Path
+
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    directory = Path(override).expanduser() if override else home / ".claude"
+    # Claude moves the user MCP file inside an explicitly selected profile.
+    config = directory / ".claude.json" if override else home / ".claude.json"
+    return directory, config
+
+
 def import_environment(agent, home, project, env_files=()):
     """Collect environment sources as data, without sourcing shell scripts."""
     import io
@@ -3424,7 +3434,8 @@ def import_environment(agent, home, project, env_files=()):
         read(project / name)
     add({name: value for name, value in os.environ.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)}, "process environment")
     if agent == "claude":
-        for path in (home / ".claude/settings.json", project / ".claude/settings.json",
+        directory, _ = claude_import_paths(home)
+        for path in (directory / "settings.json", project / ".claude/settings.json",
                      project / ".claude/settings.local.json"):
             read(path, settings=True)
     for filename in env_files:
@@ -3473,8 +3484,11 @@ def discover_imports(agent: str, home=None, project=None, env_vars=(), env_files
     home = Path(home) if home is not None else Path.home()
     project = Path(project) if project is not None else Path.cwd()
     local_env, env_sources = import_environment(agent, home, project, env_files)
+    claude_directory, claude_config = home / ".claude", home / ".claude.json"
+    if agent == "claude":
+        claude_directory, claude_config = claude_import_paths(home)
     roots = {
-        "claude": [home / ".claude/skills", project / ".claude/skills"],
+        "claude": [claude_directory / "skills", project / ".claude/skills"],
         "codex": [home / ".codex/skills", home / ".agents/skills", project / ".agents/skills"],
         "devin": [home / ".config/devin/skills", home / ".agents/skills", project / ".devin/skills", project / ".agents/skills"],
         "opencode": [home / ".claude/skills", home / ".agents/skills", home / ".config/opencode/skills",
@@ -3483,7 +3497,7 @@ def discover_imports(agent: str, home=None, project=None, env_vars=(), env_files
                    project / ".claude/skills", project / ".codex/skills", project / ".agents/skills", project / ".cursor/skills"],
     }[agent]
     configs = {
-        "claude": [home / ".claude.json", project / ".mcp.json"],
+        "claude": [claude_config, project / ".mcp.json"],
         "codex": [home / ".codex/config.toml", project / ".codex/config.toml"],
         "devin": [home / ".config/devin/config.json", home / ".config/devin/mcp_config.json", project / ".devin/mcp_config.json", project / ".devin/mcp_config.local.json"],
         "opencode": [home / ".config/opencode/opencode.json", home / ".config/opencode/opencode.jsonc",
