@@ -26,6 +26,7 @@ loader.exec_module(app)
 
 class ImportTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
@@ -45,6 +46,97 @@ class ImportTests(unittest.TestCase):
     def apply(self, items, agent="claude"):
         script = app.IMPORT_APPLY_SCRIPT.replace('pathlib.Path("/workspace/home")', 'pathlib.Path(' + repr(str(self.remote)) + ')')
         return subprocess.run([sys.executable, "-c", script], input=json.dumps({"agent": agent, "items": items}), text=True, capture_output=True)
+
+    def test_claude_config_dir_selects_user_skills_mcp_and_environment(self):
+        profile = self.home / ".claude-sandbox"
+        for folder, config, name in ((self.home / ".claude", self.home / ".claude.json", "default"),
+                                     (profile, profile / ".claude.json", "sandbox")):
+            self.write(folder / f"skills/{name}/SKILL.md", "Use $PROFILE_TOKEN and $DEFAULT_ONLY")
+            values = {"PROFILE_TOKEN": name}
+            if name == "default":
+                values["DEFAULT_ONLY"] = "default-only-value"
+            self.write(folder / "settings.json", json.dumps({"env": values}))
+            self.write(config, json.dumps({"mcpServers": {name: {
+                "command": "node", "env": {"TOKEN": "${PROFILE_TOKEN}"}}}}))
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(profile)}, clear=True):
+            items = self.discover()
+        self.assertEqual([item["id"] for item in items], ["mcp:sandbox", "skill:sandbox"])
+        for item in items:
+            self.assertEqual(item["environment"], {"PROFILE_TOKEN": "sandbox"})
+            self.assertEqual(item["env_sources"]["PROFILE_TOKEN"], str(profile / "settings.json"))
+        self.assertEqual(items[0]["source"], str(profile / ".claude.json"))
+        self.assertEqual(items[1]["source"], str(profile / "skills/sandbox"))
+        self.assertEqual(items[1]["missing_env"], ["DEFAULT_ONLY"])
+        result = self.apply(items)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.remote / ".claude/skills/sandbox/SKILL.md").is_file())
+        self.assertIn("cws-import-sandbox", json.loads((self.remote / ".claude.json").read_text())["mcpServers"])
+
+    def test_unset_and_empty_claude_config_dir_use_default_profile(self):
+        self.write(self.home / ".claude/skills/review/SKILL.md", "$PROFILE_TOKEN")
+        self.write(self.home / ".claude/settings.json", '{"env":{"PROFILE_TOKEN":"default"}}')
+        self.write(self.home / ".claude.json", '{"mcpServers":{"docs":{"command":"node"}}}')
+        for environment in ({}, {"CLAUDE_CONFIG_DIR": ""}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
+                items = self.discover()
+                self.assertEqual([item["id"] for item in items], ["mcp:docs", "skill:review"])
+                self.assertEqual(items[1]["environment"], {"PROFILE_TOKEN": "default"})
+
+    def test_missing_override_files_do_not_fall_back_to_default_profile(self):
+        self.write(self.home / ".claude/skills/review/SKILL.md", "default")
+        self.write(self.home / ".claude/settings.json", '{"env":{"PROFILE_TOKEN":"default"}}')
+        self.write(self.home / ".claude.json", '{"mcpServers":{"docs":{"command":"node"}}}')
+        profile = self.home / ".claude-sandbox"
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(profile)}, clear=True):
+            self.assertEqual(self.discover(), [])
+            profile.mkdir()
+            self.assertEqual(self.discover(), [])
+            self.write(profile / "skills/review/SKILL.md", "$PROFILE_TOKEN")
+            items = self.discover()
+        self.assertEqual([item["id"] for item in items], ["skill:review"])
+        self.assertEqual(items[0]["environment"], {})
+        self.assertEqual(items[0]["missing_env"], ["PROFILE_TOKEN"])
+
+    def test_project_sources_still_override_selected_claude_profile(self):
+        profile = self.home / ".claude-sandbox"
+        for folder, config, name in ((profile, profile / ".claude.json", "user"),
+                                     (self.project / ".claude", self.project / ".mcp.json", "project")):
+            self.write(folder / "skills/review/SKILL.md", name + " $PROFILE_TOKEN")
+            self.write(folder / "settings.json", json.dumps({"env": {"PROFILE_TOKEN": name}}))
+            self.write(config, json.dumps({"mcpServers": {"docs": {"command": "node", "args": [name]}}}))
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(profile)}, clear=True):
+            items = self.discover()
+            self.assertEqual(items[0]["config"]["args"], ["project"])
+            self.assertEqual(items[1]["files"]["SKILL.md"], "project $PROFILE_TOKEN")
+            self.assertEqual(items[1]["environment"], {"PROFILE_TOKEN": "project"})
+            self.write(self.project / ".claude/settings.local.json", '{"env":{"PROFILE_TOKEN":"local"}}')
+            self.assertEqual(self.discover()[1]["environment"], {"PROFILE_TOKEN": "local"})
+            self.write(self.project / "selected.env", "PROFILE_TOKEN=explicit\n")
+            items = app.discover_imports("claude", self.home, self.project, env_files=[self.project / "selected.env"])
+            self.assertEqual(items[1]["environment"], {"PROFILE_TOKEN": "explicit"})
+
+    def test_config_dir_supports_tilde_relative_and_explicit_default_directory(self):
+        for folder in (".claude-sandbox", ".claude"):
+            profile = self.home / folder
+            self.write(profile / "skills/review/SKILL.md", folder)
+            self.write(profile / ".claude.json", '{"mcpServers":{"docs":{"command":"node"}}}')
+            for value in (str(profile), "~/" + folder, folder):
+                with self.subTest(value=value), contextlib.chdir(self.home), \
+                        patch.dict(os.environ, {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": value}, clear=True):
+                    items = self.discover()
+                    self.assertEqual([item["id"] for item in items], ["mcp:docs", "skill:review"])
+                    self.assertEqual(items[1]["files"]["SKILL.md"], folder)
+
+    def test_claude_config_dir_is_not_imported_as_a_tool_environment_variable(self):
+        profile = self.home / ".claude-sandbox"
+        self.write(profile / "skills/review/SKILL.md", "Use $CLAUDE_CONFIG_DIR")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(profile)}, clear=True):
+            item = self.discover()[0]
+            self.assertEqual(item["environment"], {})
+            self.assertEqual(item["env_references"], [])
+            self.assertEqual(item["missing_env"], [])
+            with self.assertRaisesRegex(SystemExit, "portable environment variable"):
+                app.discover_imports("claude", self.home, self.project, env_vars=["CLAUDE_CONFIG_DIR"])
 
     def test_discovery_excludes_caches_and_blocks_links(self):
         self.write(self.home / ".claude/skills/review/SKILL.md", "review")
