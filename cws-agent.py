@@ -6775,7 +6775,7 @@ def scan_native_history(home: str, claude_dir: str | None = None,
     inspected = 0
     preview_bytes = 0
     for agent, root in roots.items():
-        root = root.resolve()
+        root = root.expanduser().resolve()
         pattern = "*/*.jsonl" if agent == "claude" else "**/rollout-*.jsonl"
         for path in root.glob(pattern):
             if path.is_symlink() or not path.is_file() or any(p.is_symlink() for p in path.parents):
@@ -6972,7 +6972,7 @@ def build_history_bundle(row: dict, home: str, target_cwd: str,
     if not target_cwd.startswith("/"):
         raise ValueError("target project directory must be absolute")
     root = Path((claude_dir if agent == "claude" else codex_dir)
-                or str(Path(home) / ("." + agent))).resolve()
+                or str(Path(home) / ("." + agent))).expanduser().resolve()
     source = Path(row["path"])
     relative = source.relative_to(root)
     target_project = re.sub(r"[^a-zA-Z0-9]", "-", target_cwd)
@@ -7075,7 +7075,7 @@ def install_history_bundle(bundle: dict, home: str, replace: bool = False,
     if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", sid):
         raise ValueError("invalid session ID")
     root = Path((claude_dir if agent == "claude" else codex_dir)
-                or str(Path(home) / ("." + agent))).resolve()
+                or str(Path(home) / ("." + agent))).expanduser().resolve()
     files = bundle.get("files", [])
     if not files or len(files) > 256:
         raise ValueError("invalid bundle file count")

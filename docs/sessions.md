@@ -245,6 +245,11 @@ absolute destination project path. Defaults are `/workspace/project` for uploads
 and your current directory for downloads. Existing history requires `--replace`,
 which saves backups beside replaced files.
 
+For Claude and Codex, local uploads read from and downloads write to the profile
+selected by `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, respectively. Unset or empty
+values use `~/.claude` or `~/.codex`. Literal `~` prefixes are expanded; relative
+profile paths are resolved from the current working directory.
+
 Transfers support recognized JSONL histories in the agent's own format, up to 32 MiB and 256 files.
 Use compatible agent versions. Desktop-only or cloud-only histories and Codex sidecar histories
 are unsupported. Old paths in message text and file-rewind data may still refer
