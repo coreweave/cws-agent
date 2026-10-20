@@ -1,7 +1,9 @@
 import base64
+import contextlib
 import copy
 import json
 import inspect
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -64,6 +66,48 @@ class TransferTests(unittest.TestCase):
         backups = cli.install_history_bundle(back, str(self.source), replace=True)
         self.assertEqual(len(backups), 1)
         self.assertTrue(Path(backups[0]).is_file())
+
+    def test_history_roundtrip_uses_selected_profile_paths(self):
+        for agent in ("claude", "codex"):
+            for form in ("absolute", "relative", "tilde"):
+                with self.subTest(agent=agent, form=form), contextlib.chdir(self.root):
+                    profile = f".{agent}-{form}"
+                    relative = ("projects/-local-project/abc.jsonl" if agent == "claude" else
+                                "sessions/2026/09/05/rollout-date-abc.jsonl")
+                    record = ({"sessionId": "abc", "cwd": "/local/project"} if agent == "claude" else
+                              {"type": "session_meta", "payload": {"id": "abc", "cwd": "/local/project"}})
+                    source = self.write(profile + "/" + relative, (json.dumps(record) + "\n").encode())
+                    keyword = "claude_dir" if agent == "claude" else "codex_dir"
+
+                    def selected(home):
+                        directory = home / profile
+                        value = ("~/" + profile if form == "tilde" else
+                                 str(directory.relative_to(self.root)) if form == "relative" else str(directory))
+                        return {keyword: value}
+
+                    with patch.dict(os.environ, {"HOME": str(self.source)}):
+                        rows = cli.scan_native_history(str(self.source), **selected(self.source))
+                        self.assertEqual([row["id"] for row in rows], ["abc"])
+                        self.assertEqual(Path(rows[0]["path"]), source)
+                        bundle = cli.build_history_bundle(rows[0], str(self.source), "/workspace/project",
+                                                          **selected(self.source))
+                    with patch.dict(os.environ, {"HOME": str(self.dest)}):
+                        self.assertEqual(cli.install_history_bundle(bundle, str(self.dest), **selected(self.dest)), [])
+                        rows = cli.scan_native_history(str(self.dest), **selected(self.dest))
+                        self.assertEqual([row["id"] for row in rows], ["abc"])
+                        self.assertEqual(rows[0]["cwd"], "/workspace/project")
+                        self.assertTrue(Path(rows[0]["path"]).is_relative_to(self.dest / profile))
+                        back = cli.build_history_bundle(rows[0], str(self.dest), "/local/project",
+                                                        **selected(self.dest))
+                    with patch.dict(os.environ, {"HOME": str(self.source)}):
+                        backups = cli.install_history_bundle(back, str(self.source), replace=True,
+                                                             **selected(self.source))
+                        self.assertEqual(len(backups), 1)
+                        self.assertTrue(Path(backups[0]).is_file())
+                        rows = cli.scan_native_history(str(self.source), **selected(self.source))
+                        self.assertEqual(rows[0]["cwd"], "/local/project")
+                    self.assertFalse((self.root / "~").exists())
+                    self.assertFalse((self.dest / ("." + agent)).exists())
 
     def test_codex_remaps_workspace_roots_and_world_state_only(self):
         records = [
