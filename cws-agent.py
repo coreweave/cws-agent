@@ -3487,9 +3487,12 @@ def discover_imports(agent: str, home=None, project=None, env_vars=(), env_files
     claude_directory, claude_config = home / ".claude", home / ".claude.json"
     if agent == "claude":
         claude_directory, claude_config = claude_import_paths(home)
+    codex_home = home / ".codex"
+    if agent == "codex":
+        codex_home = Path(os.environ.get("CODEX_HOME") or codex_home).expanduser()
     roots = {
         "claude": [claude_directory / "skills", project / ".claude/skills"],
-        "codex": [home / ".codex/skills", home / ".agents/skills", project / ".agents/skills"],
+        "codex": [codex_home / "skills", home / ".agents/skills", project / ".agents/skills"],
         "devin": [home / ".config/devin/skills", home / ".agents/skills", project / ".devin/skills", project / ".agents/skills"],
         "opencode": [home / ".claude/skills", home / ".agents/skills", home / ".config/opencode/skills",
                      project / ".claude/skills", project / ".agents/skills", project / ".opencode/skills"],
@@ -3498,7 +3501,7 @@ def discover_imports(agent: str, home=None, project=None, env_vars=(), env_files
     }[agent]
     configs = {
         "claude": [claude_config, project / ".mcp.json"],
-        "codex": [home / ".codex/config.toml", project / ".codex/config.toml"],
+        "codex": [codex_home / "config.toml", project / ".codex/config.toml"],
         "devin": [home / ".config/devin/config.json", home / ".config/devin/mcp_config.json", project / ".devin/mcp_config.json", project / ".devin/mcp_config.local.json"],
         "opencode": [home / ".config/opencode/opencode.json", home / ".config/opencode/opencode.jsonc",
                      project / "opencode.json", project / "opencode.jsonc",
