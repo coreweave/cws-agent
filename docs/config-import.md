@@ -58,6 +58,21 @@ beginning with `~` are expanded; relative paths use the current working director
 Project sources keep their existing locations and precedence. This selection
 applies to Claude imports during launch, connect, restore, preview, and sync.
 
+For Codex, a nonempty `CODEX_HOME` in the shell running `cws-agent` selects
+the local user profile. Skills come from `$CODEX_HOME/skills` and user MCP
+servers from `$CODEX_HOME/config.toml`. For example:
+
+```sh
+CODEX_HOME="$HOME/.codex-sandbox" cws-agent config preview dev1 --verbose
+```
+
+The selected directory replaces the default Codex user sources, even when
+files are missing. An unset or empty variable uses the default paths in the
+table. Paths beginning with `~` are expanded; relative paths use the current
+working directory. Shared `~/.agents/skills` and project sources keep their
+existing locations and precedence. This selection applies to Codex imports
+during launch, connect, restore, preview, and sync.
+
 Later sources win for duplicate IDs. Plugin caches, ancestor directories, and
 other alternate config-home locations aren't scanned. `--project-dir PATH`
 selects the project. Otherwise the current directory is used.
@@ -66,8 +81,8 @@ Skills go into the agent's user directory. MCP names get a `cws-import-` prefix.
 Unrelated settings remain. Restart the agent to load changes.
 Selecting another local profile leaves previously imported remote items in place
 unless an imported item with the same ID updates them. Imports continue to use
-the sandbox's standard configuration paths; the local `CLAUDE_CONFIG_DIR` value
-is excluded from automatic environment imports.
+the sandbox's standard configuration paths; the local `CLAUDE_CONFIG_DIR` and
+`CODEX_HOME` values are excluded from automatic environment imports.
 
 ## Review before importing
 

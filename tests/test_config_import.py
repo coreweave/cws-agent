@@ -26,7 +26,7 @@ loader.exec_module(app)
 
 class ImportTests(unittest.TestCase):
     def setUp(self):
-        self.enterContext(patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}))
+        self.enterContext(patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "", "CODEX_HOME": ""}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
@@ -137,6 +137,77 @@ class ImportTests(unittest.TestCase):
             self.assertEqual(item["missing_env"], [])
             with self.assertRaisesRegex(SystemExit, "portable environment variable"):
                 app.discover_imports("claude", self.home, self.project, env_vars=["CLAUDE_CONFIG_DIR"])
+
+    def test_codex_home_selects_user_skills_and_mcp(self):
+        profile = self.home / ".codex-sandbox"
+        for directory, name in ((self.home / ".codex", "default"), (profile, "sandbox")):
+            self.write(directory / f"skills/{name}/SKILL.md", "Use $PROFILE_TOKEN and $CODEX_HOME")
+            self.write(directory / "config.toml", f'[mcp_servers.{name}]\ncommand="node"\nenv_vars=["PROFILE_TOKEN"]\n')
+        with patch.dict(os.environ, {"CODEX_HOME": str(profile), "PROFILE_TOKEN": "selected-token"}, clear=True):
+            items = self.discover("codex")
+        self.assertEqual([item["id"] for item in items], ["mcp:sandbox", "skill:sandbox"])
+        self.assertEqual(items[0]["source"], str(profile / "config.toml"))
+        self.assertEqual(items[1]["source"], str(profile / "skills/sandbox"))
+        for item in items:
+            self.assertEqual(item["environment"], {"PROFILE_TOKEN": "selected-token"})
+            self.assertEqual(item["env_references"], ["PROFILE_TOKEN"])
+        result = self.apply(items, "codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.remote / ".agents/skills/sandbox/SKILL.md").is_file())
+        self.assertIn("cws-import-sandbox", (self.remote / ".codex/config.toml").read_text())
+
+    def test_unset_and_empty_codex_home_use_default_profile(self):
+        self.write(self.home / ".codex/skills/review/SKILL.md", "default")
+        self.write(self.home / ".codex/config.toml", '[mcp_servers.docs]\ncommand="node"\n')
+        for environment in ({}, {"CODEX_HOME": ""}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
+                self.assertEqual([item["id"] for item in self.discover("codex")], ["mcp:docs", "skill:review"])
+
+    def test_missing_codex_home_files_do_not_fall_back_to_default_profile(self):
+        self.write(self.home / ".codex/skills/default/SKILL.md", "default")
+        self.write(self.home / ".codex/config.toml", '[mcp_servers.default]\ncommand="node"\n')
+        profile = self.home / ".codex-sandbox"
+        with patch.dict(os.environ, {"CODEX_HOME": str(profile)}, clear=True):
+            self.assertEqual(self.discover("codex"), [])
+            profile.mkdir()
+            self.assertEqual(self.discover("codex"), [])
+            self.write(profile / "skills/review/SKILL.md", "selected")
+            self.assertEqual([item["id"] for item in self.discover("codex")], ["skill:review"])
+
+    def test_codex_home_preserves_shared_and_project_precedence(self):
+        profile = self.home / ".codex-sandbox"
+        self.write(profile / "skills/review/SKILL.md", "profile")
+        self.write(profile / "config.toml", '[mcp_servers.docs]\ncommand="node"\nargs=["profile"]\n')
+        self.write(self.home / ".agents/skills/review/SKILL.md", "shared")
+        self.write(self.home / ".agents/skills/shared/SKILL.md", "shared-only")
+        with patch.dict(os.environ, {"CODEX_HOME": str(profile)}, clear=True):
+            items = {item["id"]: item for item in self.discover("codex")}
+            self.assertEqual(items["skill:review"]["files"]["SKILL.md"], "shared")
+            self.write(self.project / ".agents/skills/review/SKILL.md", "project")
+            self.write(self.project / ".codex/config.toml", '[mcp_servers.docs]\ncommand="node"\nargs=["project"]\n')
+            items = self.discover("codex")
+        self.assertEqual([item["id"] for item in items], ["mcp:docs", "skill:review", "skill:shared"])
+        self.assertEqual(items[0]["config"]["args"], ["project"])
+        self.assertEqual(items[1]["files"]["SKILL.md"], "project")
+
+    def test_codex_home_supports_tilde_relative_and_explicit_default_directory(self):
+        for folder in (".codex-sandbox", ".codex"):
+            profile = self.home / folder
+            self.write(profile / "skills/review/SKILL.md", folder)
+            self.write(profile / "config.toml", '[mcp_servers.docs]\ncommand="node"\n')
+            for value in (str(profile), "~/" + folder, folder):
+                with self.subTest(value=value), contextlib.chdir(self.home), \
+                        patch.dict(os.environ, {"HOME": str(self.home), "CODEX_HOME": value}, clear=True):
+                    items = self.discover("codex")
+                    self.assertEqual([item["id"] for item in items], ["mcp:docs", "skill:review"])
+                    self.assertEqual(items[1]["files"]["SKILL.md"], folder)
+
+    def test_codex_home_does_not_redirect_other_agents(self):
+        self.write(self.home / ".codex/skills/default/SKILL.md", "default")
+        profile = self.home / ".codex-sandbox"
+        self.write(profile / "skills/selected/SKILL.md", "selected")
+        with patch.dict(os.environ, {"CODEX_HOME": str(profile)}, clear=True):
+            self.assertEqual([item["id"] for item in self.discover("cursor")], ["skill:default"])
 
     def test_discovery_excludes_caches_and_blocks_links(self):
         self.write(self.home / ".claude/skills/review/SKILL.md", "review")
