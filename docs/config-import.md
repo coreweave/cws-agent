@@ -73,6 +73,29 @@ working directory. Shared `~/.agents/skills` and project sources keep their
 existing locations and precedence. This selection applies to Codex imports
 during launch, connect, restore, preview, and sync.
 
+For OpenCode, the shell running `cws-agent` can select additional or relocated
+local sources:
+
+- `XDG_CONFIG_HOME` replaces `~/.config`: global skills and MCP files come from
+  `$XDG_CONFIG_HOME/opencode`, without falling back when files are missing.
+- `OPENCODE_CONFIG` adds an MCP config file after global files and before
+  project files.
+- `OPENCODE_CONFIG_DIR` adds `skills`, `opencode.json`, and `opencode.jsonc`
+  after project sources. It supplements the global and project sources.
+
+For example:
+
+```sh
+OPENCODE_CONFIG_DIR="$HOME/.opencode-sandbox" cws-agent config preview open1 --verbose
+```
+
+Unset or empty variables keep the default sources. Paths beginning with `~`
+are expanded; relative paths use the current working directory. Compatible
+skill directories retain their existing locations. These selections apply
+to OpenCode imports during launch, connect, restore, preview, and sync.
+See [OpenCode's config precedence](https://opencode.ai/docs/config/#precedence).
+Inline `OPENCODE_CONFIG_CONTENT` is not scanned.
+
 Later sources win for duplicate IDs. Plugin caches, ancestor directories, and
 other alternate config-home locations aren't scanned. `--project-dir PATH`
 selects the project. Otherwise the current directory is used.
@@ -81,8 +104,9 @@ Skills go into the agent's user directory. MCP names get a `cws-import-` prefix.
 Unrelated settings remain. Restart the agent to load changes.
 Selecting another local profile leaves previously imported remote items in place
 unless an imported item with the same ID updates them. Imports continue to use
-the sandbox's standard configuration paths; the local `CLAUDE_CONFIG_DIR` and
-`CODEX_HOME` values are excluded from automatic environment imports.
+the sandbox's standard configuration paths; the local `CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG`, and `OPENCODE_CONFIG_DIR`
+values are excluded from automatic environment imports.
 
 ## Review before importing
 

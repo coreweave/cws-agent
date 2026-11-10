@@ -38,8 +38,8 @@ class NativeImportTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(value if isinstance(value, str) else json.dumps(value))
 
-    def discover(self, agent):
-        with patch.dict(os.environ, {}, clear=True):
+    def discover(self, agent, environment=None):
+        with patch.dict(os.environ, environment or {}, clear=True):
             return app.discover_imports(agent, self.home, self.project)
 
     def apply(self, agent, items):
@@ -76,6 +76,97 @@ class NativeImportTests(unittest.TestCase):
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
         self.assertNotIn("never-import", (self.remote / ".cws-import-env.json").read_text())
         self.assertEqual(self.apply("opencode", items).returncode, 0)
+
+    def test_opencode_xdg_config_home_replaces_global_sources(self):
+        for folder, name in ((self.home / ".config/opencode", "default"),
+                             (self.home / "custom/opencode", "selected")):
+            self.write(folder / f"skills/{name}/SKILL.md", name)
+            self.write(folder / "opencode.jsonc", {"mcp": {
+                name: {"type": "remote", "url": "https://example.test/mcp"},
+            }})
+        items = self.discover("opencode", {"XDG_CONFIG_HOME": str(self.home / "custom")})
+        self.assertEqual([item["id"] for item in items], ["mcp:selected", "skill:selected"])
+        self.assertEqual(self.discover("opencode", {"XDG_CONFIG_HOME": str(self.home / "missing")}), [])
+        for environment in ({}, {"XDG_CONFIG_HOME": "", "OPENCODE_CONFIG_DIR": "", "OPENCODE_CONFIG": ""}):
+            with self.subTest(environment=environment):
+                self.assertEqual([item["id"] for item in self.discover("opencode", environment)],
+                                 ["mcp:default", "skill:default"])
+
+    def test_opencode_custom_sources_and_precedence(self):
+        global_dir = self.home / ".config/opencode"
+        custom_dir = self.home / "custom"
+        custom_file = self.home / "custom-file.jsonc"
+        sources = [global_dir / "opencode.json", global_dir / "opencode.jsonc", custom_file,
+                   self.project / "opencode.json", self.project / "opencode.jsonc",
+                   self.project / ".opencode/opencode.json", self.project / ".opencode/opencode.jsonc",
+                   custom_dir / "opencode.json", custom_dir / "opencode.jsonc"]
+        for index, path in enumerate(sources):
+            self.write(path, {"mcp": {"shared": {"type": "remote", "url": f"https://example.test/{index}"},
+                                      f"source-{index}": {"type": "remote", "url": "https://example.test/mcp"}}})
+        skill_roots = [self.home / ".claude/skills", self.home / ".agents/skills", global_dir / "skills",
+                       self.project / ".claude/skills", self.project / ".agents/skills",
+                       self.project / ".opencode/skills", custom_dir / "skills"]
+        for index, root in enumerate(skill_roots):
+            self.write(root / "shared/SKILL.md", str(index))
+            self.write(root / f"source-{index}/SKILL.md", str(index))
+        environment = {"OPENCODE_CONFIG": str(custom_file), "OPENCODE_CONFIG_DIR": str(custom_dir)}
+        # Removing each winning source exposes the next lower-precedence source.
+        for index in reversed(range(len(sources))):
+            items = {item["id"]: item for item in self.discover("opencode", environment)}
+            self.assertEqual(items["mcp:shared"]["source"], str(sources[index]))
+            self.assertEqual(items["mcp:shared"]["config"]["url"], f"https://example.test/{index}")
+            self.assertEqual(len([item for item in items.values() if item["kind"] == "mcp"]), index + 2)
+            sources[index].unlink()
+        for index in reversed(range(len(skill_roots))):
+            items = {item["id"]: item for item in self.discover("opencode", environment)}
+            self.assertEqual(items["skill:shared"]["files"]["SKILL.md"], str(index))
+            (skill_roots[index] / "shared/SKILL.md").unlink()
+
+    def test_opencode_custom_paths_expand_tilde_and_relative_paths(self):
+        folder = self.home / "profiles/opencode"
+        self.write(folder / "skills/selected/SKILL.md", "selected")
+        self.write(folder / "opencode.jsonc", {"mcp": {
+            "selected": {"type": "remote", "url": "https://example.test/mcp"},
+        }})
+        for prefix in ("~/profiles", "profiles"):
+            for variable, value, expected in (
+                ("XDG_CONFIG_HOME", prefix, ["mcp:selected", "skill:selected"]),
+                ("OPENCODE_CONFIG_DIR", prefix + "/opencode", ["mcp:selected", "skill:selected"]),
+                ("OPENCODE_CONFIG", prefix + "/opencode/opencode.jsonc", ["mcp:selected"]),
+            ):
+                with self.subTest(variable=variable, prefix=prefix), contextlib.chdir(self.home):
+                    items = self.discover("opencode", {"HOME": str(self.home), variable: value})
+                    self.assertEqual([item["id"] for item in items], expected)
+
+    def test_opencode_custom_sources_use_standard_remote_paths(self):
+        folder = self.home / "custom"
+        names = ("XDG_CONFIG_HOME", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG")
+        self.write(folder / "skills/review/SKILL.md", "$PROFILE_TOKEN " + " ".join("$" + name for name in names))
+        self.write(folder / "opencode.json", {"mcp": {"selected": {
+            "type": "remote", "url": "https://example.test/mcp", "headers": {"Token": "{env:PROFILE_TOKEN}"},
+        }}})
+        items = self.discover("opencode", {"OPENCODE_CONFIG_DIR": str(folder), "PROFILE_TOKEN": "synthetic-token"})
+        for item in items:
+            self.assertEqual(item["blocked"], "")
+            self.assertEqual(item["environment"], {"PROFILE_TOKEN": "synthetic-token"})
+        result = self.apply("opencode", items)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.remote / ".config/opencode/skills/review/SKILL.md").is_file())
+        config = json.loads((self.remote / ".config/opencode/opencode.json").read_text())
+        self.assertIn("cws-import-selected", config["mcp"])
+        for name in names:
+            self.assertNotIn(name, (self.remote / ".cws-import-env.json").read_text())
+
+    def test_opencode_path_selection_only_uses_process_environment(self):
+        folder = self.home / "custom"
+        self.write(folder / "skills/custom/SKILL.md", "custom")
+        self.write(self.home / ".config/opencode/skills/default/SKILL.md", "default")
+        self.write(self.project / ".env", f"OPENCODE_CONFIG_DIR={folder}\nXDG_CONFIG_HOME={folder}\n")
+        self.assertEqual([item["id"] for item in self.discover("opencode")], ["skill:default"])
+        for agent in ("claude", "codex", "devin", "cursor"):
+            with self.subTest(agent=agent):
+                self.assertEqual(self.discover(agent, {"OPENCODE_CONFIG_DIR": str(folder),
+                                                      "XDG_CONFIG_HOME": str(folder)}), [])
 
     def test_cursor_native_mcp_round_trip(self):
         self.write(self.home / ".cursor/mcp.json", {"mcpServers": {
