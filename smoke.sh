@@ -37,7 +37,7 @@ trap 'exit 143' TERM
 
 # An explicit reused name may still own old snapshots even without a running
 # sandbox. Refuse it rather than deleting those snapshots in our cleanup.
-EXISTING_SNAPSHOTS="$("$DIR/cws-agent.py" snapshots "$NAME")"
+EXISTING_SNAPSHOTS="$("$DIR/cws-agent.py" snapshots "$NAME" | tail -n +2)"
 if [ -n "$EXISTING_SNAPSHOTS" ]; then
   echo "smoke name '$NAME' already has snapshots; choose a fresh name" >&2
   exit 1
