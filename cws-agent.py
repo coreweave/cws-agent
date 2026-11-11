@@ -3490,11 +3490,14 @@ def discover_imports(agent: str, home=None, project=None, env_vars=(), env_files
     codex_home = home / ".codex"
     if agent == "codex":
         codex_home = Path(os.environ.get("CODEX_HOME") or codex_home).expanduser()
+    opencode_home = home / ".config/opencode"
+    if agent == "opencode":
+        opencode_home = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config").expanduser() / "opencode"
     roots = {
         "claude": [claude_directory / "skills", project / ".claude/skills"],
         "codex": [codex_home / "skills", home / ".agents/skills", project / ".agents/skills"],
         "devin": [home / ".config/devin/skills", home / ".agents/skills", project / ".devin/skills", project / ".agents/skills"],
-        "opencode": [home / ".claude/skills", home / ".agents/skills", home / ".config/opencode/skills",
+        "opencode": [home / ".claude/skills", home / ".agents/skills", opencode_home / "skills",
                      project / ".claude/skills", project / ".agents/skills", project / ".opencode/skills"],
         "cursor": [home / ".claude/skills", home / ".codex/skills", home / ".agents/skills", home / ".cursor/skills",
                    project / ".claude/skills", project / ".codex/skills", project / ".agents/skills", project / ".cursor/skills"],
@@ -3503,11 +3506,19 @@ def discover_imports(agent: str, home=None, project=None, env_vars=(), env_files
         "claude": [claude_config, project / ".mcp.json"],
         "codex": [codex_home / "config.toml", project / ".codex/config.toml"],
         "devin": [home / ".config/devin/config.json", home / ".config/devin/mcp_config.json", project / ".devin/mcp_config.json", project / ".devin/mcp_config.local.json"],
-        "opencode": [home / ".config/opencode/opencode.json", home / ".config/opencode/opencode.jsonc",
+        "opencode": [opencode_home / "opencode.json", opencode_home / "opencode.jsonc",
                      project / "opencode.json", project / "opencode.jsonc",
                      project / ".opencode/opencode.json", project / ".opencode/opencode.jsonc"],
         "cursor": [home / ".cursor/mcp.json", project / ".cursor/mcp.json"],
     }[agent]
+    if agent == "opencode":
+        # Custom files precede project config; custom directories follow it.
+        if filename := os.environ.get("OPENCODE_CONFIG"):
+            configs.insert(2, Path(filename).expanduser())
+        if directory := os.environ.get("OPENCODE_CONFIG_DIR"):
+            directory = Path(directory).expanduser()
+            roots.append(directory / "skills")
+            configs.extend([directory / "opencode.json", directory / "opencode.jsonc"])
     found = {}
     for root in roots:
         if not root.is_dir() or root.is_symlink():
