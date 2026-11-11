@@ -481,8 +481,10 @@ with (root / "calls.jsonl").open("a") as stream:
     stream.write(json.dumps(args) + "\\n")
 if args[0] == os.environ.get("SMOKE_FAKE_FAIL"):
     sys.exit(7)
-if args[0] == "snapshots" and os.environ.get("SMOKE_FAKE_OLD_SNAPSHOTS"):
-    print("existing-snapshot ready")
+if args[0] == "snapshots":
+    print("SNAPSHOT STATE SIZE SAVED SOURCE SANDBOX")
+    if os.environ.get("SMOKE_FAKE_OLD_SNAPSHOTS"):
+        print("existing-snapshot ready")
 if args[0] == "exec":
     if args[2].startswith("echo "):
         (root / "marker").write_text(args[2].split()[1])
