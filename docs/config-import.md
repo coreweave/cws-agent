@@ -93,7 +93,7 @@ Unset or empty variables keep the default sources. Paths beginning with `~`
 are expanded; relative paths use the current working directory. Compatible
 skill directories retain their existing locations. These selections apply
 to OpenCode imports during launch, connect, restore, preview, and sync.
-See [OpenCode's config precedence](https://opencode.ai/docs/config/#precedence).
+See [OpenCode's config precedence](https://opencode.ai/v1/docs/config/#precedence-order).
 Inline `OPENCODE_CONFIG_CONTENT` is not scanned.
 
 Later sources win for duplicate IDs. Plugin caches, ancestor directories, and
